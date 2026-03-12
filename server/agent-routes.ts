@@ -419,7 +419,7 @@ function maybeReplayIdempotentMutation(
     );
     return { handled: true, idempotencyKey, requestHash };
   }
-  sendMutationResponse(res, 200, existing.response, { route: mutationRoute, slug });
+  sendMutationResponse(res, existing.statusCode ?? 200, existing.response, { route: mutationRoute, slug });
   return { handled: true, idempotencyKey, requestHash };
 }
 
@@ -432,7 +432,7 @@ function storeIdempotentMutationResult(
 ): void {
   if (!replay.idempotencyKey) return;
   if (status < 200 || status >= 300) return;
-  storeIdempotencyResult(slug, routeKey, replay.idempotencyKey, body, replay.requestHash);
+  storeIdempotencyResult(slug, routeKey, replay.idempotencyKey, body, replay.requestHash, { statusCode: status });
 }
 
 function routeRequiresMutation(method: string, path: string): boolean {
