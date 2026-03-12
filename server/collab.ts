@@ -1407,6 +1407,7 @@ function materializeProjection(
   const marks = mergePreservedActionMarks(slug, encodeMarksMap(marksMap));
   const yStateVersion = getLatestYStateVersion(slug);
   if (options?.bumpRevision === false) {
+    // TODO: pass expectedRevision once materializeProjection has access to the captured revision
     const replaced = replaceDocumentProjection(slug, markdownText, marks, yStateVersion);
     if (!replaced) {
       throw new Error(`[collab] replaceDocumentProjection returned 0 rows for ${slug}`);
@@ -1673,7 +1674,7 @@ async function repairProjectionFromFragment(
     const projectionNeedsHeal = projectedRow?.projection_health !== 'healthy'
       || projectedRow?.projection_y_state_version !== yStateVersion;
     if (projectionNeedsHeal) {
-      const replaced = replaceDocumentProjection(slug, row.markdown, marks, yStateVersion);
+      const replaced = replaceDocumentProjection(slug, row.markdown, marks, yStateVersion, row.revision);
       if (!replaced) {
         recordProjectionRepair('failure', reasons.join('|') || 'y_state_version_sync_no_rows');
         return 'retry';
@@ -1914,7 +1915,7 @@ function persistCanonicalYjsBaseline(
   const snapshot = Y.encodeStateAsUpdate(ydoc);
   if (snapshot.byteLength > 0) {
     saveYSnapshot(slug, 1, snapshot);
-    replaceDocumentProjection(slug, markdown, marks, 1);
+    replaceDocumentProjection(slug, markdown, marks, 1, row.revision);
   }
 
   const updated = getDocumentBySlug(slug);
@@ -1980,6 +1981,7 @@ export async function ensureCanonicalYjsBaselineForDocument(slug: string): Promi
           stripEphemeralCollabSpans(row.markdown ?? ''),
           parseStoredMarks(row.marks),
           persistedYStateVersion,
+          row.revision,
         );
       }
     }
