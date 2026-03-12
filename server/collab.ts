@@ -23,6 +23,10 @@ import {
   removeActiveCollabConnection,
   upsertActiveCollabConnection,
   updateDocument,
+  upsertAgentPresence,
+  getActiveAgentPresence,
+  deleteAgentPresence,
+  pruneExpiredAgentPresence,
   type DocumentProjectionRow,
   type DocumentRow,
   type ProjectedDocumentRow,
@@ -234,6 +238,21 @@ function pruneExpiredAgentEphemera(slug: string, doc: Y.Doc): void {
   const removedPresenceIds = new Set<string>();
   const removedCursorIds = new Set<string>();
 
+  // Fetch active SQLite agents for cross-session ghost cleanup on doc load.
+  let activePresenceIds: Set<string> | null = null;
+  let activeCursorIds: Set<string> | null = null;
+  try {
+    const activeRows = getActiveAgentPresence(slug);
+    activePresenceIds = new Set<string>();
+    activeCursorIds = new Set<string>();
+    for (const row of activeRows) {
+      if (row.kind === 'presence') activePresenceIds.add(row.agentId);
+      else if (row.kind === 'cursor') activeCursorIds.add(row.agentId);
+    }
+  } catch {
+    // If SQLite is unavailable, skip cross-session cleanup rather than deleting valid presence.
+  }
+
   try {
     doc.transact(() => {
       const presenceMap = doc.getMap<unknown>('agentPresence');
@@ -245,6 +264,12 @@ function pruneExpiredAgentEphemera(slug: string, doc: Y.Doc): void {
           presenceMap.delete(key);
           if (typeof key === 'string' && key.trim()) removedPresenceIds.add(key.trim());
           if (typeof value?.id === 'string' && value.id.trim()) removedPresenceIds.add(value.id.trim());
+          continue;
+        }
+        // Remove if absent from the active SQLite set — ghost from a prior session.
+        if (activePresenceIds !== null && !activePresenceIds.has(normalizedKey)) {
+          presenceMap.delete(key);
+          removedPresenceIds.add(normalizedKey);
           continue;
         }
         const atRaw = value?.at;
@@ -267,6 +292,12 @@ function pruneExpiredAgentEphemera(slug: string, doc: Y.Doc): void {
           if (typeof value?.id === 'string' && value.id.trim()) removedCursorIds.add(value.id.trim());
           continue;
         }
+        // Remove if absent from the active SQLite set — ghost from a prior session.
+        if (activeCursorIds !== null && !activeCursorIds.has(normalizedKey)) {
+          cursorMap.delete(key);
+          removedCursorIds.add(normalizedKey);
+          continue;
+        }
         const atRaw = value?.at;
         const ttlMs = typeof value?.ttlMs === 'number' && Number.isFinite(value.ttlMs) && value.ttlMs > 0
           ? value.ttlMs
@@ -283,6 +314,13 @@ function pruneExpiredAgentEphemera(slug: string, doc: Y.Doc): void {
         }
       }
     }, 'agent-ephemera-prune');
+  } catch {
+    // ignore
+  }
+
+  // Prune expired SQLite rows for this slug.
+  try {
+    pruneExpiredAgentPresence(slug);
   } catch {
     // ignore
   }
@@ -350,6 +388,21 @@ function scheduleAgentCursorExpiry(slug: string, agentId: string, at: string, tt
 }
 
 function clearAgentPresenceForSlug(slug: string, agentId: string, at: string): void {
+  // Delete from SQLite (durable store) regardless of ydoc state.
+  try {
+    const row = getDb().prepare(`
+      SELECT payload_json FROM agent_presence WHERE slug = ? AND agent_id = ? AND kind = 'presence'
+    `).get(slug, agentId) as { payload_json: string } | undefined;
+    if (row) {
+      const payload = JSON.parse(row.payload_json) as Record<string, unknown>;
+      if (typeof payload.at !== 'string' || payload.at === at) {
+        deleteAgentPresence(slug, agentId, 'presence');
+      }
+    }
+  } catch {
+    // ignore
+  }
+  // Also delete from Yjs map for live client broadcast.
   const ydoc = getLiveHocuspocusDoc(slug) ?? loadedDocs.get(slug);
   if (!ydoc) return;
   try {
@@ -362,14 +415,29 @@ function clearAgentPresenceForSlug(slug: string, agentId: string, at: string): v
       if (typeof currentAt === 'string' && currentAt !== at) return;
       presenceMap.delete(agentId);
     }, 'agent-presence-expiry');
-    // Persist the expiry deletion so stale presence doesn't reappear after reconnect/restart.
-    schedulePersistDoc(slug, ydoc);
+    // No schedulePersistDoc: the SQLite delete above is the durable record; startup cleanup
+    // handles any stale Yjs entries that survive a restart.
   } catch {
     // ignore
   }
 }
 
 function clearAgentCursorForSlug(slug: string, agentId: string, at: string): void {
+  // Delete from SQLite (durable store) regardless of ydoc state.
+  try {
+    const row = getDb().prepare(`
+      SELECT payload_json FROM agent_presence WHERE slug = ? AND agent_id = ? AND kind = 'cursor'
+    `).get(slug, agentId) as { payload_json: string } | undefined;
+    if (row) {
+      const payload = JSON.parse(row.payload_json) as Record<string, unknown>;
+      if (typeof payload.at !== 'string' || payload.at === at) {
+        deleteAgentPresence(slug, agentId, 'cursor');
+      }
+    }
+  } catch {
+    // ignore
+  }
+  // Also delete from Yjs map for live client broadcast.
   const ydoc = getLiveHocuspocusDoc(slug) ?? loadedDocs.get(slug);
   if (!ydoc) return;
   try {
@@ -3353,10 +3421,9 @@ export async function getLoadedCollabFragmentTextHash(slug: string): Promise<str
 export function hasAgentPresenceInLoadedCollab(slug: string, agentId: string): boolean {
   const normalizedAgentId = normalizeAgentScopedId(agentId);
   if (!normalizedAgentId) return false;
-  const ydoc = getLiveHocuspocusDoc(slug) ?? loadedDocs.get(slug);
-  if (!ydoc) return false;
   try {
-    return ydoc.getMap<unknown>('agentPresence').has(normalizedAgentId);
+    const rows = getActiveAgentPresence(slug);
+    return rows.some(r => r.agentId === normalizedAgentId && r.kind === 'presence');
   } catch {
     return false;
   }
@@ -3384,12 +3451,12 @@ export function applyAgentPresenceToLoadedCollab(
     at: incomingAt,
   };
 
-  let merged: AgentPresenceEntry | null = null;
+  // Compute merge before transact to avoid TypeScript narrowing issues.
+  const presenceMap = ydoc.getMap<unknown>('agentPresence');
+  const merged = mergeAgentPresence(presenceMap.get(agentId), incoming);
+
   ydoc.transact(() => {
-    const presenceMap = ydoc.getMap<unknown>('agentPresence');
-    const existing = presenceMap.get(agentId);
-    merged = mergeAgentPresence(existing, incoming);
-    presenceMap.set(agentId, merged!);
+    ydoc.getMap<unknown>('agentPresence').set(agentId, merged);
 
     if (activity) {
       const arr = ydoc.getArray<unknown>('agentActivity');
@@ -3402,6 +3469,10 @@ export function applyAgentPresenceToLoadedCollab(
       }
     }
   }, 'agent-presence');
+
+  // Dual-write: persist presence to SQLite for TTL-based restart recovery.
+  const expiresAtMs = Date.now() + ttlMs;
+  upsertAgentPresence(slug, agentId, 'presence', merged as Record<string, unknown>, expiresAtMs);
 
   touchDoc(slug);
   schedulePersistDoc(slug, ydoc);
@@ -3461,6 +3532,9 @@ export function removeAgentPresenceFromLoadedCollab(
     }
   }, 'agent-presence-disconnect');
 
+  // Dual-write: also remove from SQLite.
+  deleteAgentPresence(slug, normalizedAgentId);
+
   if (!removed) return false;
   touchDoc(slug);
   schedulePersistDoc(slug, ydoc);
@@ -3482,18 +3556,22 @@ export function applyAgentCursorHintToLoadedCollab(
   const ttlMs = hint.ttlMs ?? parsePositiveInt(process.env.AGENT_CURSOR_TTL_MS, DEFAULT_AGENT_CURSOR_TTL_MS);
   const at = typeof hint.at === 'string' && hint.at.trim() ? hint.at : nowIso;
 
+  const payload: AgentCursorHint = {
+    id: agentId,
+    quote: typeof hint.quote === 'string' ? hint.quote : undefined,
+    ttlMs,
+    at,
+    name: typeof hint.name === 'string' ? hint.name : undefined,
+    color: typeof hint.color === 'string' ? hint.color : undefined,
+    avatar: typeof hint.avatar === 'string' ? hint.avatar : undefined,
+  };
+
   ydoc.transact(() => {
-    const cursorMap = ydoc.getMap<unknown>('agentCursors');
-    cursorMap.set(agentId, {
-      id: agentId,
-      quote: typeof hint.quote === 'string' ? hint.quote : undefined,
-      ttlMs,
-      at,
-      name: typeof hint.name === 'string' ? hint.name : undefined,
-      color: typeof hint.color === 'string' ? hint.color : undefined,
-      avatar: typeof hint.avatar === 'string' ? hint.avatar : undefined,
-    } satisfies AgentCursorHint);
+    ydoc.getMap<unknown>('agentCursors').set(agentId, payload satisfies AgentCursorHint);
   }, 'agent-cursor');
+
+  // Dual-write: persist cursor to SQLite for TTL-based restart recovery.
+  upsertAgentPresence(slug, agentId, 'cursor', payload as Record<string, unknown>, Date.now() + ttlMs);
 
   touchDoc(slug);
 
