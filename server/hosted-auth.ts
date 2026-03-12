@@ -52,7 +52,7 @@ function isTrustedIdentityEmailAllowed(email: string, config: TrustedProxyIdenti
 export function getTrustedProxyIdentityConfig(): TrustedProxyIdentityConfig {
   const emailHeaders = parseCsvEnv(
     process.env.PROOF_TRUSTED_IDENTITY_EMAIL_HEADERS
-    || 'x-goog-authenticated-user-email,x-forwarded-email',
+    || 'x-goog-authenticated-user-email',
   );
   const allowedEmails = parseCsvEnv(process.env.PROOF_TRUSTED_IDENTITY_EMAILS);
   const allowedDomains = parseCsvEnv(process.env.PROOF_TRUSTED_IDENTITY_EMAIL_DOMAINS);
