@@ -758,6 +758,12 @@ function isTrustedProxyIdentityOwner(ownerId: string | null | undefined, email: 
     || normalizedOwnerId === `trusted_proxy_email:${normalizedEmail}`;
 }
 
+function isRejectedTrustedProxyOwnerId(ownerId: string | null | undefined, email: string | null | undefined): boolean {
+  if (typeof ownerId !== 'string') return false;
+  if (!ownerId.trim()) return true;
+  return !isTrustedProxyIdentityOwner(ownerId, email ?? '');
+}
+
 async function ownerAuthorizedViaHostedIdentity(req: Request, ownerId: string | null | undefined): Promise<boolean> {
   const trustedIdentity = resolveTrustedProxyIdentity(req);
   if (trustedIdentity && isTrustedProxyIdentityOwner(ownerId, trustedIdentity.email)) {
@@ -1117,12 +1123,12 @@ export async function handleShareMarkdown(req: Request, res: Response): Promise<
     : titleFromQuery;
   const ownerIdFromQuery = typeof req.query.ownerId === 'string' ? req.query.ownerId : undefined;
   const ownerIdFromBody = typeof body?.ownerId === 'string' ? body.ownerId : undefined;
-  const requestedOwnerId = ownerIdFromBody ?? ownerIdFromQuery;
   if (
     auth.principalProvider === 'trusted_proxy_email'
-    && typeof requestedOwnerId === 'string'
-    && requestedOwnerId.trim()
-    && !isTrustedProxyIdentityOwner(requestedOwnerId, auth.ownerId ?? '')
+    && (
+      isRejectedTrustedProxyOwnerId(ownerIdFromBody, auth.ownerId ?? '')
+      || isRejectedTrustedProxyOwnerId(ownerIdFromQuery, auth.ownerId ?? '')
+    )
   ) {
     res.status(403).json({
       error: 'ownerId must match the authenticated trusted proxy email',
@@ -1131,8 +1137,8 @@ export async function handleShareMarkdown(req: Request, res: Response): Promise<
     return;
   }
   const ownerId = auth.principalProvider === 'trusted_proxy_email'
-    ? auth.ownerId
-    : (ownerIdFromBody ?? ownerIdFromQuery ?? auth.ownerId);
+    ? (auth.ownerId ?? undefined)
+    : (ownerIdFromBody ?? ownerIdFromQuery ?? auth.ownerId ?? undefined);
 
   const roleFromBody = body?.accessRole ?? body?.defaultRole ?? body?.role;
   const roleFromQuery = typeof req.query.role === 'string' ? req.query.role : undefined;
