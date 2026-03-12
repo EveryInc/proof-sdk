@@ -2,6 +2,90 @@ export type ShareMarkdownAuthMode = 'none' | 'api_key' | 'oauth' | 'oauth_or_api
 
 type PendingAuthStatus = 'pending' | 'completed' | 'failed';
 
+export type TrustedProxyIdentityPrincipal = {
+  provider: 'trusted_proxy_email';
+  email: string;
+  actor: string;
+  ownerId: string;
+  header: string;
+};
+
+export type TrustedProxyIdentityConfig = {
+  enabled: boolean;
+  emailHeaders: string[];
+  allowedEmails: string[];
+  allowedDomains: string[];
+};
+
+function parseCsvEnv(value: string | undefined): string[] {
+  return (value || '')
+    .split(',')
+    .map((entry) => entry.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+function trustProxyHeaders(): boolean {
+  const value = (process.env.PROOF_TRUST_PROXY_HEADERS || '').trim().toLowerCase();
+  return value === '1' || value === 'true' || value === 'yes';
+}
+
+function normalizeTrustedIdentityEmail(raw: string): string | null {
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  const withoutScheme = trimmed.replace(/^mailto:/i, '');
+  const suffix = withoutScheme.includes(':')
+    ? withoutScheme.slice(withoutScheme.lastIndexOf(':') + 1)
+    : withoutScheme;
+  const normalized = suffix.trim().toLowerCase();
+  if (!normalized || !normalized.includes('@') || normalized.startsWith('@') || normalized.endsWith('@')) {
+    return null;
+  }
+  return normalized;
+}
+
+function isTrustedIdentityEmailAllowed(email: string, config: TrustedProxyIdentityConfig): boolean {
+  if (config.allowedEmails.includes(email)) return true;
+  const domain = email.split('@')[1] || '';
+  return domain ? config.allowedDomains.includes(domain) : false;
+}
+
+export function getTrustedProxyIdentityConfig(): TrustedProxyIdentityConfig {
+  const emailHeaders = parseCsvEnv(
+    process.env.PROOF_TRUSTED_IDENTITY_EMAIL_HEADERS
+    || 'x-goog-authenticated-user-email,x-forwarded-email',
+  );
+  const allowedEmails = parseCsvEnv(process.env.PROOF_TRUSTED_IDENTITY_EMAILS);
+  const allowedDomains = parseCsvEnv(process.env.PROOF_TRUSTED_IDENTITY_EMAIL_DOMAINS);
+  return {
+    enabled: trustProxyHeaders() && emailHeaders.length > 0 && (allowedEmails.length > 0 || allowedDomains.length > 0),
+    emailHeaders,
+    allowedEmails,
+    allowedDomains,
+  };
+}
+
+export function resolveTrustedProxyIdentity(input: {
+  header(name: string): string | string[] | undefined | null;
+}): TrustedProxyIdentityPrincipal | null {
+  const config = getTrustedProxyIdentityConfig();
+  if (!config.enabled) return null;
+  for (const header of config.emailHeaders) {
+    const raw = input.header(header);
+    const firstValue = Array.isArray(raw) ? raw[0] : raw;
+    if (typeof firstValue !== 'string' || !firstValue.trim()) continue;
+    const email = normalizeTrustedIdentityEmail(firstValue);
+    if (!email || !isTrustedIdentityEmailAllowed(email, config)) continue;
+    return {
+      provider: 'trusted_proxy_email',
+      email,
+      actor: `email:${email}`,
+      ownerId: email,
+      header,
+    };
+  }
+  return null;
+}
+
 export function isOAuthConfigured(_publicBaseUrl?: string): boolean {
   return false;
 }

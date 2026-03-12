@@ -2,7 +2,7 @@ import { Router, type Request, type Response } from 'express';
 import { readFileSync } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { resolveShareMarkdownAuthMode } from './hosted-auth.js';
+import { getTrustedProxyIdentityConfig, resolveShareMarkdownAuthMode } from './hosted-auth.js';
 import {
   AGENT_DOCS_PATH,
   ALT_SHARE_TOKEN_HEADER_FORMAT,
@@ -76,6 +76,7 @@ discoveryRoutes.get('/.well-known/agent.json', (req: Request, res: Response) => 
   const shareBase = base || '';
 
   const authMode = resolveShareMarkdownAuthMode(base);
+  const trustedProxyIdentity = getTrustedProxyIdentityConfig();
   const authMethods = authMode === 'none'
     ? ['none']
     : authMode === 'api_key'
@@ -83,6 +84,9 @@ discoveryRoutes.get('/.well-known/agent.json', (req: Request, res: Response) => 
       : authMode === 'oauth_or_api_key'
         ? ['api_key', 'oauth']
         : ['oauth'];
+  if (trustedProxyIdentity.enabled) {
+    authMethods.push('trusted_proxy_email');
+  }
 
   res.setHeader('Cache-Control', 'public, max-age=300');
   res.json({
@@ -102,6 +106,16 @@ discoveryRoutes.get('/.well-known/agent.json', (req: Request, res: Response) => 
         preferred_header: AUTH_HEADER_FORMAT,
         alt_header: ALT_SHARE_TOKEN_HEADER_FORMAT,
       },
+      ...(trustedProxyIdentity.enabled
+        ? {
+          trusted_proxy: {
+            mode: 'email_header',
+            email_headers: trustedProxyIdentity.emailHeaders,
+            allowed_email_domains: trustedProxyIdentity.allowedDomains,
+            allowed_emails: trustedProxyIdentity.allowedEmails,
+          },
+        }
+        : {}),
     },
     quickstart: {
       received_link: {

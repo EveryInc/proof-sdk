@@ -54,6 +54,7 @@ import {
   handleOAuthCallback,
   pollOAuthFlow,
   resolveShareMarkdownAuthMode,
+  resolveTrustedProxyIdentity,
   revokeHostedSessionToken,
   startOAuthFlow,
   validateHostedSessionToken,
@@ -372,6 +373,7 @@ type DirectShareAuthorizationResult = {
   authed: boolean;
   authMode: 'none' | 'api_key' | 'oauth' | 'oauth_or_api_key';
   actor: string;
+  ownerId: string | null;
 };
 
 function buildOAuthNotConfiguredPayload(errorMessage: string): Record<string, unknown> {
@@ -452,7 +454,7 @@ async function authorizeDirectShareRequest(
   const presented = getDirectSharePresentedToken(req);
 
   if (authMode === 'none') {
-    return { authed: false, authMode, actor: 'anonymous' };
+    return { authed: false, authMode, actor: 'anonymous', ownerId: null };
   }
 
   if (authMode === 'api_key') {
@@ -465,7 +467,7 @@ async function authorizeDirectShareRequest(
       return null;
     }
     if (presented === requiredApiKey) {
-      return { authed: true, authMode, actor: 'api-key' };
+      return { authed: true, authMode, actor: 'api-key', ownerId: null };
     }
     res.status(401).json({
       error: 'Unauthorized direct share request',
@@ -477,7 +479,17 @@ async function authorizeDirectShareRequest(
 
   const requiredApiKey = getDirectShareApiKey();
   if (authMode === 'oauth_or_api_key' && requiredApiKey && presented === requiredApiKey) {
-    return { authed: true, authMode, actor: 'api-key' };
+    return { authed: true, authMode, actor: 'api-key', ownerId: null };
+  }
+
+  const trustedProxyIdentity = resolveTrustedProxyIdentity(req);
+  if (trustedProxyIdentity) {
+    return {
+      authed: true,
+      authMode,
+      actor: trustedProxyIdentity.actor,
+      ownerId: trustedProxyIdentity.ownerId,
+    };
   }
 
   if (!presented) {
@@ -490,6 +502,7 @@ async function authorizeDirectShareRequest(
       authed: true,
       authMode,
       actor: `oauth:${validated.principal.userId}`,
+      ownerId: `oauth:${validated.principal.userId}`,
     };
   }
 
@@ -708,7 +721,20 @@ function isOAuthPrincipalOwner(ownerId: string | null | undefined, oauthUserId: 
     || normalized === `oauth_user:${asString}`;
 }
 
-async function ownerAuthorizedViaOAuth(req: Request, ownerId: string | null | undefined): Promise<boolean> {
+function isTrustedProxyIdentityOwner(ownerId: string | null | undefined, email: string): boolean {
+  if (!ownerId || !ownerId.trim()) return false;
+  const normalizedOwnerId = ownerId.trim().toLowerCase();
+  const normalizedEmail = email.trim().toLowerCase();
+  return normalizedOwnerId === normalizedEmail
+    || normalizedOwnerId === `email:${normalizedEmail}`
+    || normalizedOwnerId === `trusted_proxy_email:${normalizedEmail}`;
+}
+
+async function ownerAuthorizedViaHostedIdentity(req: Request, ownerId: string | null | undefined): Promise<boolean> {
+  const trustedIdentity = resolveTrustedProxyIdentity(req);
+  if (trustedIdentity && isTrustedProxyIdentityOwner(ownerId, trustedIdentity.email)) {
+    return true;
+  }
   const bearerToken = getPresentedBearerToken(req);
   if (!bearerToken) return false;
   const validated = await validateHostedSessionToken(bearerToken, getPublicBaseUrl(req));
@@ -734,8 +760,8 @@ async function resolveOpenContextAccess(
   const bearerResolved = !explicitResolved && bearerToken ? resolveDocumentAccess(slug, bearerToken) : null;
   const resolved = explicitResolved ?? bearerResolved;
   const ownerBySecret = canMutateByOwnerIdentity(doc, explicitSecret);
-  const ownerByOAuth = await ownerAuthorizedViaOAuth(req, doc.owner_id);
-  const ownerAuthorized = ownerBySecret || ownerByOAuth;
+  const ownerByHostedIdentity = await ownerAuthorizedViaHostedIdentity(req, doc.owner_id);
+  const ownerAuthorized = ownerBySecret || ownerByHostedIdentity;
 
   if (ownerAuthorized) {
     return { role: 'owner_bot', tokenId: null, ownerAuthorized: true };
@@ -899,7 +925,7 @@ apiRoutes.post('/documents/:slug/access-links', async (req: Request, res: Respon
     return;
   }
 
-  const ownerAuthorized = canOwnerMutate(req, doc) || await ownerAuthorizedViaOAuth(req, doc.owner_id);
+  const ownerAuthorized = canOwnerMutate(req, doc) || await ownerAuthorizedViaHostedIdentity(req, doc.owner_id);
   const secret = getPresentedSecret(req);
   const role = secret ? resolveDocumentAccessRole(slug, secret) : null;
   const canCreateAccessLinks = ownerAuthorized || role === 'editor' || role === 'owner_bot';
@@ -1062,7 +1088,9 @@ export async function handleShareMarkdown(req: Request, res: Response): Promise<
     ? body.title
     : titleFromQuery;
   const ownerIdFromQuery = typeof req.query.ownerId === 'string' ? req.query.ownerId : undefined;
-  const ownerId = typeof body?.ownerId === 'string' ? body.ownerId : ownerIdFromQuery;
+  const ownerId = typeof body?.ownerId === 'string'
+    ? body.ownerId
+    : (ownerIdFromQuery ?? auth.ownerId ?? undefined);
 
   const roleFromBody = body?.accessRole ?? body?.defaultRole ?? body?.role;
   const roleFromQuery = typeof req.query.role === 'string' ? req.query.role : undefined;

@@ -1804,6 +1804,63 @@ async function runRoutePayloadValidationTests(): Promise<void> {
       }
     });
 
+    await test('D2: POST /share/markdown accepts trusted proxy email headers for Cloud Run IAP', async () => {
+      const previousMode = process.env.PROOF_SHARE_MARKDOWN_AUTH_MODE;
+      const previousTrustProxy = process.env.PROOF_TRUST_PROXY_HEADERS;
+      const previousTrustedHeaders = process.env.PROOF_TRUSTED_IDENTITY_EMAIL_HEADERS;
+      const previousTrustedDomains = process.env.PROOF_TRUSTED_IDENTITY_EMAIL_DOMAINS;
+      const previousTrustedEmails = process.env.PROOF_TRUSTED_IDENTITY_EMAILS;
+
+      process.env.PROOF_SHARE_MARKDOWN_AUTH_MODE = 'oauth';
+      process.env.PROOF_TRUST_PROXY_HEADERS = 'true';
+      process.env.PROOF_TRUSTED_IDENTITY_EMAIL_HEADERS = 'x-goog-authenticated-user-email';
+      process.env.PROOF_TRUSTED_IDENTITY_EMAIL_DOMAINS = 'elastic.co';
+      delete process.env.PROOF_TRUSTED_IDENTITY_EMAILS;
+
+      try {
+        const createResponse = await post(baseUrl, '/api/share/markdown', {
+          markdown: '# IAP trusted create',
+        }, {
+          'X-Goog-Authenticated-User-Email': 'accounts.google.com:agent@elastic.co',
+        });
+        assert(createResponse.status === 200, `Expected status 200 for trusted proxy create, got ${createResponse.status}`);
+        const createPayload = await createResponse.json();
+        assert(createPayload.success === true, 'Expected trusted proxy create to succeed');
+        assert(typeof createPayload.slug === 'string' && createPayload.slug.length > 0, 'Expected trusted proxy create slug');
+
+        const accessLinksResponse = await post(baseUrl, `/api/documents/${encodeURIComponent(createPayload.slug as string)}/access-links`, {
+          role: 'viewer',
+        }, {
+          'X-Goog-Authenticated-User-Email': 'accounts.google.com:agent@elastic.co',
+        });
+        assert(accessLinksResponse.status === 200, `Expected trusted proxy owner access-links status 200, got ${accessLinksResponse.status}`);
+        const accessLinksPayload = await accessLinksResponse.json();
+        assert(accessLinksPayload.success === true, 'Expected trusted proxy owner access-links success');
+
+        const discoveryResponse = await get(baseUrl, '/.well-known/agent.json');
+        assert(discoveryResponse.status === 200, `Expected discovery status 200, got ${discoveryResponse.status}`);
+        const discoveryPayload = await discoveryResponse.json();
+        const authMethods = Array.isArray(discoveryPayload?.auth?.methods) ? discoveryPayload.auth.methods : [];
+        assert(authMethods.includes('trusted_proxy_email'), 'Expected discovery auth methods to advertise trusted_proxy_email');
+        assertEqual(
+          discoveryPayload?.auth?.trusted_proxy?.email_headers?.[0],
+          'x-goog-authenticated-user-email',
+          'Expected discovery trusted proxy header metadata',
+        );
+      } finally {
+        if (previousMode === undefined) delete process.env.PROOF_SHARE_MARKDOWN_AUTH_MODE;
+        else process.env.PROOF_SHARE_MARKDOWN_AUTH_MODE = previousMode;
+        if (previousTrustProxy === undefined) delete process.env.PROOF_TRUST_PROXY_HEADERS;
+        else process.env.PROOF_TRUST_PROXY_HEADERS = previousTrustProxy;
+        if (previousTrustedHeaders === undefined) delete process.env.PROOF_TRUSTED_IDENTITY_EMAIL_HEADERS;
+        else process.env.PROOF_TRUSTED_IDENTITY_EMAIL_HEADERS = previousTrustedHeaders;
+        if (previousTrustedDomains === undefined) delete process.env.PROOF_TRUSTED_IDENTITY_EMAIL_DOMAINS;
+        else process.env.PROOF_TRUSTED_IDENTITY_EMAIL_DOMAINS = previousTrustedDomains;
+        if (previousTrustedEmails === undefined) delete process.env.PROOF_TRUSTED_IDENTITY_EMAILS;
+        else process.env.PROOF_TRUSTED_IDENTITY_EMAILS = previousTrustedEmails;
+      }
+    });
+
     await test('D2: /documents/:slug/ops enforces rate limiting', async () => {
       let saw429 = false;
       for (let i = 0; i < 140; i += 1) {
