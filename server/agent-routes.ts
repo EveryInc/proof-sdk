@@ -2044,7 +2044,7 @@ agentRoutes.post('/:slug/marks/comment', async (req: Request, res: Response) => 
   const result = await executeDocumentOperationAsync(slug, 'POST', '/marks/comment', payload);
   storeIdempotentMutationResult(slug, routeKey, replay, result.status, result.body);
   if (result.status >= 200 && result.status < 300) {
-    notifyCollabMutation(slug, buildParticipationFromMutation(req, slug, payload, { details: 'comment.add' }));
+    await notifyCollabMutation(slug, buildParticipationFromMutation(req, slug, payload, { details: 'comment.add' }));
   }
   sendMutationResponse(res, result.status, result.body, { route: mutationRoute, slug });
 });
@@ -2065,7 +2065,7 @@ agentRoutes.post('/:slug/marks/suggest-replace', async (req: Request, res: Respo
   const result = await executeDocumentOperationAsync(slug, 'POST', '/marks/suggest-replace', payload);
   storeIdempotentMutationResult(slug, routeKey, replay, result.status, result.body);
   if (result.status >= 200 && result.status < 300) {
-    notifyCollabMutation(slug, buildParticipationFromMutation(req, slug, payload, { details: 'suggestion.add.replace' }));
+    await notifyCollabMutation(slug, buildParticipationFromMutation(req, slug, payload, { details: 'suggestion.add.replace' }));
   }
   sendMutationResponse(res, result.status, result.body, { route: mutationRoute, slug });
 });
@@ -2086,7 +2086,7 @@ agentRoutes.post('/:slug/marks/suggest-insert', async (req: Request, res: Respon
   const result = await executeDocumentOperationAsync(slug, 'POST', '/marks/suggest-insert', payload);
   storeIdempotentMutationResult(slug, routeKey, replay, result.status, result.body);
   if (result.status >= 200 && result.status < 300) {
-    notifyCollabMutation(slug, buildParticipationFromMutation(req, slug, payload, { details: 'suggestion.add.insert' }));
+    await notifyCollabMutation(slug, buildParticipationFromMutation(req, slug, payload, { details: 'suggestion.add.insert' }));
   }
   sendMutationResponse(res, result.status, result.body, { route: mutationRoute, slug });
 });
@@ -2107,7 +2107,7 @@ agentRoutes.post('/:slug/marks/suggest-delete', async (req: Request, res: Respon
   const result = await executeDocumentOperationAsync(slug, 'POST', '/marks/suggest-delete', payload);
   storeIdempotentMutationResult(slug, routeKey, replay, result.status, result.body);
   if (result.status >= 200 && result.status < 300) {
-    notifyCollabMutation(slug, buildParticipationFromMutation(req, slug, payload, { details: 'suggestion.add.delete' }));
+    await notifyCollabMutation(slug, buildParticipationFromMutation(req, slug, payload, { details: 'suggestion.add.delete' }));
   }
   sendMutationResponse(res, result.status, result.body, { route: mutationRoute, slug });
 });
@@ -2192,7 +2192,7 @@ agentRoutes.post('/:slug/marks/reject', async (req: Request, res: Response) => {
   const result = await executeDocumentOperationAsync(slug, 'POST', '/marks/reject', payload);
   storeIdempotentMutationResult(slug, routeKey, replay, result.status, result.body);
   if (result.status >= 200 && result.status < 300) {
-    notifyCollabMutation(slug, buildParticipationFromMutation(req, slug, payload, { details: 'suggestion.reject' }));
+    await notifyCollabMutation(slug, buildParticipationFromMutation(req, slug, payload, { details: 'suggestion.reject' }));
   }
   sendMutationResponse(res, result.status, result.body, { route: mutationRoute, slug });
 });
@@ -2213,7 +2213,7 @@ agentRoutes.post('/:slug/marks/reply', async (req: Request, res: Response) => {
   const result = await executeDocumentOperationAsync(slug, 'POST', '/marks/reply', payload);
   storeIdempotentMutationResult(slug, routeKey, replay, result.status, result.body);
   if (result.status >= 200 && result.status < 300) {
-    notifyCollabMutation(slug, buildParticipationFromMutation(req, slug, payload, { details: 'comment.reply' }));
+    await notifyCollabMutation(slug, buildParticipationFromMutation(req, slug, payload, { details: 'comment.reply' }));
   }
   sendMutationResponse(res, result.status, result.body, { route: mutationRoute, slug });
 });
@@ -2234,7 +2234,7 @@ agentRoutes.post('/:slug/marks/resolve', async (req: Request, res: Response) => 
   const result = await executeDocumentOperationAsync(slug, 'POST', '/marks/resolve', payload);
   storeIdempotentMutationResult(slug, routeKey, replay, result.status, result.body);
   if (result.status >= 200 && result.status < 300) {
-    notifyCollabMutation(slug, buildParticipationFromMutation(req, slug, payload, { details: 'comment.resolve' }));
+    await notifyCollabMutation(slug, buildParticipationFromMutation(req, slug, payload, { details: 'comment.resolve' }));
   }
   sendMutationResponse(res, result.status, result.body, { route: mutationRoute, slug });
 });
@@ -2255,7 +2255,7 @@ agentRoutes.post('/:slug/marks/unresolve', async (req: Request, res: Response) =
   const result = await executeDocumentOperationAsync(slug, 'POST', '/marks/unresolve', payload);
   storeIdempotentMutationResult(slug, routeKey, replay, result.status, result.body);
   if (result.status >= 200 && result.status < 300) {
-    notifyCollabMutation(slug, buildParticipationFromMutation(req, slug, payload, { details: 'comment.unresolve' }));
+    await notifyCollabMutation(slug, buildParticipationFromMutation(req, slug, payload, { details: 'comment.unresolve' }));
   }
   sendMutationResponse(res, result.status, result.body, { route: mutationRoute, slug });
 });
@@ -2498,7 +2498,7 @@ agentRoutes.use(async (req: Request, res: Response) => {
   }
   const result = await executeDocumentOperationAsync(slug, method, path, asPayload(req.body));
   if (routeRequiresMutation(method, path) && result.status >= 200 && result.status < 300) {
-    notifyCollabMutation(slug, buildParticipationFromMutation(req, slug, asPayload(req.body), { details: `${method} ${path}` }));
+    await notifyCollabMutation(slug, buildParticipationFromMutation(req, slug, asPayload(req.body), { details: `${method} ${path}` }));
   }
   if (routeRequiresMutation(method, path)) {
     sendMutationResponse(res, result.status, result.body, { route: mutationRoute, slug });
