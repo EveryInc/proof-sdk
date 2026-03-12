@@ -106,16 +106,6 @@ discoveryRoutes.get('/.well-known/agent.json', (req: Request, res: Response) => 
         preferred_header: AUTH_HEADER_FORMAT,
         alt_header: ALT_SHARE_TOKEN_HEADER_FORMAT,
       },
-      ...(trustedProxyIdentity.enabled
-        ? {
-          trusted_proxy: {
-            mode: 'email_header',
-            email_headers: trustedProxyIdentity.emailHeaders,
-            allowed_email_domains: trustedProxyIdentity.allowedDomains,
-            allowed_emails: trustedProxyIdentity.allowedEmails,
-          },
-        }
-        : {}),
     },
     quickstart: {
       received_link: {

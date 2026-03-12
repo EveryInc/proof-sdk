@@ -1842,11 +1842,129 @@ async function runRoutePayloadValidationTests(): Promise<void> {
         const discoveryPayload = await discoveryResponse.json();
         const authMethods = Array.isArray(discoveryPayload?.auth?.methods) ? discoveryPayload.auth.methods : [];
         assert(authMethods.includes('trusted_proxy_email'), 'Expected discovery auth methods to advertise trusted_proxy_email');
-        assertEqual(
-          discoveryPayload?.auth?.trusted_proxy?.email_headers?.[0],
-          'x-goog-authenticated-user-email',
-          'Expected discovery trusted proxy header metadata',
+      } finally {
+        if (previousMode === undefined) delete process.env.PROOF_SHARE_MARKDOWN_AUTH_MODE;
+        else process.env.PROOF_SHARE_MARKDOWN_AUTH_MODE = previousMode;
+        if (previousTrustProxy === undefined) delete process.env.PROOF_TRUST_PROXY_HEADERS;
+        else process.env.PROOF_TRUST_PROXY_HEADERS = previousTrustProxy;
+        if (previousTrustedHeaders === undefined) delete process.env.PROOF_TRUSTED_IDENTITY_EMAIL_HEADERS;
+        else process.env.PROOF_TRUSTED_IDENTITY_EMAIL_HEADERS = previousTrustedHeaders;
+        if (previousTrustedDomains === undefined) delete process.env.PROOF_TRUSTED_IDENTITY_EMAIL_DOMAINS;
+        else process.env.PROOF_TRUSTED_IDENTITY_EMAIL_DOMAINS = previousTrustedDomains;
+        if (previousTrustedEmails === undefined) delete process.env.PROOF_TRUSTED_IDENTITY_EMAILS;
+        else process.env.PROOF_TRUSTED_IDENTITY_EMAILS = previousTrustedEmails;
+      }
+    });
+
+    await test('D2: discovery endpoint redacts trusted proxy allowlists and header config', async () => {
+      const previousMode = process.env.PROOF_SHARE_MARKDOWN_AUTH_MODE;
+      const previousTrustProxy = process.env.PROOF_TRUST_PROXY_HEADERS;
+      const previousTrustedHeaders = process.env.PROOF_TRUSTED_IDENTITY_EMAIL_HEADERS;
+      const previousTrustedDomains = process.env.PROOF_TRUSTED_IDENTITY_EMAIL_DOMAINS;
+      const previousTrustedEmails = process.env.PROOF_TRUSTED_IDENTITY_EMAILS;
+
+      process.env.PROOF_SHARE_MARKDOWN_AUTH_MODE = 'oauth';
+      process.env.PROOF_TRUST_PROXY_HEADERS = 'true';
+      process.env.PROOF_TRUSTED_IDENTITY_EMAIL_HEADERS = 'x-goog-authenticated-user-email,x-forwarded-email';
+      process.env.PROOF_TRUSTED_IDENTITY_EMAIL_DOMAINS = 'elastic.co';
+      process.env.PROOF_TRUSTED_IDENTITY_EMAILS = 'agent@elastic.co';
+
+      try {
+        const response = await get(baseUrl, '/.well-known/agent.json');
+        assert(response.status === 200, `Expected discovery status 200, got ${response.status}`);
+        const payload = await response.json();
+        const authMethods = Array.isArray(payload?.auth?.methods) ? payload.auth.methods : [];
+        assert(authMethods.includes('trusted_proxy_email'), 'Expected discovery auth methods to advertise trusted_proxy_email');
+        assert(!('trusted_proxy' in (payload?.auth ?? {})), 'Expected discovery payload to omit trusted proxy internals');
+      } finally {
+        if (previousMode === undefined) delete process.env.PROOF_SHARE_MARKDOWN_AUTH_MODE;
+        else process.env.PROOF_SHARE_MARKDOWN_AUTH_MODE = previousMode;
+        if (previousTrustProxy === undefined) delete process.env.PROOF_TRUST_PROXY_HEADERS;
+        else process.env.PROOF_TRUST_PROXY_HEADERS = previousTrustProxy;
+        if (previousTrustedHeaders === undefined) delete process.env.PROOF_TRUSTED_IDENTITY_EMAIL_HEADERS;
+        else process.env.PROOF_TRUSTED_IDENTITY_EMAIL_HEADERS = previousTrustedHeaders;
+        if (previousTrustedDomains === undefined) delete process.env.PROOF_TRUSTED_IDENTITY_EMAIL_DOMAINS;
+        else process.env.PROOF_TRUSTED_IDENTITY_EMAIL_DOMAINS = previousTrustedDomains;
+        if (previousTrustedEmails === undefined) delete process.env.PROOF_TRUSTED_IDENTITY_EMAILS;
+        else process.env.PROOF_TRUSTED_IDENTITY_EMAILS = previousTrustedEmails;
+      }
+    });
+
+    await test('D2: trusted proxy auth does not trust x-forwarded-email by default', async () => {
+      const previousMode = process.env.PROOF_SHARE_MARKDOWN_AUTH_MODE;
+      const previousTrustProxy = process.env.PROOF_TRUST_PROXY_HEADERS;
+      const previousTrustedHeaders = process.env.PROOF_TRUSTED_IDENTITY_EMAIL_HEADERS;
+      const previousTrustedDomains = process.env.PROOF_TRUSTED_IDENTITY_EMAIL_DOMAINS;
+      const previousTrustedEmails = process.env.PROOF_TRUSTED_IDENTITY_EMAILS;
+
+      process.env.PROOF_SHARE_MARKDOWN_AUTH_MODE = 'oauth';
+      process.env.PROOF_TRUST_PROXY_HEADERS = 'true';
+      delete process.env.PROOF_TRUSTED_IDENTITY_EMAIL_HEADERS;
+      process.env.PROOF_TRUSTED_IDENTITY_EMAIL_DOMAINS = 'elastic.co';
+      delete process.env.PROOF_TRUSTED_IDENTITY_EMAILS;
+
+      try {
+        const response = await post(baseUrl, '/api/share/markdown', {
+          markdown: '# spoofed forwarded email',
+        }, {
+          'X-Forwarded-Email': 'spoofed@elastic.co',
+        });
+        assert(
+          response.status === 401 || response.status === 503,
+          `Expected spoofed x-forwarded-email to be rejected (401 or 503), got ${response.status}`,
         );
+        const payload = await response.json();
+        // When OAuth is not configured, the server returns 503 after the proxy check fails.
+        // Either way, the spoofed x-forwarded-email was NOT accepted as a trusted identity.
+        assert(
+          payload.code === 'UNAUTHORIZED' || payload.code === 'OAUTH_NOT_CONFIGURED',
+          `Expected rejection code, got ${payload.code}`,
+        );
+      } finally {
+        if (previousMode === undefined) delete process.env.PROOF_SHARE_MARKDOWN_AUTH_MODE;
+        else process.env.PROOF_SHARE_MARKDOWN_AUTH_MODE = previousMode;
+        if (previousTrustProxy === undefined) delete process.env.PROOF_TRUST_PROXY_HEADERS;
+        else process.env.PROOF_TRUST_PROXY_HEADERS = previousTrustProxy;
+        if (previousTrustedHeaders === undefined) delete process.env.PROOF_TRUSTED_IDENTITY_EMAIL_HEADERS;
+        else process.env.PROOF_TRUSTED_IDENTITY_EMAIL_HEADERS = previousTrustedHeaders;
+        if (previousTrustedDomains === undefined) delete process.env.PROOF_TRUSTED_IDENTITY_EMAIL_DOMAINS;
+        else process.env.PROOF_TRUSTED_IDENTITY_EMAIL_DOMAINS = previousTrustedDomains;
+        if (previousTrustedEmails === undefined) delete process.env.PROOF_TRUSTED_IDENTITY_EMAILS;
+        else process.env.PROOF_TRUSTED_IDENTITY_EMAILS = previousTrustedEmails;
+      }
+    });
+
+    await test('D2: trusted proxy auth rejects ownerId mismatches', async () => {
+      const previousMode = process.env.PROOF_SHARE_MARKDOWN_AUTH_MODE;
+      const previousTrustProxy = process.env.PROOF_TRUST_PROXY_HEADERS;
+      const previousTrustedHeaders = process.env.PROOF_TRUSTED_IDENTITY_EMAIL_HEADERS;
+      const previousTrustedDomains = process.env.PROOF_TRUSTED_IDENTITY_EMAIL_DOMAINS;
+      const previousTrustedEmails = process.env.PROOF_TRUSTED_IDENTITY_EMAILS;
+
+      process.env.PROOF_SHARE_MARKDOWN_AUTH_MODE = 'oauth';
+      process.env.PROOF_TRUST_PROXY_HEADERS = 'true';
+      process.env.PROOF_TRUSTED_IDENTITY_EMAIL_HEADERS = 'x-goog-authenticated-user-email';
+      process.env.PROOF_TRUSTED_IDENTITY_EMAIL_DOMAINS = 'elastic.co';
+      delete process.env.PROOF_TRUSTED_IDENTITY_EMAILS;
+
+      try {
+        const mismatchResponse = await post(baseUrl, '/api/share/markdown', {
+          markdown: '# mismatched owner',
+          ownerId: 'other@elastic.co',
+        }, {
+          'X-Goog-Authenticated-User-Email': 'accounts.google.com:agent@elastic.co',
+        });
+        assert(mismatchResponse.status === 403, `Expected ownerId mismatch to be rejected, got ${mismatchResponse.status}`);
+        const mismatchPayload = await mismatchResponse.json();
+        assertEqual(mismatchPayload.code, 'FORBIDDEN_OWNER_ID_MISMATCH', 'Expected ownerId mismatch code');
+
+        const matchingResponse = await post(baseUrl, '/api/share/markdown', {
+          markdown: '# matching owner',
+          ownerId: 'agent@elastic.co',
+        }, {
+          'X-Goog-Authenticated-User-Email': 'accounts.google.com:agent@elastic.co',
+        });
+        assert(matchingResponse.status === 200, `Expected matching trusted ownerId to succeed, got ${matchingResponse.status}`);
       } finally {
         if (previousMode === undefined) delete process.env.PROOF_SHARE_MARKDOWN_AUTH_MODE;
         else process.env.PROOF_SHARE_MARKDOWN_AUTH_MODE = previousMode;
