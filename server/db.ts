@@ -1973,14 +1973,14 @@ export function getStoredIdempotencyRecord(
   documentSlug: string,
   route: string,
   idempotencyKey: string,
-): { response: Record<string, unknown>; requestHash: string | null } | null {
+): { response: Record<string, unknown>; requestHash: string | null; statusCode: number } | null {
   const d = getDb();
   const coordinatorRow = d.prepare(`
-    SELECT response_json, request_hash
+    SELECT response_json, request_hash, status_code
     FROM ${MUTATION_IDEMPOTENCY_TABLE}
     WHERE idempotency_key = ? AND document_slug = ? AND route = ?
     LIMIT 1
-  `).get(idempotencyKey, documentSlug, route) as { response_json?: string; request_hash?: string | null } | undefined;
+  `).get(idempotencyKey, documentSlug, route) as { response_json?: string; request_hash?: string | null; status_code?: number | null } | undefined;
   const legacyRow = d.prepare(`
     SELECT response_json, request_hash
     FROM idempotency_keys
@@ -2010,6 +2010,7 @@ export function getStoredIdempotencyRecord(
     return {
       response,
       requestHash: typeof row.request_hash === 'string' ? row.request_hash : null,
+      statusCode: typeof (row as { status_code?: number | null }).status_code === 'number' ? (row as { status_code: number }).status_code : 200,
     };
   } catch {
     return null;
