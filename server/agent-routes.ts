@@ -647,6 +647,32 @@ type AgentParticipation = {
   cursorHint?: { quote?: string; ttlMs?: number } | null;
 };
 
+/**
+ * Derive a stable provisional agent ID from a user-agent string for unauthenticated
+ * agent-tool sessions (e.g. Claude Code's web_fetch tool "Claw"). Returns null for
+ * real browsers, the Claude AI model itself, and known link-unfurl bots.
+ */
+function deriveProvisionalAutoAgentId(ua: string): string | null {
+  if (!ua) return null;
+  const lower = ua.toLowerCase();
+  // Skip real browsers.
+  if (
+    lower.includes('mozilla') ||
+    lower.includes('chrome') ||
+    lower.includes('safari') ||
+    lower.includes('firefox') ||
+    lower.includes('edg') ||
+    lower.includes('opr')
+  ) return null;
+  // Skip the Claude AI model itself — it should use an explicit agent ID.
+  if (lower.includes('claude')) return null;
+  // Skip known link-unfurl bots.
+  if (lower.includes('twitterbot') || lower.includes('facebookexternalhit') || lower.includes('slackbot')) return null;
+  // Derive a stable 8-char hex ID from the full user-agent string.
+  const hash = createHash('sha1').update(ua).digest('hex').slice(0, 8);
+  return `ai:auto-${hash}`;
+}
+
 function ensureAgentPresenceForAuthenticatedCall(
   req: Request,
   slug: string,
@@ -654,8 +680,38 @@ function ensureAgentPresenceForAuthenticatedCall(
   details: string,
 ): boolean {
   const identity = resolveExplicitAgentIdentity(body, req.header('x-agent-id'));
+  const ua = req.header('user-agent') ?? '';
+  const provisionalId = deriveProvisionalAutoAgentId(ua);
+
+  if (identity.kind === 'missing') {
+    // No explicit identity — apply provisional auto-presence if the user-agent looks like
+    // an agent tool (e.g. Claw / Claude Code web_fetch) rather than a real browser.
+    if (!provisionalId) return false;
+    if (hasAgentPresenceInLoadedCollab(slug, provisionalId)) return false;
+    const now = new Date().toISOString();
+    const entry: Record<string, unknown> = {
+      id: provisionalId,
+      name: 'AI collaborator',
+      status: 'active',
+      details,
+      at: now,
+    };
+    const activity: Record<string, unknown> = { type: 'agent.presence', ...entry, autoJoined: true };
+    const collabApplied = applyAgentPresenceToLoadedCollab(slug, entry, activity);
+    if (!collabApplied) return false;
+    addDocumentEvent(slug, 'agent.presence', entry, provisionalId);
+    broadcastToRoom(slug, { type: 'agent.presence', source: 'agent', timestamp: now, ...entry, autoJoined: true });
+    return true;
+  }
+
   if (identity.kind !== 'ok') return false;
   const { id, name, color, avatar } = identity;
+
+  // When an explicit agent joins, evict any provisional auto-presence that was created
+  // for the same user-agent session so the real identity replaces the placeholder.
+  if (provisionalId) {
+    removeAgentPresenceFromLoadedCollab(slug, provisionalId);
+  }
 
   if (hasAgentPresenceInLoadedCollab(slug, id)) return false;
 
