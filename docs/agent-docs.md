@@ -79,6 +79,47 @@ If a URL contains `?token=`, treat it as an access token:
 - Preferred: `Authorization: Bearer <token>`
 - Also accepted: `x-share-token: <token>`
 
+## Cloud Run Behind IAP
+
+If you place Proof SDK behind Cloud Run + Identity-Aware Proxy, agents must satisfy the IAP layer **before** they can use Proof share tokens.
+
+Recommended configuration:
+
+```bash
+PROOF_TRUST_PROXY_HEADERS=true
+PROOF_TRUSTED_IDENTITY_EMAIL_HEADERS=x-goog-authenticated-user-email
+PROOF_TRUSTED_IDENTITY_EMAIL_DOMAINS=elastic.co
+PROOF_SHARE_MARKDOWN_AUTH_MODE=oauth
+```
+
+What this does:
+
+- IAP authenticates the caller and injects `x-goog-authenticated-user-email`.
+- Proof SDK trusts that header only when `PROOF_TRUST_PROXY_HEADERS=true` and the email matches `PROOF_TRUSTED_IDENTITY_EMAILS` or `PROOF_TRUSTED_IDENTITY_EMAIL_DOMAINS`.
+- `POST /api/share/markdown` and other hosted-auth checks can use that trusted identity without a separate Proof OAuth session.
+- When a direct share is created this way, the document owner is always the authenticated trusted email; mismatched `ownerId` values are rejected.
+
+Example request from an agent that already has IAP access:
+
+```bash
+curl -X POST "https://your-proof.example.com/api/share/markdown" \
+  -H "Content-Type: application/json" \
+  -H "X-Goog-Authenticated-User-Email: accounts.google.com:agent@elastic.co" \
+  -d '{"markdown":"# Hello from IAP"}'
+```
+
+After the request passes IAP, the returned Proof share token works the same as any other deployment:
+
+```bash
+curl -H "Authorization: Bearer <access-token>" \
+  "https://your-proof.example.com/documents/<slug>/state"
+```
+
+Notes:
+
+- This is intended for trusted reverse proxies such as IAP. Do **not** enable it on a public origin without a proxy that strips/spoofs those headers.
+- External agents that cannot authenticate to IAP will still be blocked at the IAP layer. In that case, either give the agent an allowed IAP identity/service account or expose a separate non-IAP agent ingress.
+
 ## Edit Via Ops (Comments, Suggestions, Rewrite)
 
 Use:

@@ -92,6 +92,26 @@ npm test
 - `docs/proof.SKILL.md`
 - `docs/adr/2026-03-proof-sdk-public-core.md`
 
+## Cloud Run + IAP
+
+If you deploy Proof SDK behind Cloud Run + Identity-Aware Proxy, the proxy must admit the caller before Proof's own share-token auth runs.
+
+For agent traffic, you can now configure Proof to trust an upstream verified email header:
+
+```bash
+PROOF_TRUST_PROXY_HEADERS=true
+PROOF_TRUSTED_IDENTITY_EMAIL_HEADERS=x-goog-authenticated-user-email
+PROOF_TRUSTED_IDENTITY_EMAIL_DOMAINS=elastic.co
+PROOF_SHARE_MARKDOWN_AUTH_MODE=oauth
+```
+
+- Cloud Run / IAP will authenticate the caller and inject `x-goog-authenticated-user-email`.
+- Proof SDK will accept that trusted header for hosted-auth flows such as `POST /api/share/markdown`.
+- New shares created through that path always use the authenticated trusted email as `ownerId`; mismatched `ownerId` values are rejected.
+- Share/document routes still use the normal Proof share tokens (`Authorization: Bearer <token>` or `x-share-token`) once the request has passed IAP.
+
+See `docs/agent-docs.md` for the full agent-side flow.
+
 ## License
 
 - Code: `MIT` in `LICENSE`
