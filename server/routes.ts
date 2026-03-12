@@ -110,11 +110,18 @@ const DEFAULT_DIRECT_SHARE_RATE_LIMIT_MAX_AUTH_PER_MIN = 120;
 const DIRECT_SHARE_RATE_LIMIT_MAX_BUCKETS = 10_000;
 const OPS_RATE_LIMIT_WINDOW_MS = parsePositiveIntEnv('PROOF_OPS_RATE_LIMIT_WINDOW_MS', 60_000);
 const OPS_RATE_LIMIT_MAX_REQUESTS = parsePositiveIntEnv('PROOF_OPS_RATE_LIMIT_MAX', 120);
+const DOCUMENT_ACCESS_RATE_LIMIT_WINDOW_MS = parsePositiveIntEnv('PROOF_DOCUMENT_ACCESS_RATE_LIMIT_WINDOW_MS', 60_000);
+const DOCUMENT_ACCESS_RATE_LIMIT_MAX_REQUESTS = parsePositiveIntEnv('PROOF_DOCUMENT_ACCESS_RATE_LIMIT_MAX', 600);
 const REWRITE_BARRIER_TIMEOUT_MS = parsePositiveIntEnv('PROOF_REWRITE_BARRIER_TIMEOUT_MS', 5000);
 const opsRateLimiter = createRateLimiter({
   windowMs: OPS_RATE_LIMIT_WINDOW_MS,
   maxRequests: OPS_RATE_LIMIT_MAX_REQUESTS,
   keyFn: (req) => `${getClientIp(req)}:${getSlugParam(req) || 'unknown'}`,
+});
+const documentAccessRateLimiter = createRateLimiter({
+  windowMs: DOCUMENT_ACCESS_RATE_LIMIT_WINDOW_MS,
+  maxRequests: DOCUMENT_ACCESS_RATE_LIMIT_MAX_REQUESTS,
+  keyFn: (req) => `${getClientIp(req)}:${getSlugParam(req) || 'unknown'}:document-access`,
 });
 
 export const shareMarkdownBodyParser = text({
@@ -909,7 +916,7 @@ apiRoutes.post('/documents', (req: Request, res: Response) => {
   });
 });
 
-apiRoutes.post('/documents/:slug/access-links', async (req: Request, res: Response) => {
+apiRoutes.post('/documents/:slug/access-links', documentAccessRateLimiter, async (req: Request, res: Response) => {
   const slug = getSlugParam(req);
   if (!slug) {
     res.status(400).json({ error: 'Invalid slug' });
@@ -1090,7 +1097,7 @@ export async function handleShareMarkdown(req: Request, res: Response): Promise<
   const ownerIdFromQuery = typeof req.query.ownerId === 'string' ? req.query.ownerId : undefined;
   const ownerId = typeof body?.ownerId === 'string'
     ? body.ownerId
-    : (ownerIdFromQuery ?? auth.ownerId ?? undefined);
+    : (ownerIdFromQuery ?? auth.ownerId);
 
   const roleFromBody = body?.accessRole ?? body?.defaultRole ?? body?.role;
   const roleFromQuery = typeof req.query.role === 'string' ? req.query.role : undefined;
@@ -1889,7 +1896,7 @@ apiRoutes.get('/documents/:slug/info', (req: Request, res: Response) => {
   });
 });
 
-apiRoutes.get('/documents/:slug/open-context', async (req: Request, res: Response) => {
+apiRoutes.get('/documents/:slug/open-context', documentAccessRateLimiter, async (req: Request, res: Response) => {
   const slug = getSlugParam(req);
   if (!slug) {
     res.status(400).json({ error: 'Invalid slug' });
@@ -1981,7 +1988,7 @@ apiRoutes.get('/documents/:slug/open-context', async (req: Request, res: Respons
   });
 });
 
-apiRoutes.post('/documents/:slug/collab-refresh', async (req: Request, res: Response) => {
+apiRoutes.post('/documents/:slug/collab-refresh', documentAccessRateLimiter, async (req: Request, res: Response) => {
   const slug = getSlugParam(req);
   if (!slug) {
     res.status(400).json({ error: 'Invalid slug' });

@@ -45,7 +45,7 @@ function normalizeTrustedIdentityEmail(raw: string): string | null {
 
 function isTrustedIdentityEmailAllowed(email: string, config: TrustedProxyIdentityConfig): boolean {
   if (config.allowedEmails.includes(email)) return true;
-  const domain = email.split('@')[1] || '';
+  const domain = email.split('@')[1];
   return domain ? config.allowedDomains.includes(domain) : false;
 }
 
@@ -69,8 +69,8 @@ export function resolveTrustedProxyIdentity(input: {
 }): TrustedProxyIdentityPrincipal | null {
   const config = getTrustedProxyIdentityConfig();
   if (!config.enabled) return null;
-  for (const header of config.emailHeaders) {
-    const raw = input.header(header);
+  for (const headerName of config.emailHeaders) {
+    const raw = input.header(headerName);
     const firstValue = Array.isArray(raw) ? raw[0] : raw;
     if (typeof firstValue !== 'string' || !firstValue.trim()) continue;
     const email = normalizeTrustedIdentityEmail(firstValue);
@@ -80,7 +80,7 @@ export function resolveTrustedProxyIdentity(input: {
       email,
       actor: `email:${email}`,
       ownerId: email,
-      header,
+      header: headerName,
     };
   }
   return null;
