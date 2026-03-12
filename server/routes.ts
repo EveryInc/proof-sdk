@@ -379,6 +379,7 @@ function getDirectSharePresentedToken(req: Request): string | null {
 type DirectShareAuthorizationResult = {
   authed: boolean;
   authMode: 'none' | 'api_key' | 'oauth' | 'oauth_or_api_key';
+  principalProvider: 'none' | 'api_key' | 'oauth' | 'trusted_proxy_email';
   actor: string;
   ownerId: string | null;
 };
@@ -461,7 +462,13 @@ async function authorizeDirectShareRequest(
   const presented = getDirectSharePresentedToken(req);
 
   if (authMode === 'none') {
-    return { authed: false, authMode, actor: 'anonymous', ownerId: null };
+    return {
+      authed: false,
+      authMode,
+      principalProvider: 'none',
+      actor: 'anonymous',
+      ownerId: null,
+    };
   }
 
   if (authMode === 'api_key') {
@@ -474,7 +481,13 @@ async function authorizeDirectShareRequest(
       return null;
     }
     if (presented === requiredApiKey) {
-      return { authed: true, authMode, actor: 'api-key', ownerId: null };
+      return {
+        authed: true,
+        authMode,
+        principalProvider: 'api_key',
+        actor: 'api-key',
+        ownerId: null,
+      };
     }
     res.status(401).json({
       error: 'Unauthorized direct share request',
@@ -486,7 +499,13 @@ async function authorizeDirectShareRequest(
 
   const requiredApiKey = getDirectShareApiKey();
   if (authMode === 'oauth_or_api_key' && requiredApiKey && presented === requiredApiKey) {
-    return { authed: true, authMode, actor: 'api-key', ownerId: null };
+    return {
+      authed: true,
+      authMode,
+      principalProvider: 'api_key',
+      actor: 'api-key',
+      ownerId: null,
+    };
   }
 
   const trustedProxyIdentity = resolveTrustedProxyIdentity(req);
@@ -494,6 +513,7 @@ async function authorizeDirectShareRequest(
     return {
       authed: true,
       authMode,
+      principalProvider: 'trusted_proxy_email',
       actor: trustedProxyIdentity.actor,
       ownerId: trustedProxyIdentity.ownerId,
     };
@@ -508,6 +528,7 @@ async function authorizeDirectShareRequest(
     return {
       authed: true,
       authMode,
+      principalProvider: 'oauth',
       actor: `oauth:${validated.principal.userId}`,
       ownerId: `oauth:${validated.principal.userId}`,
     };
@@ -1095,9 +1116,23 @@ export async function handleShareMarkdown(req: Request, res: Response): Promise<
     ? body.title
     : titleFromQuery;
   const ownerIdFromQuery = typeof req.query.ownerId === 'string' ? req.query.ownerId : undefined;
-  const ownerId = typeof body?.ownerId === 'string'
-    ? body.ownerId
-    : (ownerIdFromQuery ?? auth.ownerId);
+  const ownerIdFromBody = typeof body?.ownerId === 'string' ? body.ownerId : undefined;
+  const requestedOwnerId = ownerIdFromBody ?? ownerIdFromQuery;
+  if (
+    auth.principalProvider === 'trusted_proxy_email'
+    && typeof requestedOwnerId === 'string'
+    && requestedOwnerId.trim()
+    && !isTrustedProxyIdentityOwner(requestedOwnerId, auth.ownerId ?? '')
+  ) {
+    res.status(403).json({
+      error: 'ownerId must match the authenticated trusted proxy email',
+      code: 'FORBIDDEN_OWNER_ID_MISMATCH',
+    });
+    return;
+  }
+  const ownerId = auth.principalProvider === 'trusted_proxy_email'
+    ? auth.ownerId
+    : (ownerIdFromBody ?? ownerIdFromQuery ?? auth.ownerId);
 
   const roleFromBody = body?.accessRole ?? body?.defaultRole ?? body?.role;
   const roleFromQuery = typeof req.query.role === 'string' ? req.query.role : undefined;

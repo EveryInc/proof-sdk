@@ -97,7 +97,7 @@ What this does:
 - IAP authenticates the caller and injects `x-goog-authenticated-user-email`.
 - Proof SDK trusts that header only when `PROOF_TRUST_PROXY_HEADERS=true` and the email matches `PROOF_TRUSTED_IDENTITY_EMAILS` or `PROOF_TRUSTED_IDENTITY_EMAIL_DOMAINS`.
 - `POST /api/share/markdown` and other hosted-auth checks can use that trusted identity without a separate Proof OAuth session.
-- When a direct share is created this way, the document owner defaults to the trusted email unless you explicitly pass `ownerId`.
+- When a direct share is created this way, the document owner is always the authenticated trusted email; mismatched `ownerId` values are rejected.
 
 Example request from an agent that already has IAP access:
 

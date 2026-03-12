@@ -107,7 +107,7 @@ PROOF_SHARE_MARKDOWN_AUTH_MODE=oauth
 
 - Cloud Run / IAP will authenticate the caller and inject `x-goog-authenticated-user-email`.
 - Proof SDK will accept that trusted header for hosted-auth flows such as `POST /api/share/markdown`.
-- New shares created through that path default `ownerId` to the trusted email unless you explicitly pass `ownerId`.
+- New shares created through that path always use the authenticated trusted email as `ownerId`; mismatched `ownerId` values are rejected.
 - Share/document routes still use the normal Proof share tokens (`Authorization: Bearer <token>` or `x-share-token`) once the request has passed IAP.
 
 See `docs/agent-docs.md` for the full agent-side flow.
