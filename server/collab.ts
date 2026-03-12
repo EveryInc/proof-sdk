@@ -3456,7 +3456,11 @@ export function applyAgentPresenceToLoadedCollab(
 
   // Dual-write: persist presence to SQLite for TTL-based restart recovery.
   const expiresAtMs = Date.now() + ttlMs;
-  upsertAgentPresence(slug, agentId, 'presence', merged as Record<string, unknown>, expiresAtMs);
+  try {
+    upsertAgentPresence(slug, agentId, 'presence', merged as Record<string, unknown>, expiresAtMs);
+  } catch {
+    // SQLite write failed; Yjs is already updated. Startup prune handles reconciliation.
+  }
 
   touchDoc(slug);
 
@@ -3516,7 +3520,11 @@ export function removeAgentPresenceFromLoadedCollab(
   }, 'agent-presence-disconnect');
 
   // Dual-write: also remove from SQLite.
-  deleteAgentPresence(slug, normalizedAgentId);
+  try {
+    deleteAgentPresence(slug, normalizedAgentId);
+  } catch {
+    // ignore — Yjs is already updated; startup prune will reconcile
+  }
 
   if (!removed) return false;
   touchDoc(slug);
@@ -3554,7 +3562,11 @@ export function applyAgentCursorHintToLoadedCollab(
   }, 'agent-cursor');
 
   // Dual-write: persist cursor to SQLite for TTL-based restart recovery.
-  upsertAgentPresence(slug, agentId, 'cursor', payload as Record<string, unknown>, Date.now() + ttlMs);
+  try {
+    upsertAgentPresence(slug, agentId, 'cursor', payload as Record<string, unknown>, Date.now() + ttlMs);
+  } catch {
+    // SQLite write failed; Yjs is already updated. Startup prune handles reconciliation.
+  }
 
   touchDoc(slug);
 

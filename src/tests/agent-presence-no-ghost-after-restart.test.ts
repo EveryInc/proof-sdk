@@ -82,6 +82,58 @@ async function run(): Promise<void> {
 
     console.log('✓ Ghost agent evicted on load; active agent preserved');
     console.log('✓ pruneExpiredAgentEphemera correctly cross-references SQLite active set');
+
+    // --- Cursor ghost eviction ---
+    const cursorMap = ydoc.getMap<unknown>('agentCursors');
+    const ghostCursorId = 'ai:ghost-cursor-agent';
+    const ghostCursorEntry = {
+      id: ghostCursorId,
+      quote: 'some text',
+      ttlMs: 30_000,
+      at: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(),
+    };
+    ydoc.transact(() => {
+      cursorMap.set(ghostCursorId, ghostCursorEntry);
+    }, 'test-ghost-cursor-write');
+
+    assert(cursorMap.has(ghostCursorId), 'Expected ghost cursor to be in Yjs map before prune');
+
+    // No SQLite row for this cursor agent — simulates legacy / crashed state.
+    const cursorActiveBeforePrune = db.getActiveAgentPresence(slug);
+    assert(
+      !cursorActiveBeforePrune.some((r) => r.agentId === ghostCursorId && r.kind === 'cursor'),
+      'Expected ghost cursor agent NOT in SQLite agent_presence before prune',
+    );
+
+    collab.__unsafePruneAgentEphemeraForTests(slug, ydoc);
+
+    assert(
+      !cursorMap.has(ghostCursorId),
+      `Expected ghost cursor "${ghostCursorId}" to be evicted: present in Yjs but absent from SQLite active set`,
+    );
+
+    // Verify that a legitimately active cursor (with a current SQLite row) is NOT evicted.
+    const activeCursorId = 'ai:active-cursor-agent';
+    const activeCursorEntry = {
+      id: activeCursorId,
+      quote: 'active text',
+      ttlMs: 30_000,
+      at: new Date().toISOString(),
+    };
+    ydoc.transact(() => {
+      cursorMap.set(activeCursorId, activeCursorEntry);
+    }, 'test-active-cursor-write');
+
+    db.upsertAgentPresence(slug, activeCursorId, 'cursor', activeCursorEntry, Date.now() + 30_000);
+
+    collab.__unsafePruneAgentEphemeraForTests(slug, ydoc);
+
+    assert(
+      cursorMap.has(activeCursorId),
+      `Expected active cursor "${activeCursorId}" to survive prune (present in SQLite active set)`,
+    );
+
+    console.log('✓ Ghost cursor evicted on load; active cursor preserved');
   } finally {
     for (const suffix of ['', '-wal', '-shm']) {
       try {
