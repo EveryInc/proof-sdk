@@ -98,6 +98,8 @@ import {
   buildProofSdkDocumentPaths,
   buildProofSdkLinks,
 } from './proof-sdk-routes.js';
+import multer from 'multer';
+import { handleDocumentImport } from './import.js';
 
 export const apiRoutes = Router();
 runLegacyMarkRangeBackfillOnce();
@@ -115,6 +117,16 @@ const opsRateLimiter = createRateLimiter({
   maxRequests: OPS_RATE_LIMIT_MAX_REQUESTS,
   keyFn: (req) => `${getClientIp(req)}:${getSlugParam(req) || 'unknown'}`,
 });
+
+const importRateLimiter = createRateLimiter({
+  windowMs: 60_000,
+  maxRequests: 10,
+  keyFn: (req) => getClientIp(req),
+});
+const importUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 },
+}).single('file');
 
 export const shareMarkdownBodyParser = text({
   type: ['text/plain', 'text/markdown'],
@@ -542,7 +554,7 @@ function checkDirectShareRateLimit(
   return { allowed: true };
 }
 
-function getPublicBaseUrl(req: Request): string {
+export function getPublicBaseUrl(req: Request): string {
   if (trustProxyHeaders()) {
     const forwardedProtoHeader = req.header('x-forwarded-proto');
     const forwardedHostHeader = req.header('x-forwarded-host');
@@ -618,7 +630,7 @@ function resolveRequestScopedCollabWsBase(req: Request): string {
   }
 }
 
-function buildShareLink(req: Request, slug: string): { url: string; shareUrl: string } {
+export function buildShareLink(req: Request, slug: string): { url: string; shareUrl: string } {
   const url = `/d/${slug}`;
   const base = getPublicBaseUrl(req);
   return {
@@ -627,7 +639,7 @@ function buildShareLink(req: Request, slug: string): { url: string; shareUrl: st
   };
 }
 
-function withShareToken(url: string, token: string): string {
+export function withShareToken(url: string, token: string): string {
   const separator = url.includes('?') ? '&' : '?';
   return `${url}${separator}token=${encodeURIComponent(token)}`;
 }
@@ -778,6 +790,17 @@ function deriveShareCapabilities(role: ShareRole, shareState: string): {
     canEdit,
   };
 }
+
+// Import a document from .md or .docx file
+apiRoutes.post('/documents/import', importRateLimiter, importUpload, async (req: Request, res: Response) => {
+  try {
+    await handleDocumentImport(req, res);
+  } catch (err) {
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Internal server error', code: 'IMPORT_FAILED' });
+    }
+  }
+});
 
 // Create a shared document
 apiRoutes.post('/documents', (req: Request, res: Response) => {
