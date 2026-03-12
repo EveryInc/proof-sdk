@@ -5029,6 +5029,14 @@ export function __unsafeSchedulePersistDocFromOnChangeForTests(slug: string, inM
   schedulePersistDoc(slug, inMemoryDoc);
 }
 
+// Test-only helper: simulate the ghost-agent eviction that onLoadDocument performs.
+// Puts the doc into loadedDocs and calls pruneExpiredAgentEphemera so tests can
+// verify that Yjs entries absent from the SQLite active set are evicted.
+export function __unsafePruneAgentEphemeraForTests(slug: string, doc: Y.Doc): void {
+  rememberLoadedDoc(slug, doc);
+  pruneExpiredAgentEphemera(slug, doc);
+}
+
 // Test-only helper for exercising websocket error suppression behavior.
 export function __unsafeAttachCollabSocketErrorHandlerForTests(
   socket: unknown,
