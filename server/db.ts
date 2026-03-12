@@ -34,7 +34,6 @@ let mutationIdempotencyTableInitialized = false;
 let mutationOutboxTableInitialized = false;
 let markTombstonesTableInitialized = false;
 let activeCollabConnectionsTableInitialized = false;
-let agentPresenceTableInitialized = false;
 let lastActiveCollabConnectionPruneAt = 0;
 const DEFAULT_ACTIVE_COLLAB_CONNECTION_TTL_MS = 45_000;
 const DEFAULT_ACTIVE_COLLAB_CONNECTION_PRUNE_INTERVAL_MS = 10_000;
@@ -974,7 +973,6 @@ function initDatabase(): void {
     )
   `);
   d.exec('CREATE INDEX IF NOT EXISTS agent_presence_slug_expires ON agent_presence (slug, expires_at)');
-  agentPresenceTableInitialized = true;
 }
 
 export function createDocument(
@@ -1178,24 +1176,6 @@ export function removeActiveCollabConnection(connectionId: string): void {
   `).run(connectionId);
 }
 
-function ensureAgentPresenceTable(): void {
-  if (agentPresenceTableInitialized) return;
-  const d = getDb();
-  d.exec(`
-    CREATE TABLE IF NOT EXISTS agent_presence (
-      slug TEXT NOT NULL,
-      agent_id TEXT NOT NULL,
-      kind TEXT NOT NULL CHECK(kind IN ('presence', 'cursor')),
-      payload_json TEXT NOT NULL,
-      expires_at INTEGER NOT NULL,
-      updated_at TEXT NOT NULL,
-      PRIMARY KEY (slug, agent_id, kind)
-    )
-  `);
-  d.exec('CREATE INDEX IF NOT EXISTS agent_presence_slug_expires ON agent_presence (slug, expires_at)');
-  agentPresenceTableInitialized = true;
-}
-
 export function upsertAgentPresence(
   slug: string,
   agentId: string,
@@ -1204,7 +1184,6 @@ export function upsertAgentPresence(
   expiresAtMs: number,
 ): void {
   assertWritesAllowed('upsertAgentPresence');
-  ensureAgentPresenceTable();
   const now = new Date().toISOString();
   getDb().prepare(`
     INSERT OR REPLACE INTO agent_presence (slug, agent_id, kind, payload_json, expires_at, updated_at)
@@ -1215,7 +1194,6 @@ export function upsertAgentPresence(
 export function getActiveAgentPresence(
   slug: string,
 ): Array<{ agentId: string; kind: 'presence' | 'cursor'; payload: Record<string, unknown> }> {
-  ensureAgentPresenceTable();
   const rows = getDb().prepare(`
     SELECT agent_id, kind, payload_json
     FROM agent_presence
@@ -1234,7 +1212,6 @@ export function deleteAgentPresence(
   kind?: 'presence' | 'cursor',
 ): void {
   assertWritesAllowed('deleteAgentPresence');
-  ensureAgentPresenceTable();
   if (kind !== undefined) {
     getDb().prepare(`
       DELETE FROM agent_presence WHERE slug = ? AND agent_id = ? AND kind = ?
@@ -1248,7 +1225,6 @@ export function deleteAgentPresence(
 
 export function pruneExpiredAgentPresence(slug: string): void {
   assertWritesAllowed('pruneExpiredAgentPresence');
-  ensureAgentPresenceTable();
   getDb().prepare(`
     DELETE FROM agent_presence
     WHERE slug = ? AND expires_at < CAST((unixepoch('now', 'subsec') * 1000) AS INTEGER)

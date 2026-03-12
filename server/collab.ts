@@ -390,15 +390,7 @@ function scheduleAgentCursorExpiry(slug: string, agentId: string, at: string, tt
 function clearAgentPresenceForSlug(slug: string, agentId: string, at: string): void {
   // Delete from SQLite (durable store) regardless of ydoc state.
   try {
-    const row = getDb().prepare(`
-      SELECT payload_json FROM agent_presence WHERE slug = ? AND agent_id = ? AND kind = 'presence'
-    `).get(slug, agentId) as { payload_json: string } | undefined;
-    if (row) {
-      const payload = JSON.parse(row.payload_json) as Record<string, unknown>;
-      if (typeof payload.at !== 'string' || payload.at === at) {
-        deleteAgentPresence(slug, agentId, 'presence');
-      }
-    }
+    deleteAgentPresence(slug, agentId, 'presence');
   } catch {
     // ignore
   }
@@ -425,15 +417,7 @@ function clearAgentPresenceForSlug(slug: string, agentId: string, at: string): v
 function clearAgentCursorForSlug(slug: string, agentId: string, at: string): void {
   // Delete from SQLite (durable store) regardless of ydoc state.
   try {
-    const row = getDb().prepare(`
-      SELECT payload_json FROM agent_presence WHERE slug = ? AND agent_id = ? AND kind = 'cursor'
-    `).get(slug, agentId) as { payload_json: string } | undefined;
-    if (row) {
-      const payload = JSON.parse(row.payload_json) as Record<string, unknown>;
-      if (typeof payload.at !== 'string' || payload.at === at) {
-        deleteAgentPresence(slug, agentId, 'cursor');
-      }
-    }
+    deleteAgentPresence(slug, agentId, 'cursor');
   } catch {
     // ignore
   }
@@ -3475,7 +3459,6 @@ export function applyAgentPresenceToLoadedCollab(
   upsertAgentPresence(slug, agentId, 'presence', merged as Record<string, unknown>, expiresAtMs);
 
   touchDoc(slug);
-  schedulePersistDoc(slug, ydoc);
 
   // Expire presence after inactivity.
   const expiryAt = typeof incoming.at === 'string' && incoming.at.trim().length > 0
