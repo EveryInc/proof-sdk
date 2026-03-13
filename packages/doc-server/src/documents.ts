@@ -41,7 +41,7 @@ import {
 import { isShareRole, type ShareRole } from './share-types.js';
 import { broadcastToRoom, closeRoom, getRoomSize } from '../../../server/ws.js';
 import { runLegacyMarkRangeBackfillOnce } from '../../../server/marks-range-backfill.js';
-import { createRateLimiter } from '../../../server/rate-limiter.js';
+import { createRateLimiter } from './rate-limiter.js';
 import { getCookie, shareTokenCookieName } from './cookies.js';
 import { canonicalizeStoredMarks } from '@proof/core/marks';
 import {
@@ -69,7 +69,7 @@ import {
   resolveLegacyCreateMode,
   type LegacyCreateMode,
 } from './agent-guidance.js';
-import { captureDocumentCreatedTelemetry } from '../../../server/telemetry.js';
+import { captureDocumentCreatedTelemetry } from './telemetry.js';
 import { executeDocumentOperationAsync, type EngineExecutionResult } from '../../../server/document-engine.js';
 import {
   type DocumentOpType,
@@ -77,7 +77,7 @@ import {
   parseDocumentOpRequest,
   resolveDocumentOpRoute,
 } from '../../../server/document-ops.js';
-import { validateRewriteApplyPayload } from '../../../server/rewrite-validation.js';
+import { validateRewriteApplyPayload } from './rewrite-validation.js';
 import { adaptMutationResponse } from '../../../server/mutation-coordinator.js';
 import {
   annotateRewriteDisruptionMetadata,
@@ -86,7 +86,7 @@ import {
   rewriteBarrierFailedResponseBody,
   rewriteBlockedResponseBody,
 } from '../../../server/rewrite-policy.js';
-import { summarizeDocumentIntegrity } from '../../../server/document-integrity.js';
+import { summarizeDocumentIntegrity } from './document-integrity.js';
 import {
   getMutationContractStage,
   isIdempotencyRequired,

@@ -68,7 +68,7 @@ import { buildAgentSnapshot } from '../../../server/agent-snapshot.js';
 import { stripProofSpanTags } from '../../../server/proof-span-strip.js';
 import { applyAgentEditV2 } from '../../../server/agent-edit-v2.js';
 import { cloneFromCanonical, executeCanonicalRewrite, repairCanonicalProjection } from '../../../server/canonical-document.js';
-import { validateRewriteApplyPayload } from '../../../server/rewrite-validation.js';
+import { validateRewriteApplyPayload } from './rewrite-validation.js';
 import { adaptMutationResponse } from '../../../server/mutation-coordinator.js';
 import {
   annotateRewriteDisruptionMetadata,

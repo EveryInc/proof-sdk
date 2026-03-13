@@ -14,8 +14,8 @@ import {
   invalidateCollabDocumentAndWait,
 } from '../../../server/collab.js';
 import { broadcastToRoom, sendBridgeRequest, type BridgeError } from '../../../server/ws.js';
-import { findBridgeRoutePolicy, getBridgeRoutePolicies, type BridgeRoutePolicy } from '../../../server/bridge-auth-policy.js';
-import { validateRewriteApplyPayload } from '../../../server/rewrite-validation.js';
+import { findBridgeRoutePolicy, getBridgeRoutePolicies, type BridgeRoutePolicy } from './bridge-auth-policy.js';
+import { validateRewriteApplyPayload } from './rewrite-validation.js';
 import {
   recordRewriteBarrierFailure,
   recordRewriteBarrierLatency,
