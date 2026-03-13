@@ -4,27 +4,26 @@
   "version": "0.1.0",
   "description": "Proof SDK SQLite-backed document storage adapters",
   "main": "./dist/index.js",
-  "types": "./src/index.ts",
+  "types": "./dist/index.d.ts",
   "dependencies": {
     "@proof/server": "0.1.0"
   },
   "exports": {
     ".": {
-      "types": "./src/index.ts",
+      "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
     "./store": {
-      "types": "./src/store.ts",
+      "types": "./dist/store.d.ts",
       "import": "./dist/store.js"
     },
     "./types": {
-      "types": "./src/types.ts",
+      "types": "./dist/types.d.ts",
       "import": "./dist/types.js"
     }
   },
   "files": [
-    "dist",
-    "src"
+    "dist"
   ],
   "scripts": {
     "build": "node ../../scripts/build-package.mjs",

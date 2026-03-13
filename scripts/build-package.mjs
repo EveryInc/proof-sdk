@@ -1,5 +1,7 @@
 import { build } from 'esbuild';
-import { readdirSync, rmSync, statSync } from 'node:fs';
+import { mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 
 const packageDir = process.cwd();
@@ -51,3 +53,34 @@ await build({
   packages: 'external',
   logLevel: 'info',
 });
+
+const tempDir = mkdtempSync(path.join(tmpdir(), 'proof-package-types-'));
+const tempTsconfigPath = path.join(tempDir, 'tsconfig.json');
+
+writeFileSync(
+  tempTsconfigPath,
+  JSON.stringify({
+    compilerOptions: {
+      target: 'ES2020',
+      module: 'NodeNext',
+      moduleResolution: 'NodeNext',
+      declaration: true,
+      declarationMap: true,
+      emitDeclarationOnly: true,
+      noCheck: true,
+      outDir: distDir,
+      rootDir: srcDir,
+    },
+    include: entryPoints.map((entryPoint) => path.join(packageDir, entryPoint)),
+  }, null, 2),
+);
+
+try {
+  execFileSync(
+    'npx',
+    ['tsc', '-p', tempTsconfigPath],
+    { stdio: 'inherit', cwd: packageDir },
+  );
+} finally {
+  rmSync(tempDir, { recursive: true, force: true });
+}

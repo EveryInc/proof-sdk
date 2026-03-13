@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "description": "Proof SDK editor runtime and editor-facing plugins",
   "main": "./dist/index.js",
-  "types": "./src/index.ts",
+  "types": "./dist/index.d.ts",
   "dependencies": {
     "@proof/core": "0.1.0",
     "@milkdown/kit": "^7.5.0",
@@ -12,45 +12,44 @@
   },
   "exports": {
     ".": {
-      "types": "./src/index.ts",
+      "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
     "./batch-executor": {
-      "types": "./src/batch-executor.ts",
+      "types": "./dist/batch-executor.d.ts",
       "import": "./dist/batch-executor.js"
     },
     "./schema/code-block-ext": {
-      "types": "./src/schema/code-block-ext.ts",
+      "types": "./dist/schema/code-block-ext.d.ts",
       "import": "./dist/schema/code-block-ext.js"
     },
     "./schema/frontmatter": {
-      "types": "./src/schema/frontmatter.ts",
+      "types": "./dist/schema/frontmatter.d.ts",
       "import": "./dist/schema/frontmatter.js"
     },
     "./schema/proof-marks": {
-      "types": "./src/schema/proof-marks.ts",
+      "types": "./dist/schema/proof-marks.d.ts",
       "import": "./dist/schema/proof-marks.js"
     },
     "./utils/text-range": {
-      "types": "./src/utils/text-range.ts",
+      "types": "./dist/utils/text-range.d.ts",
       "import": "./dist/utils/text-range.js"
     },
     "./plugins/comments": {
-      "types": "./src/plugins/comments.ts",
+      "types": "./dist/plugins/comments.d.ts",
       "import": "./dist/plugins/comments.js"
     },
     "./plugins/marks": {
-      "types": "./src/plugins/marks.ts",
+      "types": "./dist/plugins/marks.d.ts",
       "import": "./dist/plugins/marks.js"
     },
     "./plugins/suggestions": {
-      "types": "./src/plugins/suggestions.ts",
+      "types": "./dist/plugins/suggestions.d.ts",
       "import": "./dist/plugins/suggestions.js"
     }
   },
   "files": [
-    "dist",
-    "src"
+    "dist"
   ],
   "scripts": {
     "build": "node ../../scripts/build-package.mjs --exclude src/editor.ts",
