@@ -16,13 +16,13 @@ import { Decoration, DecorationSet } from '@milkdown/kit/prose/view';
 import type { EditorState } from '@milkdown/kit/prose/state';
 import type { EditorView } from '@milkdown/kit/prose/view';
 import type { Node as ProseMirrorNode } from '@milkdown/kit/prose/model';
-import { getTextForRange, resolvePatternRange, resolveQuoteRange } from '../../../../src/editor/utils/text-range.js';
+import { getTextForRange, resolvePatternRange, resolveQuoteRange } from '../utils/text-range.js';
 
-import type { Comment, CommentReply, CommentSelector } from '../../../../src/formats/provenance-sidecar.js';
+import type { Comment, CommentReply, CommentSelector } from '@proof/core/provenance-sidecar';
 import {
   createComment,
   createReply,
-} from '../../../../src/formats/provenance-sidecar.js';
+} from '@proof/core/provenance-sidecar';
 
 export interface CommentState {
   comments: Comment[];

@@ -15,9 +15,9 @@ import {
   hasHeading,
   extractHeadingFromText,
   type SelectorRange,
-} from '../../../src/editor/utils/selectors.js';
-import { setAgentCursor, setAgentSelection } from '../../../src/editor/plugins/agent-cursor.js';
-import { captureEvent } from '../../../src/analytics/telemetry.js';
+} from './utils/selectors.js';
+import { setAgentCursor, setAgentSelection } from './plugins/agent-cursor-bridge.js';
+import { captureEvent } from './telemetry.js';
 
 export interface BatchOperation {
   op: 'select' | 'goto' | 'insert' | 'replace' | 'delete' | 'save';

@@ -4,6 +4,10 @@
   "type": "module",
   "version": "0.1.0",
   "description": "Proof SDK editor runtime and editor-facing plugins",
+  "dependencies": {
+    "@proof/core": "0.1.0",
+    "@milkdown/kit": "^7.5.0"
+  },
   "exports": {
     ".": "./src/index.ts",
     "./editor": "./src/editor.ts",

@@ -4,6 +4,9 @@
   "type": "module",
   "version": "0.1.0",
   "description": "Proof SDK SQLite-backed document storage adapters",
+  "dependencies": {
+    "@proof/server": "0.1.0"
+  },
   "exports": {
     ".": "./src/index.ts",
     "./store": "./src/store.ts",

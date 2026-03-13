@@ -4,6 +4,9 @@
   "type": "module",
   "version": "0.1.0",
   "description": "Proof SDK document, share, and collaboration server routes",
+  "dependencies": {
+    "express": "^5.2.1"
+  },
   "exports": {
     ".": "./src/index.ts",
     "./agent": "./src/agent.ts",
