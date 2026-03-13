@@ -8,6 +8,7 @@ async function run(): Promise<void> {
   const coreMarks = await import('@proof/core/marks');
   const sqliteTypes = await import('@proof/sqlite/types');
   const serverDocuments = await import('@proof/server/documents');
+  const serverShareTypes = await import('@proof/server/share-types');
   const editorCommentsExport = await import('@proof/editor/plugins/comments');
 
   if (typeof core.getMarkColor !== 'function') {
@@ -56,6 +57,10 @@ async function run(): Promise<void> {
 
   if (typeof serverDocuments.createDocumentRouter !== 'function') {
     throw new Error('Expected @proof/server/documents subpath export to expose createDocumentRouter');
+  }
+
+  if (typeof serverShareTypes.isShareRole !== 'function') {
+    throw new Error('Expected @proof/server/share-types subpath export to expose isShareRole');
   }
 
   if (typeof editorCommentsExport.getUnresolvedPluginComments !== 'function') {
