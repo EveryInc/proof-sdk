@@ -59,14 +59,14 @@ import {
   parseDocumentOpRequest,
   resolveDocumentOpRoute,
 } from './document-ops.js';
-import { applyAgentEditOperations, type AgentEditOperation } from './agent-edit-ops-shared.js';
+import { applyAgentEditOperations, type AgentEditOperation } from './agent-edit-ops.js';
 import {
   ALT_SHARE_TOKEN_HEADER_FORMAT,
   AUTH_HEADER_FORMAT,
 } from './agent-guidance.js';
 import { buildAgentSnapshot } from './agent-snapshot.js';
 import { stripProofSpanTags } from './proof-span-strip.js';
-import { applyAgentEditV2 } from './agent-edit-v2-shared.js';
+import { applyAgentEditV2 } from './agent-edit-v2.js';
 import { cloneFromCanonical, executeCanonicalRewrite, repairCanonicalProjection } from './canonical-document-shared.js';
 import { validateRewriteApplyPayload } from './rewrite-validation.js';
 import { adaptMutationResponse } from './mutation-coordinator.js';

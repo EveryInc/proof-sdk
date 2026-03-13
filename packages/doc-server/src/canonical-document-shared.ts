@@ -1,4 +1,5 @@
 export {
+  deriveProjectionFromCanonicalDoc,
   cloneFromCanonical,
   executeCanonicalRewrite,
   mutateCanonicalDocument,

@@ -21,6 +21,7 @@ export {
   invalidateLoadedCollabDocument,
   invalidateLoadedCollabDocumentAndWait,
   isCanonicalReadMutationReady,
+  loadCanonicalYDoc,
   logCollabSocketErrorWithSuppression,
   noteRecentCollabSessionLease,
   releaseRewriteLock,
