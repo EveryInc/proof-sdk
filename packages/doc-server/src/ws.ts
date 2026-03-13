@@ -14,7 +14,7 @@ import {
   getCollabSessionClaims,
   handleCollabWebSocketConnection,
   logCollabSocketErrorWithSuppression,
-} from '../../../server/collab.js';
+} from './collab-shared.js';
 
 interface Client {
   ws: WebSocket;

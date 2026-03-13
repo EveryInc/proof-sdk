@@ -35,7 +35,7 @@ import {
   acquireRewriteLock,
   releaseRewriteLock,
   stripEphemeralCollabSpans,
-} from '../../../server/collab.js';
+} from './collab-shared.js';
 import { canonicalizeStoredMarks, type StoredMark } from '@proof/core/marks';
 import {
   deriveCollabApplied,

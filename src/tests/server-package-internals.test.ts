@@ -3,6 +3,8 @@ async function run(): Promise<void> {
   const shimMetrics = await import('../../server/metrics.ts');
   const packageWs = await import('../../packages/doc-server/src/ws.ts');
   const shimWs = await import('../../server/ws.ts');
+  const packageCollabShared = await import('../../packages/doc-server/src/collab-shared.ts');
+  const shimCollab = await import('../../server/collab.ts');
   const packageHeadless = await import('../../packages/doc-server/src/milkdown-headless.ts');
   const shimHeadless = await import('../../server/milkdown-headless.ts');
 
@@ -20,6 +22,14 @@ async function run(): Promise<void> {
 
   if (packageWs.getActiveCollabClientCount !== shimWs.getActiveCollabClientCount) {
     throw new Error('Expected server ws shim to preserve collab client counters');
+  }
+
+  if (packageCollabShared.getCollabRuntime !== shimCollab.getCollabRuntime) {
+    throw new Error('Expected collab shared facade to re-export collab runtime helpers');
+  }
+
+  if (packageCollabShared.getCanonicalReadableDocumentSync !== shimCollab.getCanonicalReadableDocumentSync) {
+    throw new Error('Expected collab shared facade to preserve canonical read helpers');
   }
 
   if (packageHeadless.getHeadlessMilkdownParser !== shimHeadless.getHeadlessMilkdownParser) {

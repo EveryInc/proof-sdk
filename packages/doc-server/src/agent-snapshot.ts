@@ -1,7 +1,7 @@
 import { createHash } from 'crypto';
 import type { DocumentRow, DocumentBlockRow } from './db.js';
 import { getDocumentBySlug, listLiveDocumentBlocks } from './db.js';
-import { getCanonicalReadableDocumentSync, isCanonicalReadMutationReady } from '../../../server/collab.js';
+import { getCanonicalReadableDocumentSync, isCanonicalReadMutationReady } from './collab-shared.js';
 import {
   getHeadlessMilkdownParser,
   parseMarkdownWithHtmlFallback,

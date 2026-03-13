@@ -12,7 +12,7 @@ import {
   invalidateCollabDocumentAndWait,
   stripEphemeralCollabSpans,
   acquireRewriteLock,
-} from '../../../server/collab.js';
+} from './collab-shared.js';
 import { getSnapshotPublicUrl, refreshSnapshotForSlug } from './snapshot.js';
 import { executeCanonicalRewrite, mutateCanonicalDocument } from '../../../server/canonical-document.js';
 import {

@@ -12,7 +12,7 @@ import {
   getCollabRuntime,
   invalidateCollabDocument,
   invalidateCollabDocumentAndWait,
-} from '../../../server/collab.js';
+} from './collab-shared.js';
 import { broadcastToRoom, sendBridgeRequest, type BridgeError } from './ws.js';
 import { findBridgeRoutePolicy, getBridgeRoutePolicies, type BridgeRoutePolicy } from './bridge-auth-policy.js';
 import { validateRewriteApplyPayload } from './rewrite-validation.js';

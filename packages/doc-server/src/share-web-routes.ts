@@ -19,7 +19,7 @@ import {
   getCanonicalReadableDocumentSync,
   isCanonicalReadMutationReady,
   noteRecentCollabSessionLease,
-} from '../../../server/collab.js';
+} from './collab-shared.js';
 import {
   AGENT_DOCS_PATH,
   ALT_SHARE_TOKEN_HEADER_FORMAT,
