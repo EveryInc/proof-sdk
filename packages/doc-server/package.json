@@ -5,6 +5,7 @@
   "version": "0.1.0",
   "description": "Proof SDK document, share, and collaboration server routes",
   "dependencies": {
+    "@proof/core": "0.1.0",
     "express": "^5.2.1"
   },
   "exports": {
