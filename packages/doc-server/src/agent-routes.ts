@@ -41,7 +41,7 @@ import {
   deriveCollabApplied,
   deriveCursorApplied,
   derivePresenceApplied,
-} from '../../../server/agent-collab-status.js';
+} from './agent-collab-status.js';
 import { executeDocumentOperation, executeDocumentOperationAsync } from '../../../server/document-engine.js';
 import {
   recordAgentMutation,
@@ -58,18 +58,18 @@ import {
   type DocumentOpType,
   parseDocumentOpRequest,
   resolveDocumentOpRoute,
-} from '../../../server/document-ops.js';
+} from './document-ops.js';
 import { applyAgentEditOperations, type AgentEditOperation } from '../../../server/agent-edit-ops.js';
 import {
   ALT_SHARE_TOKEN_HEADER_FORMAT,
   AUTH_HEADER_FORMAT,
 } from './agent-guidance.js';
 import { buildAgentSnapshot } from '../../../server/agent-snapshot.js';
-import { stripProofSpanTags } from '../../../server/proof-span-strip.js';
+import { stripProofSpanTags } from './proof-span-strip.js';
 import { applyAgentEditV2 } from '../../../server/agent-edit-v2.js';
 import { cloneFromCanonical, executeCanonicalRewrite, repairCanonicalProjection } from '../../../server/canonical-document.js';
 import { validateRewriteApplyPayload } from './rewrite-validation.js';
-import { adaptMutationResponse } from '../../../server/mutation-coordinator.js';
+import { adaptMutationResponse } from './mutation-coordinator.js';
 import {
   annotateRewriteDisruptionMetadata,
   classifyRewriteBarrierFailureReason,

@@ -57,7 +57,7 @@ import {
   revokeHostedSessionToken,
   startOAuthFlow,
   validateHostedSessionToken,
-} from '../../../server/hosted-auth.js';
+} from './hosted-auth.js';
 import {
   AGENT_DOCS_PATH,
   CANONICAL_CREATE_API_PATH,
@@ -76,9 +76,9 @@ import {
   authorizeDocumentOp,
   parseDocumentOpRequest,
   resolveDocumentOpRoute,
-} from '../../../server/document-ops.js';
+} from './document-ops.js';
 import { validateRewriteApplyPayload } from './rewrite-validation.js';
-import { adaptMutationResponse } from '../../../server/mutation-coordinator.js';
+import { adaptMutationResponse } from './mutation-coordinator.js';
 import {
   annotateRewriteDisruptionMetadata,
   classifyRewriteBarrierFailureReason,

@@ -14,7 +14,7 @@ import { recordShareLinkOpen } from '../../../server/metrics.js';
 import { getCookie, shareTokenCookieName } from './cookies.js';
 import { handleShareMarkdown, shareMarkdownBodyParser } from '../../../server/routes.js';
 import { getSnapshotHtml, getSnapshotPublicUrl } from '../../../server/snapshot.js';
-import { stripProofSpanTags } from '../../../server/proof-span-strip.js';
+import { stripProofSpanTags } from './proof-span-strip.js';
 import {
   getCanonicalReadableDocumentSync,
   isCanonicalReadMutationReady,
