@@ -40,7 +40,7 @@ import {
 } from '../../../server/db.js';
 import { isShareRole, type ShareRole } from './share-types.js';
 import { broadcastToRoom, closeRoom, getRoomSize } from '../../../server/ws.js';
-import { runLegacyMarkRangeBackfillOnce } from '../../../server/marks-range-backfill.js';
+import { runLegacyMarkRangeBackfillOnce } from './marks-range-backfill.js';
 import { createRateLimiter } from './rate-limiter.js';
 import { getCookie, shareTokenCookieName } from './cookies.js';
 import { canonicalizeStoredMarks } from '@proof/core/marks';

@@ -64,7 +64,7 @@ import {
   ALT_SHARE_TOKEN_HEADER_FORMAT,
   AUTH_HEADER_FORMAT,
 } from './agent-guidance.js';
-import { buildAgentSnapshot } from '../../../server/agent-snapshot.js';
+import { buildAgentSnapshot } from './agent-snapshot.js';
 import { stripProofSpanTags } from './proof-span-strip.js';
 import { applyAgentEditV2 } from '../../../server/agent-edit-v2.js';
 import { cloneFromCanonical, executeCanonicalRewrite, repairCanonicalProjection } from '../../../server/canonical-document.js';
