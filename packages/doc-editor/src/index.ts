@@ -5,6 +5,7 @@ export * from './plugins/suggestions.js';
 export {
   addComment,
   addCommentAtSelection,
+  commentsCtx,
   commentsPlugin,
   commentsPluginKey,
   commentsPlugins,
@@ -12,6 +13,7 @@ export {
   getActiveCommentId,
   getComments,
   getResolvedComments,
+  getUnresolvedComments,
   getUnresolvedPluginComments,
   hasProofMention,
   replyToComment,

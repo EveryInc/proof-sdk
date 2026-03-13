@@ -1,15 +1,55 @@
 async function run(): Promise<void> {
-  const core = await import('../../packages/doc-core/src/index.ts');
-  const sqlite = await import('../../packages/doc-store-sqlite/src/index.ts');
-  const server = await import('../../packages/doc-server/src/index.ts');
-  const editorBatch = await import('../../packages/doc-editor/src/batch-executor.ts');
-  const editorComments = await import('../../packages/doc-editor/src/plugins/comments.ts');
-  const editorSuggestions = await import('../../packages/doc-editor/src/plugins/suggestions.ts');
+  const documentStub = {
+    readyState: 'loading',
+    location: { pathname: '/' },
+    documentElement: { style: {} },
+    addEventListener() {},
+    getElementById() { return null; },
+    createElement() {
+      return {
+        style: {},
+        appendChild() {},
+        setAttribute() {},
+        classList: {
+          add() {},
+          remove() {},
+        },
+      };
+    },
+    head: { appendChild() {} },
+    querySelector() { return null; },
+    title: '',
+    visibilityState: 'visible',
+  };
+
+  (globalThis as typeof globalThis & { document: typeof documentStub }).document = documentStub;
+  (globalThis as typeof globalThis & { window: object }).window = {
+    location: { search: '', pathname: '/' },
+    addEventListener() {},
+    removeEventListener() {},
+    document: documentStub,
+  };
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true,
+    value: {
+      userAgent: 'node',
+      vendor: '',
+      maxTouchPoints: 0,
+      platform: 'Linux',
+    },
+  });
+
+  const core = await import('@proof/core');
+  const sqlite = await import('@proof/sqlite');
+  const server = await import('@proof/server');
+  const editor = await import('@proof/editor');
+  const editorBatch = await import('@proof/editor/batch-executor');
+  const editorComments = await import('@proof/editor/plugins/comments');
+  const editorSuggestions = await import('@proof/editor/plugins/suggestions');
   const coreMarks = await import('@proof/core/marks');
   const sqliteTypes = await import('@proof/sqlite/types');
   const serverDocuments = await import('@proof/server/documents');
   const serverShareTypes = await import('@proof/server/share-types');
-  const editorCommentsExport = await import('@proof/editor/plugins/comments');
 
   if (typeof core.getMarkColor !== 'function') {
     throw new Error('Expected @proof/core surface to expose getMarkColor');
@@ -33,6 +73,14 @@ async function run(): Promise<void> {
 
   if (typeof server.createBridgeRouter !== 'function') {
     throw new Error('Expected @proof/server surface to expose createBridgeRouter');
+  }
+
+  if (!['function', 'object'].includes(typeof editor.commentsCtx)) {
+    throw new Error('Expected @proof/editor root surface to expose commentsCtx');
+  }
+
+  if (typeof editor.getUnresolvedComments !== 'function') {
+    throw new Error('Expected @proof/editor root surface to expose getUnresolvedComments');
   }
 
   if (typeof editorBatch.executeBatch !== 'function') {
@@ -63,7 +111,7 @@ async function run(): Promise<void> {
     throw new Error('Expected @proof/server/share-types subpath export to expose isShareRole');
   }
 
-  if (typeof editorCommentsExport.getUnresolvedPluginComments !== 'function') {
+  if (typeof editorComments.getUnresolvedPluginComments !== 'function') {
     throw new Error('Expected @proof/editor/plugins/comments subpath export to expose getUnresolvedPluginComments');
   }
 
