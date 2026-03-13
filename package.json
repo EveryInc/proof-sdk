@@ -23,7 +23,7 @@
     "build:packages": "npm --workspace @proof/core run build && npm --workspace @proof/editor run build && npm --workspace @proof/server run build && npm --workspace @proof/sqlite run build",
     "serve": "tsx server/index.ts",
     "test": "npm run test:proof-sdk && npm run test:server-routes-share",
-    "test:packages": "npm run build:packages && node --import tsx src/tests/proof-sdk-package-surfaces.test.ts && node --import tsx src/tests/editor-package-regressions.test.ts && node --import tsx src/tests/server-package-internals.test.ts && node --import tsx src/tests/package-packed-consumer.test.ts",
+    "test:packages": "npm run build:packages && node --import tsx src/tests/proof-sdk-package-surfaces.test.ts && node --import tsx src/tests/editor-package-regressions.test.ts && node --import tsx src/tests/server-package-internals.test.ts && node --import tsx src/tests/share-web-local-build-regression.test.ts && node --import tsx src/tests/package-packed-consumer.test.ts",
     "test:proof-sdk": "tsx src/tests/proof-sdk-agent-bridge-client.test.ts",
     "test:server-routes-share": "tsx src/tests/server-routes-and-share.test.ts",
     "demo:agent": "npm --workspace proof-example run demo:agent",

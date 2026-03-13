@@ -1,6 +1,6 @@
 import { createHash } from 'crypto';
 import { Router, type Request, type Response } from 'express';
-import { readFileSync } from 'fs';
+import { existsSync, readFileSync } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import {
@@ -123,7 +123,22 @@ function deriveShareCapabilities(role: ShareRole, shareState: string): { canRead
 // SPA fallback: serve index.html for /d/:slug routes
 // Rewrite relative asset paths to absolute so they work from /d/ subpath
 let shareHtml: string | null = null;
-const distPath = path.resolve(__dirname, '..', 'dist');
+
+export function resolveShareEditorDistPath(): string | null {
+  const configured = process.env.PROOF_WEB_DIST_DIR?.trim();
+  const candidates = [
+    configured || null,
+    path.resolve(process.cwd(), 'dist'),
+    path.resolve(__dirname, '..', '..', '..', 'dist'),
+    path.resolve(__dirname, '..', 'dist'),
+  ].filter((candidate): candidate is string => Boolean(candidate));
+
+  for (const candidate of candidates) {
+    if (existsSync(path.join(candidate, 'index.html'))) return candidate;
+  }
+
+  return null;
+}
 
 function escapeHtml(value: string): string {
   return value
@@ -597,6 +612,8 @@ shareWebRoutes.get('/d/:slug', (req: Request, res: Response) => {
   const shouldReloadShareHtml = process.env.NODE_ENV !== 'production' || !shareHtml;
   if (shouldReloadShareHtml) {
     try {
+      const distPath = resolveShareEditorDistPath();
+      if (!distPath) throw new Error('share editor dist not found');
       shareHtml = readFileSync(path.join(distPath, 'index.html'), 'utf-8')
         .replace(/"\.\//g, '"/'); // "./assets/..." -> "/assets/..."
     } catch {
