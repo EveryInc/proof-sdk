@@ -1,5 +1,5 @@
 import type { Router } from 'express';
-import { agentRoutes } from '../../../server/agent-routes.js';
+import { agentRoutes } from './agent-routes.js';
 
 export function createAgentRouter(): Router {
   return agentRoutes;
