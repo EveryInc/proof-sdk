@@ -5,8 +5,8 @@ import {
   getDocumentBySlug,
   resolveDocumentAccessRole,
 } from './db.js';
-import { executeDocumentOperationAsync } from '../../../server/document-engine.js';
-import { executeCanonicalRewrite } from '../../../server/canonical-document.js';
+import { executeDocumentOperationAsync } from './document-engine-shared.js';
+import { executeCanonicalRewrite } from './canonical-document-shared.js';
 import {
   applyCanonicalDocumentToCollab,
   getCollabRuntime,

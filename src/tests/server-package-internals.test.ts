@@ -5,6 +5,14 @@ async function run(): Promise<void> {
   const shimWs = await import('../../server/ws.ts');
   const packageCollabShared = await import('../../packages/doc-server/src/collab-shared.ts');
   const shimCollab = await import('../../server/collab.ts');
+  const packageCanonical = await import('../../packages/doc-server/src/canonical-document-shared.ts');
+  const shimCanonical = await import('../../server/canonical-document.ts');
+  const packageEngine = await import('../../packages/doc-server/src/document-engine-shared.ts');
+  const shimEngine = await import('../../server/document-engine.ts');
+  const packageAgentEditOps = await import('../../packages/doc-server/src/agent-edit-ops-shared.ts');
+  const shimAgentEditOps = await import('../../server/agent-edit-ops.ts');
+  const packageAgentEditV2 = await import('../../packages/doc-server/src/agent-edit-v2-shared.ts');
+  const shimAgentEditV2 = await import('../../server/agent-edit-v2.ts');
   const packageHeadless = await import('../../packages/doc-server/src/milkdown-headless.ts');
   const shimHeadless = await import('../../server/milkdown-headless.ts');
 
@@ -30,6 +38,22 @@ async function run(): Promise<void> {
 
   if (packageCollabShared.getCanonicalReadableDocumentSync !== shimCollab.getCanonicalReadableDocumentSync) {
     throw new Error('Expected collab shared facade to preserve canonical read helpers');
+  }
+
+  if (packageCanonical.executeCanonicalRewrite !== shimCanonical.executeCanonicalRewrite) {
+    throw new Error('Expected canonical shared facade to re-export canonical rewrite helpers');
+  }
+
+  if (packageEngine.executeDocumentOperationAsync !== shimEngine.executeDocumentOperationAsync) {
+    throw new Error('Expected document engine facade to preserve async execution helpers');
+  }
+
+  if (packageAgentEditOps.applyAgentEditOperations !== shimAgentEditOps.applyAgentEditOperations) {
+    throw new Error('Expected agent edit ops facade to preserve applyAgentEditOperations');
+  }
+
+  if (packageAgentEditV2.applyAgentEditV2 !== shimAgentEditV2.applyAgentEditV2) {
+    throw new Error('Expected agent edit v2 facade to preserve applyAgentEditV2');
   }
 
   if (packageHeadless.getHeadlessMilkdownParser !== shimHeadless.getHeadlessMilkdownParser) {

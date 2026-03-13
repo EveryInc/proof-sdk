@@ -14,7 +14,7 @@ import {
   acquireRewriteLock,
 } from './collab-shared.js';
 import { getSnapshotPublicUrl, refreshSnapshotForSlug } from './snapshot.js';
-import { executeCanonicalRewrite, mutateCanonicalDocument } from '../../../server/canonical-document.js';
+import { executeCanonicalRewrite, mutateCanonicalDocument } from './canonical-document-shared.js';
 import {
   addEvent,
   addDocumentEvent,
@@ -70,7 +70,7 @@ import {
   type LegacyCreateMode,
 } from './agent-guidance.js';
 import { captureDocumentCreatedTelemetry } from './telemetry.js';
-import { executeDocumentOperationAsync, type EngineExecutionResult } from '../../../server/document-engine.js';
+import { executeDocumentOperationAsync, type EngineExecutionResult } from './document-engine-shared.js';
 import {
   type DocumentOpType,
   authorizeDocumentOp,
