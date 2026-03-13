@@ -1,5 +1,5 @@
 import { build } from 'esbuild';
-import { mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { copyFileSync, mkdtempSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
 import path from 'node:path';
@@ -9,12 +9,23 @@ const srcDir = path.join(packageDir, 'src');
 const distDir = path.join(packageDir, 'dist');
 
 const excludes = new Set();
+const copies = [];
 for (let index = 2; index < process.argv.length; index += 1) {
-  if (process.argv[index] !== '--exclude') continue;
-  const nextValue = process.argv[index + 1];
-  if (!nextValue) continue;
-  excludes.add(path.normalize(nextValue));
-  index += 1;
+  if (process.argv[index] === '--exclude') {
+    const nextValue = process.argv[index + 1];
+    if (!nextValue) continue;
+    excludes.add(path.normalize(nextValue));
+    index += 1;
+    continue;
+  }
+  if (process.argv[index] === '--copy') {
+    const nextValue = process.argv[index + 1];
+    if (!nextValue) continue;
+    const [from, to] = nextValue.split('=');
+    if (!from || !to) continue;
+    copies.push({ from, to });
+    index += 1;
+  }
 }
 
 function collectTsFiles(dir) {
@@ -34,6 +45,19 @@ function collectTsFiles(dir) {
   return files;
 }
 
+function copyRecursive(fromPath, toPath) {
+  const stats = statSync(fromPath);
+  if (stats.isDirectory()) {
+    mkdirSync(toPath, { recursive: true });
+    for (const entry of readdirSync(fromPath)) {
+      copyRecursive(path.join(fromPath, entry), path.join(toPath, entry));
+    }
+    return;
+  }
+  mkdirSync(path.dirname(toPath), { recursive: true });
+  copyFileSync(fromPath, toPath);
+}
+
 const entryPoints = collectTsFiles(srcDir);
 if (entryPoints.length === 0) {
   throw new Error(`No package source files found in ${srcDir}`);
@@ -45,7 +69,7 @@ await build({
   entryPoints,
   outdir: distDir,
   outbase: 'src',
-  bundle: false,
+  bundle: true,
   format: 'esm',
   platform: 'node',
   target: 'es2020',
@@ -83,4 +107,11 @@ try {
   );
 } finally {
   rmSync(tempDir, { recursive: true, force: true });
+}
+
+for (const copy of copies) {
+  copyRecursive(
+    path.resolve(packageDir, copy.from),
+    path.resolve(packageDir, copy.to),
+  );
 }

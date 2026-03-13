@@ -62,10 +62,11 @@
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "public"
   ],
   "scripts": {
-    "build": "node ../../scripts/build-package.mjs",
-    "clean": "rm -rf dist"
+    "build": "node ../../scripts/build-package.mjs --copy ../../public/assets/og-share=public/assets/og-share",
+    "clean": "rm -rf dist public"
   }
 }

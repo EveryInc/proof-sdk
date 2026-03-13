@@ -60,6 +60,7 @@ plans/*-plan-cache.json
 
 # MCP Server build
 dist-mcp/
+packages/doc-server/public/
 
 # Share server local data
 proof-share.db
