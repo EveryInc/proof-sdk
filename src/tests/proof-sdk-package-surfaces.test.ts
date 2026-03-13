@@ -46,6 +46,9 @@ async function run(): Promise<void> {
   const editorBatch = await import('@proof/editor/batch-executor');
   const editorComments = await import('@proof/editor/plugins/comments');
   const editorSuggestions = await import('@proof/editor/plugins/suggestions');
+  const editorCodeBlockExt = await import('@proof/editor/schema/code-block-ext');
+  const editorFrontmatter = await import('@proof/editor/schema/frontmatter');
+  const editorProofMarks = await import('@proof/editor/schema/proof-marks');
   const coreMarks = await import('@proof/core/marks');
   const sqliteTypes = await import('@proof/sqlite/types');
   const serverDocuments = await import('@proof/server/documents');
@@ -97,6 +100,18 @@ async function run(): Promise<void> {
 
   if (typeof editorSuggestions.wrapTransactionForSuggestions !== 'function') {
     throw new Error('Expected @proof/editor suggestions surface to expose wrapTransactionForSuggestions');
+  }
+
+  if (!Array.isArray(editorCodeBlockExt.codeBlockExtPlugins)) {
+    throw new Error('Expected @proof/editor/schema/code-block-ext to expose codeBlockExtPlugins');
+  }
+
+  if (!editorFrontmatter.frontmatterSchema) {
+    throw new Error('Expected @proof/editor/schema/frontmatter to expose frontmatterSchema');
+  }
+
+  if (!Array.isArray(editorProofMarks.proofMarkPlugins)) {
+    throw new Error('Expected @proof/editor/schema/proof-marks to expose proofMarkPlugins');
   }
 
   if (typeof sqliteTypes !== 'object') {
