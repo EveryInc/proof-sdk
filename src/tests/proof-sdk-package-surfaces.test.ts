@@ -52,6 +52,7 @@ async function run(): Promise<void> {
   const coreMarks = await import('@proof/core/marks');
   const sqliteTypes = await import('@proof/sqlite/types');
   const serverDocuments = await import('@proof/server/documents');
+  const serverDb = await import('@proof/server/db');
   const serverShareTypes = await import('@proof/server/share-types');
 
   if (typeof core.getMarkColor !== 'function') {
@@ -120,6 +121,10 @@ async function run(): Promise<void> {
 
   if (typeof serverDocuments.createDocumentRouter !== 'function') {
     throw new Error('Expected @proof/server/documents subpath export to expose createDocumentRouter');
+  }
+
+  if (typeof serverDb.getDocumentBySlug !== 'function') {
+    throw new Error('Expected @proof/server/db subpath export to expose getDocumentBySlug');
   }
 
   if (typeof serverShareTypes.isShareRole !== 'function') {

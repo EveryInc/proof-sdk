@@ -37,7 +37,7 @@ import {
   updateDocument,
   updateDocumentTitle,
   updateMarks,
-} from '../../../server/db.js';
+} from './db.js';
 import { isShareRole, type ShareRole } from './share-types.js';
 import { broadcastToRoom, closeRoom, getRoomSize } from './ws.js';
 import { runLegacyMarkRangeBackfillOnce } from './marks-range-backfill.js';

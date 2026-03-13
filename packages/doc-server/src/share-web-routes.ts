@@ -8,7 +8,7 @@ import {
   canMutateByOwnerIdentity,
   resolveDocumentAccessRole,
   upsertActiveCollabConnection,
-} from '../../../server/db.js';
+} from './db.js';
 import type { ShareRole } from './share-types.js';
 import { recordShareLinkOpen } from './metrics.js';
 import { getCookie, shareTokenCookieName } from './cookies.js';

@@ -1,4 +1,4 @@
-import { hasMaintenanceRun, listActiveDocuments, recordMaintenanceRun, updateMarks } from '../../../server/db.js';
+import { hasMaintenanceRun, listActiveDocuments, recordMaintenanceRun, updateMarks } from './db.js';
 
 const RUN_KEY = 'legacy-mark-range-backfill-v1';
 

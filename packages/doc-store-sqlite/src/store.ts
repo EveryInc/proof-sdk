@@ -8,7 +8,7 @@ import {
   resolveDocumentAccessRole as resolveDocumentAccessRoleImpl,
   updateDocument as updateDocumentImpl,
   updateDocumentTitle as updateDocumentTitleImpl,
-} from '../../../server/db.js';
+} from '@proof/server/db';
 import type {
   DocumentAccessToken,
   DocumentEventRow,

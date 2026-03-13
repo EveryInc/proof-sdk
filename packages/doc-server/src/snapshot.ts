@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
-import { getDocumentBySlug } from '../../../server/db.js';
+import { getDocumentBySlug } from './db.js';
 import { getCanonicalReadableDocumentSync } from '../../../server/collab.js';
 import { recordSnapshotPublish } from './metrics.js';
 import { buildSharePreviewModel, renderSharePreviewHtmlPage, resolvePublicOrigin } from './share-preview.js';

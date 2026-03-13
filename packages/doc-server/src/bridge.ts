@@ -4,7 +4,7 @@ import {
   getDocument,
   getDocumentBySlug,
   resolveDocumentAccessRole,
-} from '../../../server/db.js';
+} from './db.js';
 import { executeDocumentOperationAsync } from '../../../server/document-engine.js';
 import { executeCanonicalRewrite } from '../../../server/canonical-document.js';
 import {

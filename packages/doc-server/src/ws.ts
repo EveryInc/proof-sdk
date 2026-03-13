@@ -6,7 +6,7 @@ import {
   getDocumentAuthStateBySlug,
   getRecentDocumentLiveCollabLeaseBreakdown,
   resolveDocumentAccess,
-} from '../../../server/db.js';
+} from './db.js';
 import type { ShareRole } from './share-types.js';
 import {
   extractCollabTokenFromHeaders,

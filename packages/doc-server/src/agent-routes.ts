@@ -13,7 +13,7 @@ import {
   updateDocument,
   updateDocumentAtomic,
   updateDocumentAtomicByRevision,
-} from '../../../server/db.js';
+} from './db.js';
 import {
   applyAgentPresenceToLoadedCollab,
   applyAgentCursorHintToLoadedCollab,

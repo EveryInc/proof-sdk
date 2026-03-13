@@ -30,6 +30,7 @@
     "./agent": "./src/agent.ts",
     "./bridge": "./src/bridge.ts",
     "./collab": "./src/collab.ts",
+    "./db": "./src/db.ts",
     "./documents": "./src/documents.ts",
     "./share": "./src/share.ts",
     "./share-types": "./src/share-types.ts"

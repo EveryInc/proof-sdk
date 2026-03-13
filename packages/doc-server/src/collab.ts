@@ -26,7 +26,7 @@ import {
   type DocumentProjectionRow,
   type DocumentRow,
   type ProjectedDocumentRow,
-} from '../../../server/db.js';
+} from './db.js';
 import {
   recordCollabLogSuppressed,
   recordProjectionChars,

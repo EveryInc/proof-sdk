@@ -1,4 +1,4 @@
-import type { DocumentRow } from '../../../server/db.js';
+import type { DocumentRow } from './db.js';
 import type { DocumentOpType } from './document-ops.js';
 
 export type MutationContractStage = 'A' | 'B' | 'C';
