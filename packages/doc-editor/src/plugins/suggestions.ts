@@ -156,161 +156,189 @@ export function wrapTransactionForSuggestions(
       slice?: { content?: SliceNode[] };
     };
 
-    if (stepJson.stepType !== 'replace') continue;
+    if (stepJson.stepType === 'replace') {
+      const origFrom = stepJson.from ?? 0;
+      const origTo = stepJson.to ?? 0;
+      const from = origFrom + writeOffset;
+      const to = origTo + writeOffset;
+      const slice = stepJson.slice;
 
-    const origFrom = stepJson.from ?? 0;
-    const origTo = stepJson.to ?? 0;
-    const from = origFrom + writeOffset;
-    const to = origTo + writeOffset;
-    const slice = stepJson.slice;
+      const { text: insertedText } = collectSliceText(slice?.content);
+      const deletedText = state.doc.textBetween(origFrom, origTo, '');
+      const docSize = newTr.doc.content.size;
+      const safeFrom = Math.max(0, Math.min(from, docSize));
+      const safeTo = Math.max(safeFrom, Math.min(to, docSize));
 
-    const { text: insertedText } = collectSliceText(slice?.content);
-    const deletedText = state.doc.textBetween(origFrom, origTo, '');
-    const docSize = newTr.doc.content.size;
-    const safeFrom = Math.max(0, Math.min(from, docSize));
-    const safeTo = Math.max(safeFrom, Math.min(to, docSize));
+      if (deletedText && !insertedText) {
+        lastInsertByActor.delete(actor);
+        const existing = detectSuggestionKinds(newTr.doc, safeFrom, safeTo, suggestionType);
 
-    if (deletedText && !insertedText) {
-      lastInsertByActor.delete(actor);
-      const existing = detectSuggestionKinds(newTr.doc, safeFrom, safeTo, suggestionType);
+        if (existing.hasDelete || existing.hasInsert) {
+          newTr.delete(safeFrom, safeTo);
+          writeOffset -= deletedText.length;
+        } else if (existing.hasReplace) {
+          newTr.removeMark(safeFrom, safeTo, suggestionType);
+        } else {
+          const suggestionId = generateMarkId();
+          const createdAt = new Date().toISOString();
+          newTr.addMark(safeFrom, safeTo, suggestionType.create({ id: suggestionId, kind: 'delete', by: actor }));
+          metadata = {
+            ...metadata,
+            [suggestionId]: buildSuggestionMetadata('delete', actor, null, createdAt),
+          };
+          metadataChanged = true;
+          newTr.setSelection(TextSelection.create(newTr.doc, safeFrom));
+        }
+      } else if (insertedText && !deletedText) {
+        const now = Date.now();
+        const whitespaceOnly = isWhitespaceOnly(insertedText);
+        const candidate = getCoalescableInsertCandidate(state, safeFrom, actor, now);
 
-      if (existing.hasDelete || existing.hasInsert) {
-        newTr.delete(safeFrom, safeTo);
-        writeOffset -= deletedText.length;
-      } else if (existing.hasReplace) {
-        newTr.removeMark(safeFrom, safeTo, suggestionType);
-      } else {
-        const suggestionId = generateMarkId();
-        const createdAt = new Date().toISOString();
-        newTr.addMark(safeFrom, safeTo, suggestionType.create({ id: suggestionId, kind: 'delete', by: actor }));
-        metadata = {
-          ...metadata,
-          [suggestionId]: buildSuggestionMetadata('delete', actor, null, createdAt),
-        };
-        metadataChanged = true;
-        newTr.setSelection(TextSelection.create(newTr.doc, safeFrom));
-      }
-      continue;
-    }
+        if (candidate) {
+          const existingMeta = metadata[candidate.id];
+          const existingContent = typeof existingMeta?.content === 'string' ? existingMeta.content : '';
+          const updatedContent = candidate.direction === 'append'
+            ? `${existingContent}${insertedText}`
+            : `${insertedText}${existingContent}`;
 
-    if (insertedText && !deletedText) {
-      const now = Date.now();
-      const whitespaceOnly = isWhitespaceOnly(insertedText);
-      const candidate = getCoalescableInsertCandidate(state, safeFrom, actor, now);
+          newTr.insertText(insertedText, safeFrom);
+          newTr.addMark(
+            safeFrom,
+            safeFrom + insertedText.length,
+            suggestionType.create({ id: candidate.id, kind: 'insert', by: actor })
+          );
+          writeOffset += insertedText.length;
 
-      if (candidate) {
-        const existingMeta = metadata[candidate.id];
-        const existingContent = typeof existingMeta?.content === 'string' ? existingMeta.content : '';
-        const updatedContent = candidate.direction === 'append'
-          ? `${existingContent}${insertedText}`
-          : `${insertedText}${existingContent}`;
+          metadata = whitespaceOnly ? {
+            ...metadata,
+            [candidate.id]: {
+              ...existingMeta,
+              content: updatedContent,
+            },
+          } : {
+            ...metadata,
+            [candidate.id]: {
+              ...existingMeta,
+              kind: 'insert',
+              by: actor,
+              content: updatedContent,
+              status: existingMeta?.status ?? 'pending',
+              createdAt: existingMeta?.createdAt ?? new Date().toISOString(),
+            },
+          };
+          metadataChanged = true;
 
-        newTr.insertText(insertedText, safeFrom);
-        newTr.addMark(
-          safeFrom,
-          safeFrom + insertedText.length,
-          suggestionType.create({ id: candidate.id, kind: 'insert', by: actor })
-        );
-        writeOffset += insertedText.length;
-
-        metadata = whitespaceOnly ? {
-          ...metadata,
-          [candidate.id]: {
-            ...existingMeta,
-            content: updatedContent,
-          },
-        } : {
-          ...metadata,
-          [candidate.id]: {
-            ...existingMeta,
-            kind: 'insert',
+          lastInsertByActor.set(actor, {
+            id: candidate.id,
+            from: candidate.range.from,
+            to: candidate.range.to + insertedText.length,
             by: actor,
-            content: updatedContent,
-            status: existingMeta?.status ?? 'pending',
-            createdAt: existingMeta?.createdAt ?? new Date().toISOString(),
-          },
-        };
-        metadataChanged = true;
+            updatedAt: now,
+          });
+        } else {
+          const suggestionId = generateMarkId();
+          const createdAt = new Date().toISOString();
+          newTr.insertText(insertedText, safeFrom);
+          newTr.addMark(
+            safeFrom,
+            safeFrom + insertedText.length,
+            suggestionType.create({ id: suggestionId, kind: 'insert', by: actor })
+          );
+          writeOffset += insertedText.length;
+          metadata = {
+            ...metadata,
+            [suggestionId]: buildSuggestionMetadata('insert', actor, insertedText, createdAt),
+          };
+          metadataChanged = true;
+          lastInsertByActor.set(actor, {
+            id: suggestionId,
+            from: safeFrom,
+            to: safeFrom + insertedText.length,
+            by: actor,
+            updatedAt: now,
+          });
+        }
+      } else if (deletedText && insertedText) {
+        lastInsertByActor.delete(actor);
+        const existing = detectSuggestionKinds(newTr.doc, safeFrom, safeTo, suggestionType);
 
-        lastInsertByActor.set(actor, {
-          id: candidate.id,
-          from: candidate.range.from,
-          to: candidate.range.to + insertedText.length,
-          by: actor,
-          updatedAt: now,
-        });
+        if (existing.hasDelete) {
+          newTr.delete(safeFrom, safeTo);
+          writeOffset -= deletedText.length;
+          const suggestionId = generateMarkId();
+          const createdAt = new Date().toISOString();
+          newTr.insertText(insertedText, safeFrom);
+          newTr.addMark(
+            safeFrom,
+            safeFrom + insertedText.length,
+            suggestionType.create({ id: suggestionId, kind: 'insert', by: actor })
+          );
+          writeOffset += insertedText.length;
+          metadata = {
+            ...metadata,
+            [suggestionId]: buildSuggestionMetadata('insert', actor, insertedText, createdAt),
+          };
+          metadataChanged = true;
+        } else if (existing.hasInsert) {
+          const suggestionId = generateMarkId();
+          const createdAt = new Date().toISOString();
+          newTr.replaceWith(safeFrom, safeTo, state.schema.text(insertedText));
+          newTr.addMark(
+            safeFrom,
+            safeFrom + insertedText.length,
+            suggestionType.create({ id: suggestionId, kind: 'insert', by: actor })
+          );
+          writeOffset += insertedText.length - deletedText.length;
+          metadata = {
+            ...metadata,
+            [suggestionId]: buildSuggestionMetadata('insert', actor, insertedText, createdAt),
+          };
+          metadataChanged = true;
+        } else {
+          const suggestionId = generateMarkId();
+          const createdAt = new Date().toISOString();
+          newTr.removeMark(safeFrom, safeTo, suggestionType);
+          newTr.addMark(
+            safeFrom,
+            safeTo,
+            suggestionType.create({ id: suggestionId, kind: 'replace', by: actor })
+          );
+          metadata = {
+            ...metadata,
+            [suggestionId]: buildSuggestionMetadata('replace', actor, insertedText, createdAt),
+          };
+          metadataChanged = true;
+          newTr.setSelection(TextSelection.create(newTr.doc, safeTo));
+        }
       } else {
-        const suggestionId = generateMarkId();
-        const createdAt = new Date().toISOString();
-        newTr.insertText(insertedText, safeFrom);
-        newTr.addMark(
-          safeFrom,
-          safeFrom + insertedText.length,
-          suggestionType.create({ id: suggestionId, kind: 'insert', by: actor })
-        );
-        writeOffset += insertedText.length;
-        metadata = {
-          ...metadata,
-          [suggestionId]: buildSuggestionMetadata('insert', actor, insertedText, createdAt),
-        };
-        metadataChanged = true;
-        lastInsertByActor.set(actor, {
-          id: suggestionId,
-          from: safeFrom,
-          to: safeFrom + insertedText.length,
-          by: actor,
-          updatedAt: now,
-        });
+        try {
+          const sizeBefore = newTr.doc.content.size;
+          newTr.step(step);
+          writeOffset += newTr.doc.content.size - sizeBefore;
+        } catch (error) {
+          console.warn('[suggestions] Could not apply structural step:', error);
+        }
       }
-      continue;
-    }
-
-    if (deletedText && insertedText) {
-      lastInsertByActor.delete(actor);
-      const existing = detectSuggestionKinds(newTr.doc, safeFrom, safeTo, suggestionType);
-
-      if (existing.hasDelete) {
-        newTr.delete(safeFrom, safeTo);
-        writeOffset -= deletedText.length;
-        const suggestionId = generateMarkId();
-        const createdAt = new Date().toISOString();
-        newTr.insertText(insertedText, safeFrom);
-        newTr.addMark(
-          safeFrom,
-          safeFrom + insertedText.length,
-          suggestionType.create({ id: suggestionId, kind: 'insert', by: actor })
-        );
-        writeOffset += insertedText.length;
-        metadata = {
-          ...metadata,
-          [suggestionId]: buildSuggestionMetadata('insert', actor, insertedText, createdAt),
-        };
-        metadataChanged = true;
-      } else if (existing.hasInsert) {
-        const suggestionId = generateMarkId();
-        const createdAt = new Date().toISOString();
-        newTr.replaceWith(safeFrom, safeTo, state.schema.text(insertedText));
-        newTr.addMark(
-          safeFrom,
-          safeFrom + insertedText.length,
-          suggestionType.create({ id: suggestionId, kind: 'insert', by: actor })
-        );
-        writeOffset += insertedText.length - deletedText.length;
-        metadata = {
-          ...metadata,
-          [suggestionId]: buildSuggestionMetadata('insert', actor, insertedText, createdAt),
-        };
-        metadataChanged = true;
-      } else {
-        const suggestionId = generateMarkId();
-        const createdAt = new Date().toISOString();
-        newTr.removeMark(safeFrom, safeTo, suggestionType);
-        newTr.addMark(safeFrom, safeTo, suggestionType.create({ id: suggestionId, kind: 'replace', by: actor }));
-        metadata = {
-          ...metadata,
-          [suggestionId]: buildSuggestionMetadata('replace', actor, insertedText, createdAt),
-        };
-        metadataChanged = true;
+    } else if (
+      stepJson.stepType === 'replaceAround'
+      || stepJson.stepType === 'addMark'
+      || stepJson.stepType === 'removeMark'
+    ) {
+      try {
+        newTr.step(step);
+      } catch (error) {
+        console.warn('[suggestions] Could not apply step:', stepJson.stepType, error);
+      }
+    } else {
+      try {
+        const result = step.apply(newTr.doc);
+        if (result.doc && result.doc !== newTr.doc) {
+          const sizeDiff = result.doc.content.size - newTr.doc.content.size;
+          newTr.step(step);
+          writeOffset += sizeDiff;
+        }
+      } catch (error) {
+        console.warn('[suggestions] Could not apply step:', stepJson.stepType, error);
       }
     }
   }
@@ -321,6 +349,8 @@ export function wrapTransactionForSuggestions(
       metadata,
     });
   }
+
+  newTr.setMeta('suggestions-wrapped', true);
 
   return newTr;
 }
