@@ -2,8 +2,17 @@
   "name": "proof-sdk",
   "version": "0.1.0",
   "description": "Open-source collaborative markdown editor with provenance tracking and an agent HTTP bridge",
-  "private": false,
+  "private": true,
   "type": "module",
+  "license": "MIT",
+  "homepage": "https://proofeditor.ai",
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/EveryInc/proof-sdk.git"
+  },
+  "bugs": {
+    "url": "https://github.com/EveryInc/proof-sdk/issues"
+  },
   "workspaces": [
     "packages/*",
     "apps/*"
@@ -11,11 +20,14 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build && node scripts/finalize-web-build.mjs",
+    "build:packages": "npm --workspace @proof/core run build && npm --workspace @proof/editor run build && npm --workspace @proof/server run build && npm --workspace @proof/sqlite run build",
     "serve": "tsx server/index.ts",
     "test": "npm run test:proof-sdk && npm run test:server-routes-share",
+    "test:packages": "npm run build:packages && node --import tsx src/tests/proof-sdk-package-surfaces.test.ts && node --import tsx src/tests/editor-package-regressions.test.ts && node --import tsx src/tests/server-package-internals.test.ts && node --import tsx src/tests/share-web-local-build-regression.test.ts && node --import tsx src/tests/package-packed-consumer.test.ts",
     "test:proof-sdk": "tsx src/tests/proof-sdk-agent-bridge-client.test.ts",
     "test:server-routes-share": "tsx src/tests/server-routes-and-share.test.ts",
-    "demo:agent": "npm --workspace proof-example run demo:agent"
+    "demo:agent": "npm --workspace proof-example run demo:agent",
+    "pack:packages": "NPM_CONFIG_CACHE=.tmp/npm-cache npm --workspace @proof/core pack --json && NPM_CONFIG_CACHE=.tmp/npm-cache npm --workspace @proof/editor pack --json && NPM_CONFIG_CACHE=.tmp/npm-cache npm --workspace @proof/server pack --json && NPM_CONFIG_CACHE=.tmp/npm-cache npm --workspace @proof/sqlite pack --json"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.879.0",

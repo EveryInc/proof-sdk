@@ -1,8 +1,58 @@
 {
   "name": "@proof/core",
-  "private": true,
   "type": "module",
   "version": "0.1.0",
   "description": "Core Proof SDK document and provenance types",
-  "exports": "./src/index.ts"
+  "license": "MIT",
+  "homepage": "https://proofeditor.ai",
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/EveryInc/proof-sdk.git",
+    "directory": "packages/doc-core"
+  },
+  "bugs": {
+    "url": "https://github.com/EveryInc/proof-sdk/issues"
+  },
+  "keywords": [
+    "proof",
+    "sdk",
+    "markdown",
+    "provenance",
+    "comments",
+    "suggestions"
+  ],
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "publishConfig": {
+    "access": "public"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./marks": {
+      "types": "./dist/marks.d.ts",
+      "import": "./dist/marks.js"
+    },
+    "./provenance-sidecar": {
+      "types": "./dist/provenance-sidecar.d.ts",
+      "import": "./dist/provenance-sidecar.js"
+    },
+    "./remark-proof-marks": {
+      "types": "./dist/remark-proof-marks.d.ts",
+      "import": "./dist/remark-proof-marks.js"
+    },
+    "./agent-identity": {
+      "types": "./dist/agent-identity.d.ts",
+      "import": "./dist/agent-identity.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "clean": "rm -rf dist"
+  }
 }

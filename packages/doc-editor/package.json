@@ -1,8 +1,81 @@
 {
   "name": "@proof/editor",
-  "private": true,
   "type": "module",
   "version": "0.1.0",
   "description": "Proof SDK editor runtime and editor-facing plugins",
-  "exports": "./src/index.ts"
+  "license": "MIT",
+  "homepage": "https://proofeditor.ai",
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/EveryInc/proof-sdk.git",
+    "directory": "packages/doc-editor"
+  },
+  "bugs": {
+    "url": "https://github.com/EveryInc/proof-sdk/issues"
+  },
+  "keywords": [
+    "proof",
+    "sdk",
+    "editor",
+    "markdown",
+    "comments",
+    "suggestions",
+    "prosemirror",
+    "milkdown"
+  ],
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "@proof/core": "0.1.0",
+    "@milkdown/kit": "^7.5.0",
+    "y-prosemirror": "^1.2.19"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./batch-executor": {
+      "types": "./dist/batch-executor.d.ts",
+      "import": "./dist/batch-executor.js"
+    },
+    "./schema/code-block-ext": {
+      "types": "./dist/schema/code-block-ext.d.ts",
+      "import": "./dist/schema/code-block-ext.js"
+    },
+    "./schema/frontmatter": {
+      "types": "./dist/schema/frontmatter.d.ts",
+      "import": "./dist/schema/frontmatter.js"
+    },
+    "./schema/proof-marks": {
+      "types": "./dist/schema/proof-marks.d.ts",
+      "import": "./dist/schema/proof-marks.js"
+    },
+    "./utils/text-range": {
+      "types": "./dist/utils/text-range.d.ts",
+      "import": "./dist/utils/text-range.js"
+    },
+    "./plugins/comments": {
+      "types": "./dist/plugins/comments.d.ts",
+      "import": "./dist/plugins/comments.js"
+    },
+    "./plugins/marks": {
+      "types": "./dist/plugins/marks.d.ts",
+      "import": "./dist/plugins/marks.js"
+    },
+    "./plugins/suggestions": {
+      "types": "./dist/plugins/suggestions.d.ts",
+      "import": "./dist/plugins/suggestions.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "node ../../scripts/build-package.mjs --exclude src/editor.ts",
+    "clean": "rm -rf dist"
+  }
 }

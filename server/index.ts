@@ -41,8 +41,10 @@ async function main(): Promise<void> {
   const server = createServer(app);
   const wss = new WebSocketServer({ server, path: '/ws' });
   const allowedCorsOrigins = parseAllowedCorsOrigins();
+  const builtWebDistDir = path.join(__dirname, '..', 'dist');
 
   app.use(express.json({ limit: '10mb' }));
+  app.use(express.static(builtWebDistDir, { index: false }));
   app.use(express.static(path.join(__dirname, '..', 'public')));
 
   app.use((req, res, next) => {

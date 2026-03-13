@@ -1,8 +1,52 @@
 {
   "name": "@proof/sqlite",
-  "private": true,
   "type": "module",
   "version": "0.1.0",
   "description": "Proof SDK SQLite-backed document storage adapters",
-  "exports": "./src/index.ts"
+  "license": "MIT",
+  "homepage": "https://proofeditor.ai",
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/EveryInc/proof-sdk.git",
+    "directory": "packages/doc-store-sqlite"
+  },
+  "bugs": {
+    "url": "https://github.com/EveryInc/proof-sdk/issues"
+  },
+  "keywords": [
+    "proof",
+    "sdk",
+    "sqlite",
+    "storage",
+    "documents"
+  ],
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "@proof/server": "0.1.0"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./store": {
+      "types": "./dist/store.d.ts",
+      "import": "./dist/store.js"
+    },
+    "./types": {
+      "types": "./dist/types.d.ts",
+      "import": "./dist/types.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "node ../../scripts/build-package.mjs",
+    "clean": "rm -rf dist"
+  }
 }

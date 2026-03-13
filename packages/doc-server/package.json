@@ -1,8 +1,95 @@
 {
   "name": "@proof/server",
-  "private": true,
   "type": "module",
   "version": "0.1.0",
   "description": "Proof SDK document, share, and collaboration server routes",
-  "exports": "./src/index.ts"
+  "license": "MIT",
+  "homepage": "https://proofeditor.ai",
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/EveryInc/proof-sdk.git",
+    "directory": "packages/doc-server"
+  },
+  "bugs": {
+    "url": "https://github.com/EveryInc/proof-sdk/issues"
+  },
+  "keywords": [
+    "proof",
+    "sdk",
+    "server",
+    "collaboration",
+    "express",
+    "yjs",
+    "markdown"
+  ],
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.879.0",
+    "@milkdown/core": "^7.5.0",
+    "@milkdown/kit": "^7.5.0",
+    "@milkdown/preset-commonmark": "^7.5.0",
+    "@milkdown/preset-gfm": "^7.5.0",
+    "@milkdown/prose": "^7.5.0",
+    "@milkdown/transformer": "^7.5.0",
+    "@resvg/resvg-js": "^2.6.2",
+    "@proof/core": "0.1.0",
+    "@proof/editor": "0.1.0",
+    "better-sqlite3": "^12.6.2",
+    "express": "^5.2.1",
+    "remark-frontmatter": "^5.0.0",
+    "remark-gfm": "^4.0.1",
+    "remark-parse": "^11.0.0",
+    "remark-stringify": "^11.0.0",
+    "satori": "^0.24.1",
+    "unified": "^11.0.5",
+    "ws": "^8.18.0",
+    "y-prosemirror": "^1.2.19",
+    "yjs": "^13.6.20"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./agent": {
+      "types": "./dist/agent.d.ts",
+      "import": "./dist/agent.js"
+    },
+    "./bridge": {
+      "types": "./dist/bridge.d.ts",
+      "import": "./dist/bridge.js"
+    },
+    "./collab": {
+      "types": "./dist/collab.d.ts",
+      "import": "./dist/collab.js"
+    },
+    "./db": {
+      "types": "./dist/db.d.ts",
+      "import": "./dist/db.js"
+    },
+    "./documents": {
+      "types": "./dist/documents.d.ts",
+      "import": "./dist/documents.js"
+    },
+    "./share": {
+      "types": "./dist/share.d.ts",
+      "import": "./dist/share.js"
+    },
+    "./share-types": {
+      "types": "./dist/share-types.d.ts",
+      "import": "./dist/share-types.js"
+    }
+  },
+  "files": [
+    "dist",
+    "public"
+  ],
+  "scripts": {
+    "build": "node ../../scripts/build-package.mjs --copy ../../public/assets/og-share=public/assets/og-share",
+    "clean": "rm -rf dist public"
+  }
 }

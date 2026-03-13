@@ -1422,6 +1422,31 @@ async function runRoutePayloadValidationTests(): Promise<void> {
       }
     });
 
+    await test('D2: collab-session keeps embedded local ws on the same port without COLLAB_EMBEDDED_WS', async () => {
+      const previousEmbedded = process.env.COLLAB_EMBEDDED_WS;
+      delete process.env.COLLAB_EMBEDDED_WS;
+      try {
+        const response = await get(baseUrl, `/api/documents/${slug}/collab-session`, {
+          'x-share-token': accessToken,
+        });
+        assert(response.status === 200, `Expected status 200, got ${response.status}`);
+        const payload = await response.json();
+        if (payload?.session) {
+          const collabWsUrl = String(payload?.session?.collabWsUrl ?? '');
+          const parsed = new URL(collabWsUrl);
+          const baseParsed = new URL(baseUrl);
+          assert(parsed.pathname === '/ws', `Expected embedded ws path, got ${parsed.pathname}`);
+          assert(parsed.port === baseParsed.port, `Expected embedded ws port ${baseParsed.port}, got ${parsed.port}`);
+          assert(parsed.hostname === baseParsed.hostname, `Expected embedded ws host ${baseParsed.hostname}, got ${parsed.hostname}`);
+        } else {
+          assert(payload?.collabAvailable === false, 'Expected collabAvailable=false when collab-session lacks session');
+        }
+      } finally {
+        if (previousEmbedded === undefined) delete process.env.COLLAB_EMBEDDED_WS;
+        else process.env.COLLAB_EMBEDDED_WS = previousEmbedded;
+      }
+    });
+
     await test('D2: collab-refresh returns sync protocol and consistent capabilities when available', async () => {
       const response = await post(baseUrl, `/api/documents/${slug}/collab-refresh`, {}, {
         'x-share-token': accessToken,
