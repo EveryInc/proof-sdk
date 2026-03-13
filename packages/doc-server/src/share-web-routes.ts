@@ -11,7 +11,7 @@ import {
 } from '../../../server/db.js';
 import type { ShareRole } from './share-types.js';
 import { recordShareLinkOpen } from '../../../server/metrics.js';
-import { getCookie, shareTokenCookieName } from '../../../server/cookies.js';
+import { getCookie, shareTokenCookieName } from './cookies.js';
 import { handleShareMarkdown, shareMarkdownBodyParser } from '../../../server/routes.js';
 import { getSnapshotHtml, getSnapshotPublicUrl } from '../../../server/snapshot.js';
 import { stripProofSpanTags } from '../../../server/proof-span-strip.js';
@@ -26,7 +26,7 @@ import {
   AUTH_HEADER_FORMAT,
   TOKEN_FROM_URL_HINT,
   TOKEN_MISSING_HINT,
-} from '../../../server/agent-guidance.js';
+} from './agent-guidance.js';
 import {
   buildSharePreviewModel,
   renderShareMetaTags,
@@ -38,7 +38,7 @@ import {
   buildProofSdkAgentDescriptor,
   buildProofSdkDocumentPaths,
   buildProofSdkLinks,
-} from '../../../server/proof-sdk-routes.js';
+} from './proof-sdk-routes.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);

@@ -52,7 +52,7 @@ import {
 } from '../../../server/metrics.js';
 import type { ShareRole } from './share-types.js';
 import { broadcastToRoom, getActiveCollabClientBreakdown, getActiveCollabClientCount } from '../../../server/ws.js';
-import { getCookie, shareTokenCookieName } from '../../../server/cookies.js';
+import { getCookie, shareTokenCookieName } from './cookies.js';
 import {
   authorizeDocumentOp,
   type DocumentOpType,
@@ -63,7 +63,7 @@ import { applyAgentEditOperations, type AgentEditOperation } from '../../../serv
 import {
   ALT_SHARE_TOKEN_HEADER_FORMAT,
   AUTH_HEADER_FORMAT,
-} from '../../../server/agent-guidance.js';
+} from './agent-guidance.js';
 import { buildAgentSnapshot } from '../../../server/agent-snapshot.js';
 import { stripProofSpanTags } from '../../../server/proof-span-strip.js';
 import { applyAgentEditV2 } from '../../../server/agent-edit-v2.js';
@@ -92,7 +92,7 @@ import {
   buildProofSdkAgentDescriptor,
   buildProofSdkDocumentPaths,
   buildProofSdkLinks,
-} from '../../../server/proof-sdk-routes.js';
+} from './proof-sdk-routes.js';
 
 export const agentRoutes = Router({ mergeParams: true });
 

@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'crypto';
 import { Router, text, type Request, type Response } from 'express';
-import { generateSlug } from '../../../server/slug.js';
+import { generateSlug } from './slug.js';
 import {
   applyAgentCursorHintToLoadedCollab,
   applyAgentPresenceToLoadedCollab,
@@ -42,7 +42,7 @@ import { isShareRole, type ShareRole } from './share-types.js';
 import { broadcastToRoom, closeRoom, getRoomSize } from '../../../server/ws.js';
 import { runLegacyMarkRangeBackfillOnce } from '../../../server/marks-range-backfill.js';
 import { createRateLimiter } from '../../../server/rate-limiter.js';
-import { getCookie, shareTokenCookieName } from '../../../server/cookies.js';
+import { getCookie, shareTokenCookieName } from './cookies.js';
 import { canonicalizeStoredMarks } from '@proof/core/marks';
 import {
   recordRewriteBarrierFailure,
@@ -68,7 +68,7 @@ import {
   getLegacyCreateResponseHeaders,
   resolveLegacyCreateMode,
   type LegacyCreateMode,
-} from '../../../server/agent-guidance.js';
+} from './agent-guidance.js';
 import { captureDocumentCreatedTelemetry } from '../../../server/telemetry.js';
 import { executeDocumentOperationAsync, type EngineExecutionResult } from '../../../server/document-engine.js';
 import {
@@ -97,7 +97,7 @@ import {
   buildProofSdkAgentDescriptor,
   buildProofSdkDocumentPaths,
   buildProofSdkLinks,
-} from '../../../server/proof-sdk-routes.js';
+} from './proof-sdk-routes.js';
 
 export const apiRoutes = Router();
 
