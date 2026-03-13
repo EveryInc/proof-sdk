@@ -14,6 +14,7 @@ export {
   getDocument,
   getDocumentAuthStateBySlug,
   getDocumentBySlug,
+  getDocumentProjectionBySlug,
   getLatestYSnapshot,
   getLatestYStateVersion,
   getLatestYUpdate,

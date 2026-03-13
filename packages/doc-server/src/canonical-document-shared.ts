@@ -4,10 +4,10 @@ export {
   executeCanonicalRewrite,
   mutateCanonicalDocument,
   repairCanonicalProjection,
-} from '../../../server/canonical-document.js';
+} from './canonical-document.js';
 
 export type {
   CanonicalMutationResult,
   CanonicalRepairResult,
   CanonicalRouteResult,
-} from '../../../server/canonical-document.js';
+} from './canonical-document.js';
