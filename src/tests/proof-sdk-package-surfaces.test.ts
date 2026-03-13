@@ -1,44 +1,4 @@
 async function run(): Promise<void> {
-  const documentStub = {
-    readyState: 'loading',
-    location: { pathname: '/' },
-    documentElement: { style: {} },
-    addEventListener() {},
-    getElementById() { return null; },
-    createElement() {
-      return {
-        style: {},
-        appendChild() {},
-        setAttribute() {},
-        classList: {
-          add() {},
-          remove() {},
-        },
-      };
-    },
-    head: { appendChild() {} },
-    querySelector() { return null; },
-    title: '',
-    visibilityState: 'visible',
-  };
-
-  (globalThis as typeof globalThis & { document: typeof documentStub }).document = documentStub;
-  (globalThis as typeof globalThis & { window: object }).window = {
-    location: { search: '', pathname: '/' },
-    addEventListener() {},
-    removeEventListener() {},
-    document: documentStub,
-  };
-  Object.defineProperty(globalThis, 'navigator', {
-    configurable: true,
-    value: {
-      userAgent: 'node',
-      vendor: '',
-      maxTouchPoints: 0,
-      platform: 'Linux',
-    },
-  });
-
   const core = await import('@proof/core');
   const sqlite = await import('@proof/sqlite');
   const server = await import('@proof/server');
@@ -85,6 +45,14 @@ async function run(): Promise<void> {
 
   if (typeof editor.getUnresolvedComments !== 'function') {
     throw new Error('Expected @proof/editor root surface to expose getUnresolvedComments');
+  }
+
+  if (typeof editor.executeBatch !== 'function') {
+    throw new Error('Expected @proof/editor root surface to expose executeBatch');
+  }
+
+  if (typeof editor.suggestReplace !== 'function') {
+    throw new Error('Expected @proof/editor root surface to expose suggestReplace');
   }
 
   if (typeof editorBatch.executeBatch !== 'function') {
