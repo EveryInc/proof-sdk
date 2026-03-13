@@ -11,6 +11,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build && node scripts/finalize-web-build.mjs",
+    "build:packages": "npm run build --workspaces --if-present",
     "serve": "tsx server/index.ts",
     "test": "npm run test:proof-sdk && npm run test:server-routes-share",
     "test:proof-sdk": "tsx src/tests/proof-sdk-agent-bridge-client.test.ts",

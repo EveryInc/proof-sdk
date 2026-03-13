@@ -1,8 +1,21 @@
 {
   "name": "@proof/core",
-  "private": true,
   "type": "module",
   "version": "0.1.0",
   "description": "Core Proof SDK document and provenance types",
-  "exports": "./src/index.ts"
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "clean": "rm -rf dist"
+  }
 }
