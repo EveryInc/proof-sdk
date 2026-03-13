@@ -33,6 +33,7 @@ export {
   rebuildDocumentBlocks,
   recordMaintenanceRun,
   removeActiveCollabConnection,
+  removeResurrectedMarksFromPayload,
   replaceDocumentProjection,
   resolveDocumentAccess,
   resolveDocumentAccessRole,
@@ -41,12 +42,14 @@ export {
   revokeDocumentAccessTokens,
   saveYSnapshot,
   setDocumentProjectionHealth,
+  shouldRejectMarkMutationByResolvedRevision,
   storeIdempotencyResult,
   updateDocument,
   updateDocumentAtomic,
   updateDocumentAtomicByRevision,
   updateDocumentTitle,
   updateMarks,
+  upsertMarkTombstone,
   upsertActiveCollabConnection,
 } from '../../../server/db.js';
 
