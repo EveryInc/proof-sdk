@@ -2,7 +2,7 @@
   "name": "proof-sdk",
   "version": "0.1.0",
   "description": "Open-source collaborative markdown editor with provenance tracking and an agent HTTP bridge",
-  "private": false,
+  "private": true,
   "type": "module",
   "license": "MIT",
   "homepage": "https://proofeditor.ai",

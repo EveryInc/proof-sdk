@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, readdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -19,16 +19,39 @@ function assert(condition: boolean, message: string): void {
   if (!condition) throw new Error(message);
 }
 
-function linkExternalDependencies(rootDir: string, fixtureNodeModulesDir: string): void {
+function readPackageJson(packageDir: string): {
+  dependencies?: Record<string, string>;
+  peerDependencies?: Record<string, string>;
+  exports?: Record<string, unknown>;
+} {
+  return JSON.parse(readFileSync(path.join(packageDir, 'package.json'), 'utf8')) as {
+    dependencies?: Record<string, string>;
+    peerDependencies?: Record<string, string>;
+    exports?: Record<string, unknown>;
+  };
+}
+
+function linkDependency(rootDir: string, fixtureNodeModulesDir: string, packageName: string): void {
   const rootNodeModulesDir = path.join(rootDir, 'node_modules');
-  for (const entry of readdirSync(rootNodeModulesDir)) {
-    if (entry === '.bin' || entry === '@proof') continue;
-    symlinkSync(
-      path.join(rootNodeModulesDir, entry),
-      path.join(fixtureNodeModulesDir, entry),
-      'junction',
-    );
+  const pathSegments = packageName.split('/');
+  const sourcePath = path.join(rootNodeModulesDir, ...pathSegments);
+  const targetPath = path.join(fixtureNodeModulesDir, ...pathSegments);
+  mkdirSync(path.dirname(targetPath), { recursive: true });
+  symlinkSync(sourcePath, targetPath, 'junction');
+}
+
+function collectDeclaredExternalDependencies(proofScopeDir: string): string[] {
+  const dependencyNames = new Set<string>();
+  for (const packedPackage of PACKED_PACKAGES) {
+    const packageJson = readPackageJson(path.join(proofScopeDir, packedPackage.dirName));
+    for (const dependencyName of Object.keys(packageJson.dependencies ?? {})) {
+      if (!dependencyName.startsWith('@proof/')) dependencyNames.add(dependencyName);
+    }
+    for (const dependencyName of Object.keys(packageJson.peerDependencies ?? {})) {
+      if (!dependencyName.startsWith('@proof/')) dependencyNames.add(dependencyName);
+    }
   }
+  return [...dependencyNames].sort();
 }
 
 function packWorkspacePackage(rootDir: string, packageDir: string, packDir: string, npmCacheDir: string): string {
@@ -65,11 +88,13 @@ function run(): void {
   mkdirSync(npmCacheDir, { recursive: true });
   mkdirSync(proofScopeDir, { recursive: true });
 
-  linkExternalDependencies(rootDir, fixtureNodeModulesDir);
-
   for (const packedPackage of PACKED_PACKAGES) {
     const tarballPath = packWorkspacePackage(rootDir, packedPackage.packageDir, packDir, npmCacheDir);
     unpackTarball(tarballPath, path.join(proofScopeDir, packedPackage.dirName));
+  }
+
+  for (const dependencyName of collectDeclaredExternalDependencies(proofScopeDir)) {
+    linkDependency(rootDir, fixtureNodeModulesDir, dependencyName);
   }
 
   writeFileSync(
@@ -77,9 +102,7 @@ function run(): void {
     JSON.stringify({ name: 'proof-sdk-packed-consumer-fixture', private: true, type: 'module' }, null, 2),
   );
 
-  const editorPackageJson = JSON.parse(
-    readFileSync(path.join(proofScopeDir, 'editor', 'package.json'), 'utf8'),
-  ) as { exports?: Record<string, unknown> };
+  const editorPackageJson = readPackageJson(path.join(proofScopeDir, 'editor'));
   assert(
     editorPackageJson.exports && !Object.prototype.hasOwnProperty.call(editorPackageJson.exports, './editor'),
     'Expected packed @proof/editor artifact to omit the removed ./editor export',
