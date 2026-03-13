@@ -1,5 +1,13 @@
+import type { Router } from 'express';
+import { apiRoutes, handleShareMarkdown, shareMarkdownBodyParser } from '../../../server/routes.js';
+
 export {
-  apiRoutes,
   handleShareMarkdown,
   shareMarkdownBodyParser,
-} from '../../../server/routes.js';
+};
+
+export function createDocumentRouter(): Router {
+  return apiRoutes;
+}
+
+export { apiRoutes };

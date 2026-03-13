@@ -1,5 +1,12 @@
+import { getCollabRuntime, startCollabRuntime, startCollabRuntimeEmbedded } from '../../../server/collab.js';
+
 export {
-  getCollabRuntime,
   startCollabRuntime,
   startCollabRuntimeEmbedded,
-} from '../../../server/collab.js';
+};
+
+export function createCollabRuntime() {
+  return getCollabRuntime();
+}
+
+export { getCollabRuntime };

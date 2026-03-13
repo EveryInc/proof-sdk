@@ -1,29 +1,9 @@
 import type { Express, Router } from 'express';
-import { agentRoutes } from './agent.js';
-import { bridgeRouter, createBridgeMountRouter } from './bridge.js';
-import { getCollabRuntime, startCollabRuntime, startCollabRuntimeEmbedded } from './collab.js';
-import { apiRoutes, handleShareMarkdown, shareMarkdownBodyParser } from './documents.js';
-import { shareWebRoutes } from './share.js';
-
-export function createDocumentRouter(): Router {
-  return apiRoutes;
-}
-
-export function createShareRouter(): Router {
-  return shareWebRoutes;
-}
-
-export function createAgentRouter(): Router {
-  return agentRoutes;
-}
-
-export function createBridgeRouter(): Router {
-  return bridgeRouter;
-}
-
-export function createCollabRuntime() {
-  return getCollabRuntime();
-}
+import { agentRoutes, createAgentRouter } from './agent.js';
+import { bridgeRouter, createBridgeMountRouter, createBridgeRouter } from './bridge.js';
+import { createCollabRuntime, getCollabRuntime, startCollabRuntime, startCollabRuntimeEmbedded } from './collab.js';
+import { apiRoutes, createDocumentRouter, handleShareMarkdown, shareMarkdownBodyParser } from './documents.js';
+import { createShareRouter, shareWebRoutes } from './share.js';
 
 export function mountProofSdkRoutes(app: Express): void {
   app.use(apiRoutes);
@@ -36,6 +16,11 @@ export {
   agentRoutes,
   apiRoutes,
   bridgeRouter,
+  createAgentRouter,
+  createBridgeRouter,
+  createCollabRuntime,
+  createDocumentRouter,
+  createShareRouter,
   getCollabRuntime,
   handleShareMarkdown,
   shareMarkdownBodyParser,
