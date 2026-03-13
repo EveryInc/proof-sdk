@@ -5,6 +5,8 @@ async function run(): Promise<void> {
   const shimWs = await import('../../server/ws.ts');
   const packageCollabShared = await import('../../packages/doc-server/src/collab-shared.ts');
   const shimCollab = await import('../../server/collab.ts');
+  const packageDb = await import('../../packages/doc-server/src/db.ts');
+  const shimDb = await import('../../server/db.ts');
   const packageCanonical = await import('../../packages/doc-server/src/canonical-document-shared.ts');
   const shimCanonical = await import('../../server/canonical-document.ts');
   const packageEngine = await import('../../packages/doc-server/src/document-engine-shared.ts');
@@ -38,6 +40,14 @@ async function run(): Promise<void> {
 
   if (packageCollabShared.getCanonicalReadableDocumentSync !== shimCollab.getCanonicalReadableDocumentSync) {
     throw new Error('Expected collab shared facade to preserve canonical read helpers');
+  }
+
+  if (packageDb.getDocumentBySlug !== shimDb.getDocumentBySlug) {
+    throw new Error('Expected db shim to preserve getDocumentBySlug');
+  }
+
+  if (packageDb.updateDocument !== shimDb.updateDocument) {
+    throw new Error('Expected db shim to preserve updateDocument');
   }
 
   if (packageCanonical.executeCanonicalRewrite !== shimCanonical.executeCanonicalRewrite) {

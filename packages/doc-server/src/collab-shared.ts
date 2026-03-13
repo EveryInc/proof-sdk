@@ -32,4 +32,4 @@ export {
   stripEphemeralCollabSpans,
   verifyCanonicalDocumentInLoadedCollab,
   getCollabSessionClaims,
-} from '../../../server/collab.js';
+} from './collab.js';

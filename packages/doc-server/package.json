@@ -14,6 +14,7 @@
     "@resvg/resvg-js": "^2.6.2",
     "@proof/core": "0.1.0",
     "@proof/editor": "0.1.0",
+    "better-sqlite3": "^12.6.2",
     "express": "^5.2.1",
     "remark-frontmatter": "^5.0.0",
     "remark-gfm": "^4.0.1",
