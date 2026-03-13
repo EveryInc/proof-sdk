@@ -13,7 +13,7 @@ import {
   invalidateCollabDocument,
   invalidateCollabDocumentAndWait,
 } from '../../../server/collab.js';
-import { broadcastToRoom, sendBridgeRequest, type BridgeError } from '../../../server/ws.js';
+import { broadcastToRoom, sendBridgeRequest, type BridgeError } from './ws.js';
 import { findBridgeRoutePolicy, getBridgeRoutePolicies, type BridgeRoutePolicy } from './bridge-auth-policy.js';
 import { validateRewriteApplyPayload } from './rewrite-validation.js';
 import {
@@ -28,7 +28,7 @@ import {
   evaluateRewriteLiveClientGate,
   rewriteBarrierFailedResponseBody,
   rewriteBlockedResponseBody,
-} from '../../../server/rewrite-policy.js';
+} from './rewrite-policy.js';
 import { canonicalizeStoredMarks, type StoredMark } from '@proof/core/marks';
 
 export const bridgeRouter = Router({ mergeParams: true });

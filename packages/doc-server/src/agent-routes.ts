@@ -51,7 +51,7 @@ import {
   recordRewriteLiveClientBlock,
 } from '../../../server/metrics.js';
 import type { ShareRole } from './share-types.js';
-import { broadcastToRoom, getActiveCollabClientBreakdown, getActiveCollabClientCount } from '../../../server/ws.js';
+import { broadcastToRoom, getActiveCollabClientBreakdown, getActiveCollabClientCount } from './ws.js';
 import { getCookie, shareTokenCookieName } from './cookies.js';
 import {
   authorizeDocumentOp,
@@ -77,13 +77,13 @@ import {
   isHostedRewriteEnvironment,
   rewriteBarrierFailedResponseBody,
   rewriteBlockedResponseBody,
-} from '../../../server/rewrite-policy.js';
+} from './rewrite-policy.js';
 import {
   getMutationContractStage,
   isIdempotencyRequired,
   validateEditPrecondition,
   validateOpPrecondition,
-} from '../../../server/mutation-stage.js';
+} from './mutation-stage.js';
 import {
   normalizeAgentScopedId,
   resolveExplicitAgentIdentity,
@@ -1296,6 +1296,7 @@ agentRoutes.get('/:slug/state', (req: Request, res: Response) => {
     mutationReady,
   };
   const proofSdkPaths = buildProofSdkDocumentPaths(slug);
+  const legacyTitlePath = `/api/documents/${encodeURIComponent(slug)}/title`;
   const links = {
     ...(isRecord(body._links) ? body._links : {}),
     ...buildProofSdkLinks(slug),
@@ -1303,7 +1304,7 @@ agentRoutes.get('/:slug/state', (req: Request, res: Response) => {
   if (mutationReady) {
     links.ops = { method: 'POST', href: proofSdkPaths.ops };
     links.edit = { method: 'POST', href: proofSdkPaths.edit };
-    links.title = { method: 'PUT', href: proofSdkPaths.title };
+    links.title = { method: 'PUT', href: legacyTitlePath };
   }
   if (editV2Enabled) {
     links.snapshot = proofSdkPaths.snapshot;
@@ -1334,7 +1335,7 @@ agentRoutes.get('/:slug/state', (req: Request, res: Response) => {
   if (mutationReady) {
     agent.opsApi = proofSdkPaths.ops;
     agent.editApi = proofSdkPaths.edit;
-    agent.titleApi = proofSdkPaths.title;
+    agent.titleApi = legacyTitlePath;
   }
   if (editV2Enabled) {
     agent.snapshotApi = proofSdkPaths.snapshot;

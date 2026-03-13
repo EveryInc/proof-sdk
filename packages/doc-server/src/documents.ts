@@ -39,7 +39,7 @@ import {
   updateMarks,
 } from '../../../server/db.js';
 import { isShareRole, type ShareRole } from './share-types.js';
-import { broadcastToRoom, closeRoom, getRoomSize } from '../../../server/ws.js';
+import { broadcastToRoom, closeRoom, getRoomSize } from './ws.js';
 import { runLegacyMarkRangeBackfillOnce } from './marks-range-backfill.js';
 import { createRateLimiter } from './rate-limiter.js';
 import { getCookie, shareTokenCookieName } from './cookies.js';
@@ -85,13 +85,13 @@ import {
   evaluateRewriteLiveClientGate,
   rewriteBarrierFailedResponseBody,
   rewriteBlockedResponseBody,
-} from '../../../server/rewrite-policy.js';
+} from './rewrite-policy.js';
 import { summarizeDocumentIntegrity } from './document-integrity.js';
 import {
   getMutationContractStage,
   isIdempotencyRequired,
   validateOpPrecondition,
-} from '../../../server/mutation-stage.js';
+} from './mutation-stage.js';
 import { resolveExplicitAgentIdentity } from '@proof/core/agent-identity';
 import {
   buildProofSdkAgentDescriptor,
