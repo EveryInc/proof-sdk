@@ -5,6 +5,7 @@ async function run(): Promise<void> {
   const editorBatch = await import('../../packages/doc-editor/src/batch-executor.ts');
   const editorComments = await import('../../packages/doc-editor/src/plugins/comments.ts');
   const editorSuggestions = await import('../../packages/doc-editor/src/plugins/suggestions.ts');
+  const coreMarks = await import('@proof/core/marks');
   const sqliteTypes = await import('@proof/sqlite/types');
   const serverDocuments = await import('@proof/server/documents');
   const editorCommentsExport = await import('@proof/editor/plugins/comments');
@@ -59,6 +60,10 @@ async function run(): Promise<void> {
 
   if (typeof editorCommentsExport.getUnresolvedPluginComments !== 'function') {
     throw new Error('Expected @proof/editor/plugins/comments subpath export to expose getUnresolvedPluginComments');
+  }
+
+  if (typeof coreMarks.getMarkColor !== 'function') {
+    throw new Error('Expected @proof/core/marks subpath export to expose getMarkColor');
   }
 
   console.log('proof-sdk-package-surfaces.test.ts passed');

@@ -9,6 +9,22 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./marks": {
+      "types": "./dist/marks.d.ts",
+      "import": "./dist/marks.js"
+    },
+    "./provenance-sidecar": {
+      "types": "./dist/provenance-sidecar.d.ts",
+      "import": "./dist/provenance-sidecar.js"
+    },
+    "./remark-proof-marks": {
+      "types": "./dist/remark-proof-marks.d.ts",
+      "import": "./dist/remark-proof-marks.js"
+    },
+    "./agent-identity": {
+      "types": "./dist/agent-identity.d.ts",
+      "import": "./dist/agent-identity.js"
     }
   },
   "files": [
