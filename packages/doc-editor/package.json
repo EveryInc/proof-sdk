@@ -12,6 +12,9 @@
     ".": "./src/index.ts",
     "./editor": "./src/editor.ts",
     "./batch-executor": "./src/batch-executor.ts",
+    "./schema/code-block-ext": "./src/schema/code-block-ext.ts",
+    "./schema/frontmatter": "./src/schema/frontmatter.ts",
+    "./schema/proof-marks": "./src/schema/proof-marks.ts",
     "./plugins/comments": "./src/plugins/comments.ts",
     "./plugins/marks": "./src/plugins/marks.ts",
     "./plugins/suggestions": "./src/plugins/suggestions.ts"

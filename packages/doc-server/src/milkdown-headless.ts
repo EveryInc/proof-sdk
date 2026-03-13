@@ -11,10 +11,10 @@ import { unified } from 'unified';
 
 // Reuse the same Milkdown schema plugins + proof span remark plugin as the browser editor so
 // markdown replacements can be applied into the Yjs ProseMirror fragment server-side.
-import { codeBlockExtPlugins } from '../../../src/editor/schema/code-block-ext.js';
-import { frontmatterSchema } from '../../../src/editor/schema/frontmatter.js';
-import { proofMarkPlugins } from '../../../src/editor/schema/proof-marks.js';
-import { remarkProofMarks, proofMarkHandler } from '../../../src/formats/remark-proof-marks.js';
+import { codeBlockExtPlugins } from '@proof/editor/schema/code-block-ext';
+import { frontmatterSchema } from '@proof/editor/schema/frontmatter';
+import { proofMarkPlugins } from '@proof/editor/schema/proof-marks';
+import { remarkProofMarks, proofMarkHandler } from '@proof/core/remark-proof-marks';
 
 export type HeadlessMilkdownParser = {
   schema: Schema;
