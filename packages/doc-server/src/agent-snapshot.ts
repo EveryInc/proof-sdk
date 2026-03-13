@@ -7,7 +7,7 @@ import {
   parseMarkdownWithHtmlFallback,
   serializeSingleNode,
   summarizeParseError,
-} from '../../../server/milkdown-headless.js';
+} from './milkdown-headless.js';
 import { stripProofSpanTags } from './proof-span-strip.js';
 
 export type AgentSnapshotResult = {

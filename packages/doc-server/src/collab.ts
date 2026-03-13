@@ -46,7 +46,7 @@ import {
   parseMarkdownWithHtmlFallback,
   serializeMarkdown,
   summarizeParseError,
-} from '../../../server/milkdown-headless.js';
+} from './milkdown-headless.js';
 import { normalizeAgentScopedId } from '@proof/core/agent-identity';
 
 type HocuspocusInstance = {
