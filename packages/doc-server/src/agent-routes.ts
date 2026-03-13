@@ -49,7 +49,7 @@ import {
   recordRewriteBarrierLatency,
   recordRewriteForceIgnored,
   recordRewriteLiveClientBlock,
-} from '../../../server/metrics.js';
+} from './metrics.js';
 import type { ShareRole } from './share-types.js';
 import { broadcastToRoom, getActiveCollabClientBreakdown, getActiveCollabClientCount } from './ws.js';
 import { getCookie, shareTokenCookieName } from './cookies.js';

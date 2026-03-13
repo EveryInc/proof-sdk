@@ -21,7 +21,7 @@ import {
   recordRewriteBarrierLatency,
   recordRewriteForceIgnored,
   recordRewriteLiveClientBlock,
-} from '../../../server/metrics.js';
+} from './metrics.js';
 import {
   annotateRewriteDisruptionMetadata,
   classifyRewriteBarrierFailureReason,

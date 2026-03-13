@@ -10,7 +10,7 @@ import {
   upsertActiveCollabConnection,
 } from '../../../server/db.js';
 import type { ShareRole } from './share-types.js';
-import { recordShareLinkOpen } from '../../../server/metrics.js';
+import { recordShareLinkOpen } from './metrics.js';
 import { getCookie, shareTokenCookieName } from './cookies.js';
 import { handleShareMarkdown, shareMarkdownBodyParser } from '../../../server/routes.js';
 import { getSnapshotHtml, getSnapshotPublicUrl } from './snapshot.js';
