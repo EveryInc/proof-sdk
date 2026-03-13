@@ -1,9 +1,9 @@
 import type { Express, Router } from 'express';
-import { agentRoutes } from '../../../server/agent-routes.js';
-import { bridgeRouter, createBridgeMountRouter } from '../../../server/bridge.js';
-import { getCollabRuntime, startCollabRuntime, startCollabRuntimeEmbedded } from '../../../server/collab.js';
-import { apiRoutes, handleShareMarkdown, shareMarkdownBodyParser } from '../../../server/routes.js';
-import { shareWebRoutes } from '../../../server/share-web-routes.js';
+import { agentRoutes } from './agent.js';
+import { bridgeRouter, createBridgeMountRouter } from './bridge.js';
+import { getCollabRuntime, startCollabRuntime, startCollabRuntimeEmbedded } from './collab.js';
+import { apiRoutes, handleShareMarkdown, shareMarkdownBodyParser } from './documents.js';
+import { shareWebRoutes } from './share.js';
 
 export function createDocumentRouter(): Router {
   return apiRoutes;

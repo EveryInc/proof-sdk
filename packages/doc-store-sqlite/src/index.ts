@@ -8,7 +8,7 @@ import {
   resolveDocumentAccessRole,
   updateDocument,
   updateDocumentTitle,
-} from '../../../server/db.js';
+} from './store.js';
 
 export interface SqliteDocumentStore {
   createDocument: typeof createDocument;
