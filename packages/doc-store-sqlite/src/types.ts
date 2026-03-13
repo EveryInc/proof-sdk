@@ -1,6 +1,4 @@
-export type ShareState = 'ACTIVE' | 'PAUSED' | 'REVOKED' | 'DELETED';
-
-export type ShareRole = 'viewer' | 'commenter' | 'editor' | 'owner_bot';
+export type { ShareRole, ShareState } from '@proof/server/share-types';
 
 export interface DocumentRow {
   slug: string;
