@@ -5,6 +5,9 @@ async function run(): Promise<void> {
   const editorBatch = await import('../../packages/doc-editor/src/batch-executor.ts');
   const editorComments = await import('../../packages/doc-editor/src/plugins/comments.ts');
   const editorSuggestions = await import('../../packages/doc-editor/src/plugins/suggestions.ts');
+  const sqliteTypes = await import('@proof/sqlite/types');
+  const serverDocuments = await import('@proof/server/documents');
+  const editorCommentsExport = await import('@proof/editor/plugins/comments');
 
   if (typeof core.getMarkColor !== 'function') {
     throw new Error('Expected @proof/core surface to expose getMarkColor');
@@ -44,6 +47,18 @@ async function run(): Promise<void> {
 
   if (typeof editorSuggestions.wrapTransactionForSuggestions !== 'function') {
     throw new Error('Expected @proof/editor suggestions surface to expose wrapTransactionForSuggestions');
+  }
+
+  if (typeof sqliteTypes !== 'object') {
+    throw new Error('Expected @proof/sqlite/types subpath export to resolve');
+  }
+
+  if (typeof serverDocuments.createDocumentRouter !== 'function') {
+    throw new Error('Expected @proof/server/documents subpath export to expose createDocumentRouter');
+  }
+
+  if (typeof editorCommentsExport.getUnresolvedPluginComments !== 'function') {
+    throw new Error('Expected @proof/editor/plugins/comments subpath export to expose getUnresolvedPluginComments');
   }
 
   console.log('proof-sdk-package-surfaces.test.ts passed');

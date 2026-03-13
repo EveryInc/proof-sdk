@@ -4,5 +4,12 @@
   "type": "module",
   "version": "0.1.0",
   "description": "Proof SDK editor runtime and editor-facing plugins",
-  "exports": "./src/index.ts"
+  "exports": {
+    ".": "./src/index.ts",
+    "./editor": "./src/editor.ts",
+    "./batch-executor": "./src/batch-executor.ts",
+    "./plugins/comments": "./src/plugins/comments.ts",
+    "./plugins/marks": "./src/plugins/marks.ts",
+    "./plugins/suggestions": "./src/plugins/suggestions.ts"
+  }
 }

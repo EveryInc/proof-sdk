@@ -4,5 +4,12 @@
   "type": "module",
   "version": "0.1.0",
   "description": "Proof SDK document, share, and collaboration server routes",
-  "exports": "./src/index.ts"
+  "exports": {
+    ".": "./src/index.ts",
+    "./agent": "./src/agent.ts",
+    "./bridge": "./src/bridge.ts",
+    "./collab": "./src/collab.ts",
+    "./documents": "./src/documents.ts",
+    "./share": "./src/share.ts"
+  }
 }

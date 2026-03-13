@@ -4,5 +4,9 @@
   "type": "module",
   "version": "0.1.0",
   "description": "Proof SDK SQLite-backed document storage adapters",
-  "exports": "./src/index.ts"
+  "exports": {
+    ".": "./src/index.ts",
+    "./store": "./src/store.ts",
+    "./types": "./src/types.ts"
+  }
 }
