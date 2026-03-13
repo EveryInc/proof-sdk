@@ -3,8 +3,30 @@
   "type": "module",
   "version": "0.1.0",
   "description": "Proof SDK document, share, and collaboration server routes",
+  "license": "MIT",
+  "homepage": "https://proofeditor.ai",
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/EveryInc/proof-sdk.git",
+    "directory": "packages/doc-server"
+  },
+  "bugs": {
+    "url": "https://github.com/EveryInc/proof-sdk/issues"
+  },
+  "keywords": [
+    "proof",
+    "sdk",
+    "server",
+    "collaboration",
+    "express",
+    "yjs",
+    "markdown"
+  ],
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "publishConfig": {
+    "access": "public"
+  },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.879.0",
     "@milkdown/core": "^7.5.0",

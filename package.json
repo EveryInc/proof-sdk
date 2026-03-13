@@ -4,6 +4,15 @@
   "description": "Open-source collaborative markdown editor with provenance tracking and an agent HTTP bridge",
   "private": false,
   "type": "module",
+  "license": "MIT",
+  "homepage": "https://proofeditor.ai",
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/EveryInc/proof-sdk.git"
+  },
+  "bugs": {
+    "url": "https://github.com/EveryInc/proof-sdk/issues"
+  },
   "workspaces": [
     "packages/*",
     "apps/*"
@@ -17,7 +26,8 @@
     "test:packages": "npm run build:packages && node --import tsx src/tests/proof-sdk-package-surfaces.test.ts && node --import tsx src/tests/editor-package-regressions.test.ts && node --import tsx src/tests/server-package-internals.test.ts && node --import tsx src/tests/package-packed-consumer.test.ts",
     "test:proof-sdk": "tsx src/tests/proof-sdk-agent-bridge-client.test.ts",
     "test:server-routes-share": "tsx src/tests/server-routes-and-share.test.ts",
-    "demo:agent": "npm --workspace proof-example run demo:agent"
+    "demo:agent": "npm --workspace proof-example run demo:agent",
+    "pack:packages": "NPM_CONFIG_CACHE=.tmp/npm-cache npm --workspace @proof/core pack --json && NPM_CONFIG_CACHE=.tmp/npm-cache npm --workspace @proof/editor pack --json && NPM_CONFIG_CACHE=.tmp/npm-cache npm --workspace @proof/server pack --json && NPM_CONFIG_CACHE=.tmp/npm-cache npm --workspace @proof/sqlite pack --json"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.879.0",

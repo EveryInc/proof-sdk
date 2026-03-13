@@ -3,8 +3,31 @@
   "type": "module",
   "version": "0.1.0",
   "description": "Proof SDK editor runtime and editor-facing plugins",
+  "license": "MIT",
+  "homepage": "https://proofeditor.ai",
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/EveryInc/proof-sdk.git",
+    "directory": "packages/doc-editor"
+  },
+  "bugs": {
+    "url": "https://github.com/EveryInc/proof-sdk/issues"
+  },
+  "keywords": [
+    "proof",
+    "sdk",
+    "editor",
+    "markdown",
+    "comments",
+    "suggestions",
+    "prosemirror",
+    "milkdown"
+  ],
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "publishConfig": {
+    "access": "public"
+  },
   "dependencies": {
     "@proof/core": "0.1.0",
     "@milkdown/kit": "^7.5.0",
