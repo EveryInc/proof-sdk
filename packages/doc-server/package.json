@@ -1,9 +1,10 @@
 {
   "name": "@proof/server",
-  "private": true,
   "type": "module",
   "version": "0.1.0",
   "description": "Proof SDK document, share, and collaboration server routes",
+  "main": "./dist/index.js",
+  "types": "./src/index.ts",
   "dependencies": {
     "@aws-sdk/client-s3": "^3.879.0",
     "@milkdown/core": "^7.5.0",
@@ -27,13 +28,45 @@
     "yjs": "^13.6.20"
   },
   "exports": {
-    ".": "./src/index.ts",
-    "./agent": "./src/agent.ts",
-    "./bridge": "./src/bridge.ts",
-    "./collab": "./src/collab.ts",
-    "./db": "./src/db.ts",
-    "./documents": "./src/documents.ts",
-    "./share": "./src/share.ts",
-    "./share-types": "./src/share-types.ts"
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./dist/index.js"
+    },
+    "./agent": {
+      "types": "./src/agent.ts",
+      "import": "./dist/agent.js"
+    },
+    "./bridge": {
+      "types": "./src/bridge.ts",
+      "import": "./dist/bridge.js"
+    },
+    "./collab": {
+      "types": "./src/collab.ts",
+      "import": "./dist/collab.js"
+    },
+    "./db": {
+      "types": "./src/db.ts",
+      "import": "./dist/db.js"
+    },
+    "./documents": {
+      "types": "./src/documents.ts",
+      "import": "./dist/documents.js"
+    },
+    "./share": {
+      "types": "./src/share.ts",
+      "import": "./dist/share.js"
+    },
+    "./share-types": {
+      "types": "./src/share-types.ts",
+      "import": "./dist/share-types.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "scripts": {
+    "build": "node ../../scripts/build-package.mjs",
+    "clean": "rm -rf dist"
   }
 }

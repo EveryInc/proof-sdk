@@ -1,23 +1,59 @@
 {
   "name": "@proof/editor",
-  "private": true,
   "type": "module",
   "version": "0.1.0",
   "description": "Proof SDK editor runtime and editor-facing plugins",
+  "main": "./dist/index.js",
+  "types": "./src/index.ts",
   "dependencies": {
     "@proof/core": "0.1.0",
     "@milkdown/kit": "^7.5.0",
     "y-prosemirror": "^1.2.19"
   },
   "exports": {
-    ".": "./src/index.ts",
-    "./batch-executor": "./src/batch-executor.ts",
-    "./schema/code-block-ext": "./src/schema/code-block-ext.ts",
-    "./schema/frontmatter": "./src/schema/frontmatter.ts",
-    "./schema/proof-marks": "./src/schema/proof-marks.ts",
-    "./utils/text-range": "./src/utils/text-range.ts",
-    "./plugins/comments": "./src/plugins/comments.ts",
-    "./plugins/marks": "./src/plugins/marks.ts",
-    "./plugins/suggestions": "./src/plugins/suggestions.ts"
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./dist/index.js"
+    },
+    "./batch-executor": {
+      "types": "./src/batch-executor.ts",
+      "import": "./dist/batch-executor.js"
+    },
+    "./schema/code-block-ext": {
+      "types": "./src/schema/code-block-ext.ts",
+      "import": "./dist/schema/code-block-ext.js"
+    },
+    "./schema/frontmatter": {
+      "types": "./src/schema/frontmatter.ts",
+      "import": "./dist/schema/frontmatter.js"
+    },
+    "./schema/proof-marks": {
+      "types": "./src/schema/proof-marks.ts",
+      "import": "./dist/schema/proof-marks.js"
+    },
+    "./utils/text-range": {
+      "types": "./src/utils/text-range.ts",
+      "import": "./dist/utils/text-range.js"
+    },
+    "./plugins/comments": {
+      "types": "./src/plugins/comments.ts",
+      "import": "./dist/plugins/comments.js"
+    },
+    "./plugins/marks": {
+      "types": "./src/plugins/marks.ts",
+      "import": "./dist/plugins/marks.js"
+    },
+    "./plugins/suggestions": {
+      "types": "./src/plugins/suggestions.ts",
+      "import": "./dist/plugins/suggestions.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "scripts": {
+    "build": "node ../../scripts/build-package.mjs --exclude src/editor.ts",
+    "clean": "rm -rf dist"
   }
 }
