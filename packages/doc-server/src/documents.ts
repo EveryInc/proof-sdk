@@ -13,7 +13,7 @@ import {
   stripEphemeralCollabSpans,
   acquireRewriteLock,
 } from '../../../server/collab.js';
-import { getSnapshotPublicUrl, refreshSnapshotForSlug } from '../../../server/snapshot.js';
+import { getSnapshotPublicUrl, refreshSnapshotForSlug } from './snapshot.js';
 import { executeCanonicalRewrite, mutateCanonicalDocument } from '../../../server/canonical-document.js';
 import {
   addEvent,

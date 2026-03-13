@@ -39,7 +39,7 @@ import {
   recordProjectionWipe,
 } from '../../../server/metrics.js';
 import { canonicalizeStoredMarks, type StoredMark } from '@proof/core/marks';
-import { refreshSnapshotForSlug } from '../../../server/snapshot.js';
+import { refreshSnapshotForSlug } from './snapshot.js';
 import { isShareRole, type ShareRole, type ShareState } from './share-types.js';
 import {
   getHeadlessMilkdownParser,
