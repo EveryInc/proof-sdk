@@ -5,8 +5,11 @@
   "version": "0.1.0",
   "description": "Proof SDK document, share, and collaboration server routes",
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.879.0",
+    "@resvg/resvg-js": "^2.6.2",
     "@proof/core": "0.1.0",
     "express": "^5.2.1",
+    "satori": "^0.24.1",
     "y-prosemirror": "^1.2.19",
     "yjs": "^13.6.20"
   },

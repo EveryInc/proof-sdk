@@ -33,7 +33,7 @@ import {
   renderShareOgPng,
   resolvePublicOrigin,
   type SharePreviewModel,
-} from '../../../server/share-preview.js';
+} from './share-preview.js';
 import {
   buildProofSdkAgentDescriptor,
   buildProofSdkDocumentPaths,
