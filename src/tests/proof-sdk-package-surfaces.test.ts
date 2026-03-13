@@ -107,6 +107,18 @@ async function run(): Promise<void> {
     throw new Error('Expected @proof/core/marks subpath export to expose getMarkColor');
   }
 
+  let removedEditorEntrypointResolved = false;
+  try {
+    await import('@proof/editor/editor');
+    removedEditorEntrypointResolved = true;
+  } catch {
+    // Expected: the reusable editor package no longer exports the web runtime.
+  }
+
+  if (removedEditorEntrypointResolved) {
+    throw new Error('Expected @proof/editor/editor export to be removed');
+  }
+
   console.log('proof-sdk-package-surfaces.test.ts passed');
 }
 
