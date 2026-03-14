@@ -144,21 +144,45 @@ DO migrations (`new_sqlite_classes`) are declared in config and auto-applied on 
 
 ### CI/CD
 
-A manual-trigger GitHub Actions workflow is included at `.github/workflows/deploy-cloudflare.yml`. It builds the frontend and runs `wrangler deploy`.
+A GitHub Actions workflow is included at `.github/workflows/deploy-cloudflare.yml`. It's **manual-trigger only** (`workflow_dispatch`) — it won't run on push or merge. This is intentional: the repo is an SDK, and most contributors won't have or need a Cloudflare deployment. The workflow is there so that anyone who *does* deploy can use it without writing their own.
 
-To use it:
-1. Add a `CLOUDFLARE_API_TOKEN` secret to your repo (Settings > Secrets > Actions)
-2. Trigger from the Actions tab or via `gh workflow run deploy-cloudflare.yml`
+**Setup:**
 
-To enable auto-deploy on merge, add a `push` trigger:
+1. Create a Cloudflare API token with `Workers Scripts:Edit` and `D1:Edit` permissions
+2. Add it as `CLOUDFLARE_API_TOKEN` in your repo (Settings > Secrets and variables > Actions)
+3. Trigger from the Actions tab or CLI:
+   ```bash
+   gh workflow run deploy-cloudflare.yml
+   ```
+
+The workflow runs `npm ci`, `npm run build` (frontend bundle), then `wrangler deploy` from `apps/proof-cloudflare/`. D1 and Durable Object migrations are applied automatically by Wrangler on each deploy.
+
+**Upgrading to auto-deploy:**
+
+If you're running your own fork and want every merge to `main` to deploy automatically, add a `push` trigger alongside the existing `workflow_dispatch`:
 
 ```yaml
 on:
   push:
     branches: [main]
+    paths:
+      - "apps/proof-cloudflare/**"
+      - "src/**"
+      - "packages/**"
+      - "package.json"
   workflow_dispatch:
-    # ...existing inputs
+    inputs:
+      environment:
+        description: "Deployment environment"
+        required: false
+        default: "production"
+        type: choice
+        options:
+          - production
+          - preview
 ```
+
+The `paths` filter avoids deploying on doc-only changes. You can still trigger manually for off-cycle deploys or to select the preview environment.
 
 ### Custom domain
 
