@@ -142,6 +142,24 @@ All bindings are declared in `wrangler.jsonc`:
 
 DO migrations (`new_sqlite_classes`) are declared in config and auto-applied on deploy.
 
+### CI/CD
+
+A manual-trigger GitHub Actions workflow is included at `.github/workflows/deploy-cloudflare.yml`. It builds the frontend and runs `wrangler deploy`.
+
+To use it:
+1. Add a `CLOUDFLARE_API_TOKEN` secret to your repo (Settings > Secrets > Actions)
+2. Trigger from the Actions tab or via `gh workflow run deploy-cloudflare.yml`
+
+To enable auto-deploy on merge, add a `push` trigger:
+
+```yaml
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    # ...existing inputs
+```
+
 ### Custom domain
 
 Add `routes` or `custom_domain` to `wrangler.jsonc`, or configure via the Cloudflare dashboard under Workers > your worker > Settings > Domains & Routes.
