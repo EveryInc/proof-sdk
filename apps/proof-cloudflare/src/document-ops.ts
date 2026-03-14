@@ -1,3 +1,10 @@
+/**
+ * Document operation parsing and authorization for the agent `ops` endpoint.
+ *
+ * Parses incoming operation requests into typed operations, resolves them to
+ * internal mark/rewrite routes, and checks role-based access control.
+ */
+
 import type { ShareRole } from './share-types.js';
 
 export type DocumentOpType =
@@ -14,6 +21,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+/** Parse and validate an agent's document operation request into a typed operation. */
 export function parseDocumentOpRequest(body: unknown): { op: DocumentOpType; payload: Record<string, unknown> } | { error: string } {
   const raw = isRecord(body) ? body : {};
   const op = (raw.type ?? raw.op) as DocumentOpType | undefined;
@@ -27,6 +35,7 @@ export function parseDocumentOpRequest(body: unknown): { op: DocumentOpType; pay
   return { op, payload };
 }
 
+/** Map an operation type to its internal route (e.g. comment.add → /marks/comment). */
 export function resolveDocumentOpRoute(
   opType: DocumentOpType,
   payload: Record<string, unknown>,
@@ -58,6 +67,7 @@ export function resolveDocumentOpRoute(
   }
 }
 
+/** Check whether the caller's role permits the requested operation. Returns null if allowed, error string if denied. */
 export function authorizeDocumentOp(
   type: DocumentOpType,
   accessRole: ShareRole | null,

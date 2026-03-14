@@ -12,6 +12,7 @@ Proof is the hosted product. Proof SDK is the open-source editor, collaboration 
 - Include `by` on every write. Use `ai:<agent-name>`.
 - Treat `slug + token` as the document address and auth pair.
 - Prefer HTTP APIs over local runtime assumptions.
+- All routes work on any Proof SDK deployment (Express, Cloudflare Workers, etc.). Examples below use `localhost:4000`; replace with your deployment URL.
 
 ## Authentication
 
@@ -37,7 +38,7 @@ curl -sS -X POST http://localhost:4000/documents \
   -d '{"title":"My Document","markdown":"# Hello\n\nFirst draft."}'
 ```
 
-Hosted Proof also keeps `POST /share/markdown` as a compatibility alias.
+`POST /share/markdown` is a compatibility alias.
 
 ### Read state
 
@@ -155,8 +156,9 @@ curl -sS -X POST "http://localhost:4000/documents/<slug>/presence" \
 
 ## References
 
-- Discovery JSON: `http://localhost:4000/.well-known/agent.json`
-- Docs: `http://localhost:4000/agent-docs`
-- Setup: `http://localhost:4000/agent-setup`
-- [AGENT_CONTRACT.md](/Users/danshipper/CascadeProjects/every-proof/.worktrees/proof-sdk-split/AGENT_CONTRACT.md)
-- [agent-docs.md](/Users/danshipper/CascadeProjects/every-proof/.worktrees/proof-sdk-split/docs/agent-docs.md)
+- Discovery JSON: `<base-url>/.well-known/agent.json`
+- Docs: `<base-url>/agent-docs`
+- Setup: `<base-url>/agent-setup`
+- `AGENT_CONTRACT.md`
+- `docs/agent-docs.md`
+- `docs/DEPLOYMENT.md`

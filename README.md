@@ -20,6 +20,7 @@ If you want the hosted product, use [Proof](https://proofeditor.ai).
 - `packages/doc-store-sqlite`
 - `packages/agent-bridge`
 - `apps/proof-example`
+- `apps/proof-cloudflare`
 - `server`
 - `src`
 
@@ -89,8 +90,10 @@ npm test
 
 - `AGENT_CONTRACT.md`
 - `docs/agent-docs.md`
+- `docs/DEPLOYMENT.md`
 - `docs/proof.SKILL.md`
 - `docs/adr/2026-03-proof-sdk-public-core.md`
+- `docs/adr/2026-03-cloudflare-workers-deployment.md`
 
 ## License
 

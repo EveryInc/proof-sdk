@@ -1,5 +1,7 @@
 # Proof Agent Docs
 
+> **Deployment note**: Examples use `localhost:4000` (local Express server). The same routes and API apply to all Proof SDK deployments — Express, Cloudflare Workers, etc. Replace `localhost:4000` with your deployment URL. See `docs/DEPLOYMENT.md` for setup options.
+
 ## Proof SDK Route Alias
 
 Hosted Proof keeps the `/api/agent/*` and `/share/markdown` compatibility routes.

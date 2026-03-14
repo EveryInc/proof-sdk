@@ -1,5 +1,5 @@
 {
-  "name": "proof-sdk-cloudflare",
+  "name": "proof-cloudflare",
   "main": "src/index.ts",
   "compatibility_date": "2024-12-01",
   "compatibility_flags": ["nodejs_compat"],

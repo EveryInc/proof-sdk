@@ -1,7 +1,16 @@
+/**
+ * Cloudflare Workers entry point for Proof SDK.
+ *
+ * Routes incoming requests to static assets, the D1 document catalog,
+ * or per-document Durable Objects. Each document gets its own DO instance
+ * for state isolation and collab.
+ */
+
 import { DocumentSession } from "./document-session.js";
 
 export { DocumentSession };
 
+/** Cloudflare bindings: Durable Objects, D1, and static assets. */
 export interface Env {
   DOCUMENT_SESSION: DurableObjectNamespace<DocumentSession>;
   CATALOG_DB: D1Database;
@@ -215,6 +224,7 @@ export default {
   },
 } satisfies ExportedHandler<Env>;
 
+/** Forward a request to the Durable Object instance for the given document slug. */
 async function routeToDocumentSession(
   request: Request,
   env: Env,

@@ -1,5 +1,5 @@
 {
-  "name": "proof-sdk-cloudflare",
+  "name": "proof-cloudflare",
   "version": "0.1.0",
   "type": "module",
   "private": true,

@@ -1,3 +1,11 @@
+/**
+ * Agent edit operations pipeline.
+ *
+ * Implements append/replace/insert operations on raw markdown, handling
+ * proof-authored span wrapping, fenced code block detection, and anchor
+ * resolution through stripped (visible-text) matching.
+ */
+
 import {
   buildStrippedIndexMap,
   expandRangeToIncludeFullyWrappedAuthoredSpan,
@@ -182,6 +190,7 @@ function resolveInsertAfterIndex(markdown: string, after: string): number {
   return moveIndexPastTrailingAuthoredSpans(markdown, origEnd + 1);
 }
 
+/** Apply a sequence of agent edit operations to markdown, returning the updated text or first failure. */
 export function applyAgentEditOperations(
   markdown: string,
   operations: AgentEditOperation[],
