@@ -500,7 +500,7 @@ shareWebRoutes.get('/d/:slug', (req: Request, res: Response) => {
         origin,
         includeMutationRoutes: mutationReady,
         includeSnapshotRoute: editV2Enabled,
-        includeEditV2Route: editV2Enabled && mutationReady,
+        includeEditV2Route: editV2Enabled,
       }),
       self: `${origin}/d/${encodeURIComponent(slug)}`,
       agentDocs: `${origin}${AGENT_DOCS_PATH}`,
@@ -511,7 +511,7 @@ shareWebRoutes.get('/d/:slug', (req: Request, res: Response) => {
         origin,
         includeMutationRoutes: mutationReady,
         includeSnapshotRoute: editV2Enabled,
-        includeEditV2Route: editV2Enabled && mutationReady,
+        includeEditV2Route: editV2Enabled,
       }),
       mutationReady,
       auth: {

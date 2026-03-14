@@ -67,6 +67,7 @@ export type ShareRequestError = {
     status: number;
     code: string;
     message: string;
+    retryAfterMs?: number | null;
   };
 };
 
@@ -78,6 +79,8 @@ type CollabSessionPayload = {
 type CollabUnavailablePayload = {
   collabAvailable: false;
   snapshotUrl: string | null;
+  code?: string;
+  retryAfterMs?: number | null;
 };
 
 export interface AccessLinkResponse {
@@ -93,11 +96,19 @@ export interface ShareMarkMutationResponse {
 }
 
 type ShareMutationBase = {
+  baseToken?: string;
   baseRevision?: number;
   baseUpdatedAt?: string;
 };
 
 export type ShareEventHandler = (message: Record<string, unknown>) => void;
+
+const MUTATION_BASE_STATE_RETRY_ATTEMPTS = 4;
+const MUTATION_BASE_STATE_RETRY_DELAY_MS = 100;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 export class ShareClient {
   private slug: string | null = null;
@@ -211,6 +222,10 @@ export class ShareClient {
     return `${origin}/api`;
   }
 
+  getApiBaseUrl(): string {
+    return this.getApiBase();
+  }
+
   getShareAuthHeaders(explicitToken?: string): Record<string, string> {
     const token = explicitToken?.trim() || this.shareToken;
     const headers: Record<string, string> = {
@@ -228,40 +243,140 @@ export class ShareClient {
   }
 
   private async parseRequestError(response: Response): Promise<ShareRequestError> {
-    const body = await response.json().catch(() => ({} as { error?: unknown; code?: unknown }));
+    const body = await response.json().catch(() => ({} as {
+      error?: unknown;
+      code?: unknown;
+      retryAfterMs?: unknown;
+    }));
     const code = typeof body.code === 'string' && body.code.trim().length > 0
       ? body.code
       : 'unknown';
     const message = typeof body.error === 'string' && body.error.trim().length > 0
       ? body.error
       : response.statusText || 'Request failed';
+    const retryAfterMs = typeof body.retryAfterMs === 'number' && Number.isFinite(body.retryAfterMs)
+      ? Math.max(0, Math.trunc(body.retryAfterMs))
+      : null;
     return {
       error: {
         status: response.status,
         code,
         message,
+        retryAfterMs,
       },
     };
   }
 
   private createLocalRequestError(status: number, code: string, message: string): ShareRequestError {
     return {
-      error: { status, code, message },
+      error: { status, code, message, retryAfterMs: null },
     };
   }
 
-  private async getMutationBase(options?: { token?: string }): Promise<ShareMutationBase | ShareRequestError> {
-    if (!this.slug) {
-      return this.createLocalRequestError(400, 'missing_slug', 'Share slug is not available');
+  private parseShareMarkMutationResponse(payload: Record<string, unknown> | null): ShareMarkMutationResponse {
+    return {
+      success: payload?.success === true,
+      marks: (payload?.marks && typeof payload.marks === 'object' && !Array.isArray(payload.marks))
+        ? payload.marks as Record<string, unknown>
+        : undefined,
+    };
+  }
+
+  private shouldRetryTransientMarkMutation(error: ShareRequestError): boolean {
+    const code = error.error.code.trim().toUpperCase();
+    const message = error.error.message.trim().toLowerCase();
+    return code === 'STALE_BASE'
+      || code === 'PROJECTION_STALE'
+      || code === 'AUTHORITATIVE_BASE_UNAVAILABLE'
+      || code === 'MARK_NOT_FOUND'
+      || code === 'MARK_NOT_HYDRATED'
+      || code === 'COLLAB_SYNC_FAILED'
+      || message.includes('stale')
+      || message.includes('shadow')
+      || message.includes('projection')
+      || message.includes('mutation base')
+      || message.includes('not found');
+  }
+
+  private resolveRecoveredMarkMutation(
+    context: ShareOpenContext | ShareRequestError | null,
+    markId: string,
+    finalStatus: 'accepted' | 'rejected',
+  ): ShareMarkMutationResponse | null {
+    if (!context || 'error' in context) return null;
+    const marks = (context.doc?.marks && typeof context.doc.marks === 'object' && !Array.isArray(context.doc.marks))
+      ? context.doc.marks as Record<string, unknown>
+      : null;
+    if (!marks) return null;
+
+    if (!(markId in marks)) {
+      return { success: true, marks };
     }
 
-    const response = await fetch(`${this.getApiBase()}/agent/${encodeURIComponent(this.slug)}/state`, {
-      method: 'GET',
-      headers: this.getShareAuthHeaders(options?.token),
-    });
-    if (!response.ok) return this.parseRequestError(response);
+    const entry = marks[markId];
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return null;
+    const status = typeof (entry as { status?: unknown }).status === 'string'
+      ? (entry as { status: string }).status.trim().toLowerCase()
+      : '';
+    if (status === finalStatus) {
+      return { success: true, marks };
+    }
+    return null;
+  }
 
-    const payload = await response.json().catch(() => null) as Record<string, unknown> | null;
+  private async performMarkMutationWithRetry(args: {
+    path: 'accept' | 'reject';
+    markId: string;
+    by: string;
+    options?: { token?: string };
+  }): Promise<ShareMarkMutationResponse | ShareRequestError | null> {
+    const submit = async (base: ShareMutationBase): Promise<ShareMarkMutationResponse | ShareRequestError> => {
+      const response = await fetch(`${this.getApiBase()}/agent/${encodeURIComponent(this.slug as string)}/marks/${args.path}`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...this.getShareAuthHeaders(args.options?.token),
+        },
+        body: JSON.stringify({ markId: args.markId, by: args.by, ...base }),
+      });
+      if (!response.ok) return this.parseRequestError(response);
+      const payload = await response.json().catch(() => null) as Record<string, unknown> | null;
+      return this.parseShareMarkMutationResponse(payload);
+    };
+
+    const base = await this.getMutationBase(args.options);
+    if ('error' in base) return base;
+
+    const firstResult = await submit(base);
+    if (!('error' in firstResult) || !this.shouldRetryTransientMarkMutation(firstResult)) {
+      return firstResult;
+    }
+
+    const finalStatus = args.path === 'accept' ? 'accepted' : 'rejected';
+    const recovered = this.resolveRecoveredMarkMutation(await this.fetchOpenContext(args.options), args.markId, finalStatus);
+    if (recovered) return recovered;
+
+    await sleep(MUTATION_BASE_STATE_RETRY_DELAY_MS);
+    const retryBase = await this.getMutationBase(args.options);
+    if ('error' in retryBase) return retryBase;
+
+    const retryResult = await submit(retryBase);
+    if (!('error' in retryResult)) return retryResult;
+
+    return this.resolveRecoveredMarkMutation(await this.fetchOpenContext(args.options), args.markId, finalStatus)
+      ?? retryResult;
+  }
+
+  private extractMutationBase(payload: Record<string, unknown> | null): ShareMutationBase | null {
+    const mutationBase = payload?.mutationBase;
+    if (mutationBase && typeof mutationBase === 'object' && !Array.isArray(mutationBase)) {
+      const token = typeof (mutationBase as { token?: unknown }).token === 'string'
+        ? (mutationBase as { token: string }).token.trim()
+        : '';
+      if (token) {
+        return { baseToken: token };
+      }
+    }
     const revision = Number.isInteger(payload?.revision) ? Number(payload?.revision) : null;
     if (revision !== null && revision > 0) {
       return { baseRevision: revision };
@@ -271,6 +386,28 @@ export class ShareClient {
       : null;
     if (updatedAt) {
       return { baseUpdatedAt: updatedAt };
+    }
+    return null;
+  }
+
+  private async getMutationBase(options?: { token?: string }): Promise<ShareMutationBase | ShareRequestError> {
+    if (!this.slug) {
+      return this.createLocalRequestError(400, 'missing_slug', 'Share slug is not available');
+    }
+
+    for (let attempt = 0; attempt < MUTATION_BASE_STATE_RETRY_ATTEMPTS; attempt += 1) {
+      const response = await fetch(`${this.getApiBase()}/agent/${encodeURIComponent(this.slug)}/state`, {
+        method: 'GET',
+        headers: this.getShareAuthHeaders(options?.token),
+      });
+      if (!response.ok) return this.parseRequestError(response);
+
+      const payload = await response.json().catch(() => null) as Record<string, unknown> | null;
+      const base = this.extractMutationBase(payload);
+      if (base) return base;
+      if (attempt < (MUTATION_BASE_STATE_RETRY_ATTEMPTS - 1)) {
+        await sleep(MUTATION_BASE_STATE_RETRY_DELAY_MS);
+      }
     }
     return this.createLocalRequestError(409, 'missing_mutation_base', 'Could not determine current mutation base');
   }
@@ -589,25 +726,12 @@ export class ShareClient {
     const trimmedMarkId = typeof markId === 'string' ? markId.trim() : '';
     const actor = typeof by === 'string' ? by.trim() : '';
     if (!trimmedMarkId || !actor) return null;
-    const base = await this.getMutationBase(options);
-    if ('error' in base) return base;
-
-    const response = await fetch(`${this.getApiBase()}/agent/${encodeURIComponent(this.slug)}/marks/reject`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...this.getShareAuthHeaders(options?.token),
-      },
-      body: JSON.stringify({ markId: trimmedMarkId, by: actor, ...base }),
+    return this.performMarkMutationWithRetry({
+      path: 'reject',
+      markId: trimmedMarkId,
+      by: actor,
+      options,
     });
-    if (!response.ok) return this.parseRequestError(response);
-    const payload = await response.json().catch(() => null) as Record<string, unknown> | null;
-    return {
-      success: payload?.success === true,
-      marks: (payload?.marks && typeof payload.marks === 'object' && !Array.isArray(payload.marks))
-        ? payload.marks as Record<string, unknown>
-        : undefined,
-    };
   }
 
   async acceptSuggestion(
@@ -619,25 +743,12 @@ export class ShareClient {
     const trimmedMarkId = typeof markId === 'string' ? markId.trim() : '';
     const actor = typeof by === 'string' ? by.trim() : '';
     if (!trimmedMarkId || !actor) return null;
-    const base = await this.getMutationBase(options);
-    if ('error' in base) return base;
-
-    const response = await fetch(`${this.getApiBase()}/agent/${encodeURIComponent(this.slug)}/marks/accept`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...this.getShareAuthHeaders(options?.token),
-      },
-      body: JSON.stringify({ markId: trimmedMarkId, by: actor, ...base }),
+    return this.performMarkMutationWithRetry({
+      path: 'accept',
+      markId: trimmedMarkId,
+      by: actor,
+      options,
     });
-    if (!response.ok) return this.parseRequestError(response);
-    const payload = await response.json().catch(() => null) as Record<string, unknown> | null;
-    return {
-      success: payload?.success === true,
-      marks: (payload?.marks && typeof payload.marks === 'object' && !Array.isArray(payload.marks))
-        ? payload.marks as Record<string, unknown>
-        : undefined,
-    };
   }
 
   async disconnectAgentPresence(

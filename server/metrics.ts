@@ -516,6 +516,63 @@ export function recordRewriteBarrierLatency(route: string, durationMs: number): 
   }, durationMs);
 }
 
+export function recordCollabAdmissionGuard(
+  _event: 'trip' | 'block',
+  _reason: string,
+  _surface: string,
+): void {
+}
+
+export function recordCollabPathologyQuarantine(_reason: string, _surface: string): void {
+}
+
+export function recordPersistedYjsUpdateBytes(
+  _bytes: number,
+  _source: string,
+  _outcome: 'accepted' | 'rejected' | 'quarantined',
+  _reason?: string,
+): void {
+}
+
+export function recordLegacyReseedAttempt(
+  _result: 'seeded' | 'blocked' | 'quarantined',
+  _source: string,
+): void {
+}
+
+export function recordLegacyReverseFlowBlocked(
+  _source: string,
+  _liveState: 'live_doc' | 'loaded_doc',
+): void {
+}
+
+export function recordFragmentCacheMismatch(_source: string): void {
+}
+
+export function recordSuspiciousDocBlocked(
+  _path: 'legacy_reseed' | 'pending_delta_clear',
+  _reason: string,
+): void {
+}
+
+export function recordEditAnchorAmbiguous(_route: string, _mode: string): void {
+}
+
+export function recordEditAnchorNotFound(_route: string, _mode: string): void {
+}
+
+export function recordEditStructuralCleanupApplied(_route: string): void {
+}
+
+export function recordEditAuthoredSpanRemap(_route: string, _mode: string): void {
+}
+
+export function recordCollabRouteLatency(_route: string, _result: string, _durationMs: number): void {
+}
+
+export function recordCollabSessionBuildLatency(_result: string, _role: string, _durationMs: number): void {
+}
+
 export function recordMarkAnchorResolution(result: 'success' | 'failure', source: string): void {
   markAnchorResolutionCounter.inc({
     result,

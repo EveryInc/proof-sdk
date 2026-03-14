@@ -146,6 +146,7 @@ import { initThemePicker, getThemePicker } from '../ui/theme-picker';
 import { fileClient } from '../bridge/file-client';
 import { shareClient, type CollabSessionInfo, type SharePendingEvent } from '../bridge/share-client';
 import { collabClient, type CollabSyncStatus } from '../bridge/collab-client';
+import { shouldDeferShareMarksRefresh } from './share-marks-refresh';
 import { collabCursorBuilder, collabSelectionBuilder } from './plugins/collab-cursors';
 import { isAgentScopedId } from '../shared/agent-identity';
 import {
@@ -1073,6 +1074,8 @@ class ProofEditorImpl implements ProofEditor {
   private shareEventCursor: number = 0;
   private shareLastForcedCollabEventId: number = 0;
   private shareDocumentUpdatedTimer: ReturnType<typeof setTimeout> | null = null;
+  private shareMarksRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+  private pendingShareMarksRefresh: boolean = false;
   private pendingCommentDraftRestoreTimer: ReturnType<typeof setTimeout> | null = null;
   private pendingCommentDraftSnapshot: CommentPopoverDraftSnapshot | null = null;
   private shareAgentPresenceSummary: string = '';
@@ -1673,6 +1676,11 @@ class ProofEditorImpl implements ProofEditor {
       clearTimeout(this.shareDocumentUpdatedTimer);
       this.shareDocumentUpdatedTimer = null;
     }
+    if (this.shareMarksRefreshTimer) {
+      clearTimeout(this.shareMarksRefreshTimer);
+      this.shareMarksRefreshTimer = null;
+    }
+    this.pendingShareMarksRefresh = false;
     this.clearPendingCommentDraftRestore();
     if (this.shareWsUnsubscribe) {
       this.shareWsUnsubscribe();
@@ -2576,7 +2584,16 @@ class ProofEditorImpl implements ProofEditor {
       && this.collabIsSynced;
   }
 
+  private isMarksPendingShareEvent(event: SharePendingEvent): boolean {
+    return event.type.startsWith('comment.')
+      || event.type.startsWith('suggestion.');
+  }
+
   private handlePendingShareEvent(event: SharePendingEvent): void {
+    if (this.isMarksPendingShareEvent(event)) {
+      this.scheduleShareMarksRefresh();
+      return;
+    }
     if (!this.shouldForceCollabRefreshFromPendingEvent(event)) return;
     if (event.id <= this.shareLastForcedCollabEventId) return;
     this.shareLastForcedCollabEventId = event.id;
@@ -2649,6 +2666,43 @@ class ProofEditorImpl implements ProofEditor {
         })
         .catch(() => {
           // best-effort refresh
+        });
+    }, this.shareDocumentUpdatedDebounceMs);
+  }
+
+  private scheduleShareMarksRefresh(): void {
+    this.pendingShareMarksRefresh = true;
+    if (this.shareMarksRefreshTimer) {
+      clearTimeout(this.shareMarksRefreshTimer);
+      this.shareMarksRefreshTimer = null;
+    }
+    this.shareMarksRefreshTimer = setTimeout(() => {
+      this.shareMarksRefreshTimer = null;
+      if (!this.pendingShareMarksRefresh) return;
+      if (!this.isShareMode || !this.collabEnabled) {
+        this.pendingShareMarksRefresh = false;
+        return;
+      }
+      if (shouldDeferShareMarksRefresh({
+        collabCanEdit: this.collabCanEdit,
+        collabUnsyncedChanges: this.collabUnsyncedChanges,
+        collabPendingLocalUpdates: this.collabPendingLocalUpdates,
+      })) {
+        this.scheduleShareMarksRefresh();
+        return;
+      }
+      this.pendingShareMarksRefresh = false;
+      void shareClient.fetchOpenContext()
+        .then((context) => {
+          if (!context || this.isShareRequestError(context) || !('doc' in context)) return;
+          const serverMarks = (context.doc?.marks && typeof context.doc.marks === 'object' && !Array.isArray(context.doc.marks))
+            ? context.doc.marks as Record<string, StoredMark>
+            : null;
+          if (!serverMarks) return;
+          this.applyAuthoritativeShareMarks(serverMarks);
+        })
+        .catch(() => {
+          // best-effort refresh for server-originated mark updates
         });
     }, this.shareDocumentUpdatedDebounceMs);
   }
@@ -4589,6 +4643,11 @@ class ProofEditorImpl implements ProofEditor {
       clearTimeout(this.shareDocumentUpdatedTimer);
       this.shareDocumentUpdatedTimer = null;
     }
+    if (this.shareMarksRefreshTimer) {
+      clearTimeout(this.shareMarksRefreshTimer);
+      this.shareMarksRefreshTimer = null;
+    }
+    this.pendingShareMarksRefresh = false;
     const existing = document.getElementById('share-banner');
     if (!existing) return;
     existing.remove();

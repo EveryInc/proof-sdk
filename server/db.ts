@@ -19,6 +19,7 @@ let db: Database.Database;
 const DEFAULT_EVENT_PAGE_SIZE = 100;
 const DB_METADATA_TABLE = 'system_metadata';
 const DB_ENV_METADATA_KEY = 'db_environment';
+const GLOBAL_COLLAB_ADMISSION_GUARD_METADATA_KEY = 'collab.global_admission_guard';
 const MUTATION_IDEMPOTENCY_TABLE = 'mutation_idempotency';
 const MUTATION_OUTBOX_TABLE = 'mutation_outbox';
 const MARK_TOMBSTONES_TABLE = 'mark_tombstones';
@@ -38,6 +39,38 @@ let lastActiveCollabConnectionPruneAt = 0;
 const DEFAULT_ACTIVE_COLLAB_CONNECTION_TTL_MS = 45_000;
 const DEFAULT_ACTIVE_COLLAB_CONNECTION_PRUNE_INTERVAL_MS = 10_000;
 const DEFAULT_DOCUMENT_LIVE_COLLAB_LEASE_TTL_MS = 45_000;
+const DEFAULT_MAX_YJS_UPDATE_BLOB_BYTES = 8 * 1024 * 1024;
+
+export class OversizedYjsUpdateError extends Error {
+  readonly slug: string;
+  readonly bytes: number;
+  readonly limitBytes: number;
+  readonly sourceActor: string | null;
+
+  constructor(slug: string, bytes: number, limitBytes: number, sourceActor: string | null) {
+    super(`Oversized Yjs update blocked for ${slug}: ${bytes} bytes exceeds ${limitBytes} byte limit`);
+    this.name = 'OversizedYjsUpdateError';
+    this.slug = slug;
+    this.bytes = bytes;
+    this.limitBytes = limitBytes;
+    this.sourceActor = sourceActor;
+  }
+}
+
+function getMaxYjsUpdateBlobBytes(): number {
+  return parsePositiveInt(process.env.COLLAB_MAX_UPDATE_BLOB_BYTES, DEFAULT_MAX_YJS_UPDATE_BLOB_BYTES);
+}
+
+function assertYjsUpdateWithinLimit(
+  documentSlug: string,
+  update: Uint8Array,
+  sourceActor: string | null | undefined,
+): void {
+  const bytes = update.byteLength;
+  const limitBytes = getMaxYjsUpdateBlobBytes();
+  if (bytes <= limitBytes) return;
+  throw new OversizedYjsUpdateError(documentSlug, bytes, limitBytes, sourceActor ?? null);
+}
 
 function normalizeEnvironment(value: string | null | undefined): string {
   const normalized = (value ?? '').trim().toLowerCase();
@@ -215,11 +248,13 @@ export interface DocumentProjectionRow {
   plain_text: string;
   updated_at: string;
   health: 'healthy' | 'projection_stale' | 'quarantined';
+  health_reason: string | null;
 }
 
 export interface ProjectedDocumentRow extends DocumentRow {
   plain_text: string;
   projection_health: 'healthy' | 'projection_stale' | 'quarantined';
+  projection_health_reason: string | null;
   projection_revision: number | null;
   projection_y_state_version: number | null;
   projection_updated_at: string | null;
@@ -256,6 +291,47 @@ export interface DocumentAccessRow {
   secret_hash: string;
   created_at: string;
   revoked_at: string | null;
+}
+
+export interface PersistedGlobalCollabAdmissionGuardEntry {
+  reason: string;
+  untilMs: number;
+  triggeredAt: number;
+  lastTriggeredAt: number;
+  count: number;
+  details?: Record<string, unknown>;
+}
+
+function parsePersistedGlobalCollabAdmissionGuard(
+  raw: string | null,
+): PersistedGlobalCollabAdmissionGuardEntry | null {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+    if (typeof parsed.reason !== 'string' || parsed.reason.trim().length === 0) return null;
+    const untilMs = Number(parsed.untilMs);
+    const triggeredAt = Number(parsed.triggeredAt);
+    const lastTriggeredAt = Number(parsed.lastTriggeredAt);
+    const count = Number(parsed.count);
+    if (!Number.isFinite(untilMs) || untilMs <= 0) return null;
+    if (!Number.isFinite(triggeredAt) || triggeredAt <= 0) return null;
+    if (!Number.isFinite(lastTriggeredAt) || lastTriggeredAt <= 0) return null;
+    if (!Number.isFinite(count) || count <= 0) return null;
+    const details = parsed.details && typeof parsed.details === 'object' && !Array.isArray(parsed.details)
+      ? parsed.details as Record<string, unknown>
+      : undefined;
+    return {
+      reason: parsed.reason.trim(),
+      untilMs: Math.trunc(untilMs),
+      triggeredAt: Math.trunc(triggeredAt),
+      lastTriggeredAt: Math.trunc(lastTriggeredAt),
+      count: Math.trunc(count),
+      ...(details ? { details } : {}),
+    };
+  } catch {
+    return null;
+  }
 }
 
 export interface DocumentEventRow {
@@ -368,6 +444,41 @@ export function assertDatabaseEnvironmentSafeForRuntime(): void {
   assertDatabaseEnvironmentCompatibility('startup');
 }
 
+export function getPersistedGlobalCollabAdmissionGuard(): PersistedGlobalCollabAdmissionGuardEntry | null {
+  const d = getDb();
+  createMetadataTableIfNeeded(d);
+  return parsePersistedGlobalCollabAdmissionGuard(
+    readMetadataValue(d, GLOBAL_COLLAB_ADMISSION_GUARD_METADATA_KEY),
+  );
+}
+
+export function upsertPersistedGlobalCollabAdmissionGuard(
+  entry: PersistedGlobalCollabAdmissionGuardEntry,
+): PersistedGlobalCollabAdmissionGuardEntry {
+  assertWritesAllowed('upsertPersistedGlobalCollabAdmissionGuard');
+  const d = getDb();
+  createMetadataTableIfNeeded(d);
+  writeMetadataValue(d, GLOBAL_COLLAB_ADMISSION_GUARD_METADATA_KEY, JSON.stringify({
+    reason: entry.reason,
+    untilMs: Math.trunc(entry.untilMs),
+    triggeredAt: Math.trunc(entry.triggeredAt),
+    lastTriggeredAt: Math.trunc(entry.lastTriggeredAt),
+    count: Math.trunc(entry.count),
+    details: entry.details ?? {},
+  }));
+  return getPersistedGlobalCollabAdmissionGuard() as PersistedGlobalCollabAdmissionGuardEntry;
+}
+
+export function clearPersistedGlobalCollabAdmissionGuard(): void {
+  assertWritesAllowed('clearPersistedGlobalCollabAdmissionGuard');
+  const d = getDb();
+  createMetadataTableIfNeeded(d);
+  d.prepare(`
+    DELETE FROM ${DB_METADATA_TABLE}
+    WHERE key = ?
+  `).run(GLOBAL_COLLAB_ADMISSION_GUARD_METADATA_KEY);
+}
+
 function hashSecret(value: string): string {
   return createHash('sha256').update(value).digest('hex');
 }
@@ -407,6 +518,7 @@ function upsertDocumentProjectionRow(
   yStateVersion: number,
   updatedAt: string,
   health: DocumentProjectionRow['health'] = 'healthy',
+  healthReason: string | null = null,
 ): void {
   getDb().prepare(`
     INSERT INTO document_projections (
@@ -417,9 +529,10 @@ function upsertDocumentProjectionRow(
       marks_json,
       plain_text,
       updated_at,
-      health
+      health,
+      health_reason
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(document_slug) DO UPDATE SET
       revision = excluded.revision,
       y_state_version = excluded.y_state_version,
@@ -427,7 +540,8 @@ function upsertDocumentProjectionRow(
       marks_json = excluded.marks_json,
       plain_text = excluded.plain_text,
       updated_at = excluded.updated_at,
-      health = excluded.health
+      health = excluded.health,
+      health_reason = excluded.health_reason
   `).run(
     slug,
     revision,
@@ -437,7 +551,17 @@ function upsertDocumentProjectionRow(
     normalizeProjectionPlainText(markdown),
     updatedAt,
     health,
+    health === 'quarantined' ? healthReason : null,
   );
+}
+
+function addMissingDocumentProjectionColumns(): void {
+  const d = getDb();
+  const columns = d.prepare('PRAGMA table_info(document_projections)').all() as Array<{ name: string }>;
+  const names = new Set(columns.map((column) => column.name));
+  if (!names.has('health_reason')) {
+    d.exec('ALTER TABLE document_projections ADD COLUMN health_reason TEXT');
+  }
 }
 
 function backfillDocumentProjections(): void {
@@ -698,9 +822,11 @@ function initDatabase(): void {
       plain_text TEXT NOT NULL DEFAULT '',
       updated_at TEXT NOT NULL,
       health TEXT NOT NULL DEFAULT 'healthy',
+      health_reason TEXT,
       FOREIGN KEY (document_slug) REFERENCES documents(slug)
     )
   `);
+  addMissingDocumentProjectionColumns();
   d.exec('CREATE INDEX IF NOT EXISTS idx_document_projections_revision ON document_projections(document_slug, revision)');
   d.exec('CREATE INDEX IF NOT EXISTS idx_document_projections_health ON document_projections(health, updated_at)');
   backfillDocumentProjections();
@@ -1027,6 +1153,7 @@ export function getProjectedDocumentBySlug(slug: string): ProjectedDocumentRow |
       COALESCE(p.marks_json, d.marks) AS marks,
       COALESCE(p.plain_text, d.markdown) AS plain_text,
       COALESCE(p.health, 'projection_stale') AS projection_health,
+      p.health_reason AS projection_health_reason,
       p.revision AS projection_revision,
       p.y_state_version AS projection_y_state_version,
       p.updated_at AS projection_updated_at
@@ -1041,14 +1168,18 @@ export function getProjectedDocumentBySlug(slug: string): ProjectedDocumentRow |
 export function setDocumentProjectionHealth(
   slug: string,
   health: DocumentProjectionRow['health'],
+  reason: string | null = null,
 ): boolean {
   assertWritesAllowed('setDocumentProjectionHealth');
+  const nextReason = health === 'quarantined'
+    ? (reason ?? getDocumentProjectionBySlug(slug)?.health_reason ?? null)
+    : null;
 
   const result = getDb().prepare(`
     UPDATE document_projections
-    SET health = ?
+    SET health = ?, health_reason = ?
     WHERE document_slug = ?
-  `).run(health, slug);
+  `).run(health, nextReason, slug);
 
   if (result.changes > 0) return true;
 
@@ -1062,6 +1193,7 @@ export function setDocumentProjectionHealth(
     row.y_state_version,
     row.updated_at,
     health,
+    nextReason,
   );
   return true;
 }
@@ -1338,6 +1470,105 @@ export function updateDocumentAtomic(
   return result.changes > 0;
 }
 
+export async function rebuildDocumentBlocks(
+  document: DocumentRow,
+  markdown: string,
+  revision: number,
+): Promise<DocumentBlockRow[]> {
+  assertWritesAllowed('rebuildDocumentBlocks');
+  if (!document.doc_id) {
+    throw new Error('Document is missing doc_id; cannot rebuild block index.');
+  }
+
+  const documentId = document.doc_id;
+  const oldBlocks = listLiveDocumentBlocks(documentId);
+  const newBlocks = await buildBlockDescriptors(markdown);
+  const matches = matchBlocks(oldBlocks, newBlocks);
+
+  const nextBlocks = newBlocks.map((block, index) => {
+    const oldIndex = matches.get(index);
+    const existing = oldIndex !== undefined ? oldBlocks[oldIndex] : null;
+    return {
+      document_id: documentId,
+      block_id: existing?.block_id ?? randomUUID(),
+      ordinal: block.ordinal,
+      node_type: block.node_type,
+      attrs_json: block.attrs_json,
+      markdown_hash: block.markdown_hash,
+      text_preview: block.text_preview,
+      created_revision: existing?.created_revision ?? revision,
+      last_seen_revision: revision,
+      retired_revision: null,
+    } satisfies DocumentBlockRow;
+  });
+
+  const oldBlockIds = new Set(oldBlocks.map((block) => block.block_id));
+  const usedOldIds = new Set<string>(nextBlocks.map((block) => block.block_id));
+  const retiredOld = oldBlocks.filter((block) => !usedOldIds.has(block.block_id));
+
+  const db = getDb();
+  const updateTemp = db.prepare(`
+    UPDATE document_blocks
+    SET ordinal = ?, node_type = ?, attrs_json = ?, markdown_hash = ?, text_preview = ?, last_seen_revision = ?, retired_revision = NULL
+    WHERE document_id = ? AND block_id = ?
+  `);
+  const updateOrdinal = db.prepare(`
+    UPDATE document_blocks
+    SET ordinal = ?
+    WHERE document_id = ? AND block_id = ?
+  `);
+  const retire = db.prepare(`
+    UPDATE document_blocks
+    SET retired_revision = ?
+    WHERE document_id = ? AND block_id = ? AND retired_revision IS NULL
+  `);
+  const insert = db.prepare(`
+    INSERT INTO document_blocks (
+      document_id, block_id, ordinal, node_type, attrs_json, markdown_hash, text_preview,
+      created_revision, last_seen_revision, retired_revision
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+  `);
+
+  const tx = db.transaction(() => {
+    for (const block of retiredOld) {
+      retire.run(revision, documentId, block.block_id);
+    }
+
+    for (let i = 0; i < nextBlocks.length; i += 1) {
+      const block = nextBlocks[i];
+      if (oldBlockIds.has(block.block_id)) {
+        updateTemp.run(-(i + 1), block.node_type, block.attrs_json, block.markdown_hash, block.text_preview, revision, documentId, block.block_id);
+      }
+    }
+
+    for (const block of nextBlocks) {
+      if (!oldBlockIds.has(block.block_id)) {
+        insert.run(
+          block.document_id,
+          block.block_id,
+          block.ordinal,
+          block.node_type,
+          block.attrs_json,
+          block.markdown_hash,
+          block.text_preview,
+          block.created_revision,
+          block.last_seen_revision,
+        );
+      }
+    }
+
+    for (const block of nextBlocks) {
+      if (oldBlockIds.has(block.block_id)) {
+        updateOrdinal.run(block.ordinal, documentId, block.block_id);
+      }
+    }
+  });
+
+  tx();
+  return listLiveDocumentBlocks(documentId);
+}
+
 export function updateDocumentAtomicByRevision(
   slug: string,
   expectedRevision: number,
@@ -1584,105 +1815,6 @@ export function listDocumentBlocks(documentId: string): DocumentBlockRow[] {
     WHERE document_id = ?
     ORDER BY ordinal ASC
   `).all(documentId) as DocumentBlockRow[];
-}
-
-export async function rebuildDocumentBlocks(
-  document: DocumentRow,
-  markdown: string,
-  revision: number,
-): Promise<DocumentBlockRow[]> {
-  assertWritesAllowed('rebuildDocumentBlocks');
-  if (!document.doc_id) {
-    throw new Error('Document is missing doc_id; cannot rebuild block index.');
-  }
-
-  const documentId = document.doc_id;
-  const oldBlocks = listLiveDocumentBlocks(documentId);
-  const newBlocks = await buildBlockDescriptors(markdown);
-  const matches = matchBlocks(oldBlocks, newBlocks);
-
-  const nextBlocks = newBlocks.map((block, index) => {
-    const oldIndex = matches.get(index);
-    const existing = oldIndex !== undefined ? oldBlocks[oldIndex] : null;
-    return {
-      document_id: documentId,
-      block_id: existing?.block_id ?? randomUUID(),
-      ordinal: block.ordinal,
-      node_type: block.node_type,
-      attrs_json: block.attrs_json,
-      markdown_hash: block.markdown_hash,
-      text_preview: block.text_preview,
-      created_revision: existing?.created_revision ?? revision,
-      last_seen_revision: revision,
-      retired_revision: null,
-    } satisfies DocumentBlockRow;
-  });
-
-  const oldBlockIds = new Set(oldBlocks.map((block) => block.block_id));
-  const usedOldIds = new Set<string>(nextBlocks.map((block) => block.block_id));
-  const retiredOld = oldBlocks.filter((block) => !usedOldIds.has(block.block_id));
-
-  const db = getDb();
-  const updateTemp = db.prepare(`
-    UPDATE document_blocks
-    SET ordinal = ?, node_type = ?, attrs_json = ?, markdown_hash = ?, text_preview = ?, last_seen_revision = ?, retired_revision = NULL
-    WHERE document_id = ? AND block_id = ?
-  `);
-  const updateOrdinal = db.prepare(`
-    UPDATE document_blocks
-    SET ordinal = ?
-    WHERE document_id = ? AND block_id = ?
-  `);
-  const retire = db.prepare(`
-    UPDATE document_blocks
-    SET retired_revision = ?
-    WHERE document_id = ? AND block_id = ? AND retired_revision IS NULL
-  `);
-  const insert = db.prepare(`
-    INSERT INTO document_blocks (
-      document_id, block_id, ordinal, node_type, attrs_json, markdown_hash, text_preview,
-      created_revision, last_seen_revision, retired_revision
-    )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
-  `);
-
-  const tx = db.transaction(() => {
-    for (const block of retiredOld) {
-      retire.run(revision, documentId, block.block_id);
-    }
-
-    for (let i = 0; i < nextBlocks.length; i += 1) {
-      const block = nextBlocks[i];
-      if (oldBlockIds.has(block.block_id)) {
-        updateTemp.run(-(i + 1), block.node_type, block.attrs_json, block.markdown_hash, block.text_preview, revision, documentId, block.block_id);
-      }
-    }
-
-    for (const block of nextBlocks) {
-      if (!oldBlockIds.has(block.block_id)) {
-        insert.run(
-          block.document_id,
-          block.block_id,
-          block.ordinal,
-          block.node_type,
-          block.attrs_json,
-          block.markdown_hash,
-          block.text_preview,
-          block.created_revision,
-          block.last_seen_revision,
-        );
-      }
-    }
-
-    for (const block of nextBlocks) {
-      if (oldBlockIds.has(block.block_id)) {
-        updateOrdinal.run(block.ordinal, documentId, block.block_id);
-      }
-    }
-  });
-
-  tx();
-  return listLiveDocumentBlocks(documentId);
 }
 
 function updateShareState(slug: string, state: ShareState): boolean {
@@ -2334,6 +2466,7 @@ export function backfillMutationOutboxBatch(limit: number = 500): {
 
 export function appendYUpdate(documentSlug: string, update: Uint8Array, sourceActor?: string): number {
   assertWritesAllowed('appendYUpdate');
+  assertYjsUpdateWithinLimit(documentSlug, update, sourceActor);
   const now = new Date().toISOString();
   const result = getDb().prepare(`
     INSERT INTO document_y_updates (document_slug, update_blob, source_actor, created_at)
@@ -2352,6 +2485,19 @@ export function getYUpdatesAfter(
     WHERE document_slug = ? AND seq > ?
     ORDER BY seq ASC
   `).all(documentSlug, afterSeq) as Array<{ seq: number; update_blob: Buffer }>;
+  return rows.map((row) => ({ seq: row.seq, update: new Uint8Array(row.update_blob) }));
+}
+
+export function getYUpdatesAtOrAfter(
+  documentSlug: string,
+  fromSeq: number,
+): Array<{ seq: number; update: Uint8Array }> {
+  const rows = getDb().prepare(`
+    SELECT seq, update_blob
+    FROM document_y_updates
+    WHERE document_slug = ? AND seq >= ?
+    ORDER BY seq ASC
+  `).all(documentSlug, fromSeq) as Array<{ seq: number; update_blob: Buffer }>;
   return rows.map((row) => ({ seq: row.seq, update: new Uint8Array(row.update_blob) }));
 }
 

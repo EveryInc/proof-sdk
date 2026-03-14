@@ -1,17 +1,58 @@
 import {
-  buildStrippedIndexMap,
+  applyPostMutationCleanup,
+  buildAnchorRetrySteps,
+  type AnchorMatchMode,
+  type AnchorResolveSuccess,
+  type AnchorTarget,
+  isAgentEditAnchorV2Enabled,
+  isAuthoredSpanRemapEnabled,
+  isFailClosedDuplicateHandlingEnabled,
+  isStructuralCleanupEnabled,
+  resolveAnchorTarget,
+} from './anchor-resolver.js';
+import {
   expandRangeToIncludeFullyWrappedAuthoredSpan,
   moveIndexPastTrailingAuthoredSpans,
 } from './proof-span-strip.js';
 
+export type AgentEditTarget = AnchorTarget;
+
 export type AgentEditOperation =
   | { op: 'append'; section: string; content: string }
-  | { op: 'replace'; search: string; content: string }
-  | { op: 'insert'; after: string; content: string };
+  | { op: 'replace'; search?: string; target?: AgentEditTarget; content: string }
+  | { op: 'insert'; after?: string; target?: AgentEditTarget; content: string };
+
+export type AgentEditOperationMetadata = {
+  opIndex: number;
+  selectedIndex: number;
+  candidateCount: number;
+  mode: AnchorMatchMode;
+  remapUsed: boolean;
+};
 
 export type AgentEditApplyResult =
-  | { ok: true; markdown: string }
-  | { ok: false; code: 'ANCHOR_NOT_FOUND'; message: string; opIndex: number };
+  | {
+    ok: true;
+    markdown: string;
+    metadata: AgentEditOperationMetadata[];
+    structuralCleanupApplied: boolean;
+    authoredWrapperCleanupApplied: boolean;
+  }
+  | {
+    ok: false;
+    code: 'ANCHOR_NOT_FOUND' | 'ANCHOR_AMBIGUOUS';
+    message: string;
+    opIndex: number;
+    details: {
+      candidateCount: number;
+      mode: AnchorMatchMode;
+      remapUsed: boolean;
+      selectedIndex: number | null;
+    };
+    nextSteps: string[];
+  };
+
+type AgentEditApplyFailure = Extract<AgentEditApplyResult, { ok: false }>;
 
 function normalizeNewlines(input: string): string {
   return input.replace(/\r\n/g, '\n');
@@ -35,7 +76,7 @@ function contentLooksInline(content: string): boolean {
   const normalized = normalizeNewlines(content).trim();
   if (!normalized) return false;
   if (normalized.includes('```') || normalized.includes('~~~')) return false;
-  if (/\n\s*\n/.test(normalized)) return false; // blank line => multi-paragraph / blocky
+  if (/\n\s*\n/.test(normalized)) return false;
   if (/^\s*#{1,6}\s+/.test(normalized)) return false;
   if (/^\s*[-*+]\s+/.test(normalized)) return false;
   if (/^\s*\d+\.\s+/.test(normalized)) return false;
@@ -44,8 +85,6 @@ function contentLooksInline(content: string): boolean {
 }
 
 function looksLikeInlineMarkdownFormatting(content: string): boolean {
-  // Keep authored HTML wrappers away from inline markdown tokens so we don't
-  // interfere with markdown parser round-tripping.
   if (/(^|[^\\])`[^`\n]+`/.test(content)) return true;
   if (/(^|[^\\])\*\*[^*\n]+?\*\*/.test(content)) return true;
   if (/(^|[^\\])\*[^*\n]+?\*(?!\*)/.test(content)) return true;
@@ -60,14 +99,13 @@ function maybeWrapAuthored(content: string, by: string | undefined, allow: boole
   if (/data-proof\s*=\s*("|')authored(")?/i.test(normalized)) return content;
   if (!contentLooksInline(normalized)) return content;
   if (looksLikeInlineMarkdownFormatting(normalized)) return content;
-  // Keep as a single inline HTML wrapper so remarkProofMarks can parse it into a proofAuthored mark.
   return `<span data-proof="authored" data-by="${by.trim()}">${normalized}</span>`;
 }
 
 function computeLineOffsets(src: string): number[] {
   const offsets: number[] = [0];
-  for (let i = 0; i < src.length; i++) {
-    if (src.charCodeAt(i) === 10 /* \n */) offsets.push(i + 1);
+  for (let i = 0; i < src.length; i += 1) {
+    if (src.charCodeAt(i) === 10) offsets.push(i + 1);
   }
   return offsets;
 }
@@ -75,8 +113,6 @@ function computeLineOffsets(src: string): number[] {
 function normalizeHeadingLabel(value: string): string {
   const collapsed = normalizeNewlines(value).replace(/\s+/g, ' ').trim().toLowerCase();
   if (!collapsed) return '';
-  // Allow section matching to ignore leading ordinal prefixes like:
-  // "4. Title", "4) Title", or "4.1 Title".
   return collapsed.replace(/^\d+(?:\.\d+)*[.)]?\s+/, '');
 }
 
@@ -85,13 +121,11 @@ function findSectionBoundaryIndex(lines: string[], offsets: number[], headingLin
   const m = line.match(/^(#{1,6})\s+/);
   if (!m) return offsets[headingLineIndex] ?? 0;
   const level = m[1].length;
-  for (let j = headingLineIndex + 1; j < lines.length; j++) {
+  for (let j = headingLineIndex + 1; j < lines.length; j += 1) {
     const m2 = lines[j].match(/^(#{1,6})\s+/);
     if (!m2) continue;
     const nextLevel = m2[1].length;
-    if (nextLevel <= level) {
-      return offsets[j] ?? 0;
-    }
+    if (nextLevel <= level) return offsets[j] ?? 0;
   }
   const lastOffset = offsets[offsets.length - 1];
   return typeof lastOffset === 'number' ? lastOffset + (lines[lines.length - 1] ?? '').length : 0;
@@ -106,14 +140,12 @@ function findHeadingAppendIndex(src: string, section: string): number | null {
 
   let fallbackHeadingLineIndex: number | null = null;
   const normalizedNeedle = normalizeHeadingLabel(needle);
-  for (let i = 0; i < lines.length; i++) {
+  for (let i = 0; i < lines.length; i += 1) {
     const line = lines[i];
     const m = line.match(/^(#{1,6})\s+(.*?)(\s+#*\s*)?$/);
     if (!m) continue;
     const title = (m[2] || '').trim();
-    if (title === needle) {
-      return findSectionBoundaryIndex(lines, offsets, i);
-    }
+    if (title === needle) return findSectionBoundaryIndex(lines, offsets, i);
     if (fallbackHeadingLineIndex === null && normalizedNeedle && normalizeHeadingLabel(title) === normalizedNeedle) {
       fallbackHeadingLineIndex = i;
     }
@@ -131,66 +163,84 @@ function spliceAt(src: string, index: number, insert: string): string {
 }
 
 function ensureLeadingBreak(insert: string, beforeChar: string | null): string {
-  if (!insert) return insert;
-  if (!beforeChar) return insert;
-  if (beforeChar === '\n') return insert;
+  if (!insert || !beforeChar || beforeChar === '\n') return insert;
   return `\n${insert}`;
 }
 
 function ensureTrailingBreak(insert: string, afterChar: string | null): string {
-  if (!insert) return insert;
-  if (!afterChar) return insert;
-  if (afterChar === '\n') return insert;
+  if (!insert || !afterChar || afterChar === '\n') return insert;
   return `${insert}\n`;
 }
 
-function resolveReplaceRange(
-  markdown: string,
-  search: string,
-): { start: number; end: number } | null {
-  if (!search) return null;
-
-  const directIdx = markdown.indexOf(search);
-  if (directIdx >= 0) {
-    return expandRangeToIncludeFullyWrappedAuthoredSpan(markdown, directIdx, directIdx + search.length);
-  }
-
-  const { stripped, map } = buildStrippedIndexMap(markdown);
-  const strippedIdx = stripped.indexOf(search);
-  if (strippedIdx < 0) return null;
-
-  const origStart = map[strippedIdx] ?? -1;
-  const origEnd = map[strippedIdx + search.length - 1];
-  if (origStart < 0 || origEnd === undefined) return null;
-  return expandRangeToIncludeFullyWrappedAuthoredSpan(markdown, origStart, origEnd + 1);
+function buildImplicitLegacyTarget(
+  anchor: string,
+  anchorV2Enabled: boolean,
+): AgentEditTarget {
+  return {
+    anchor,
+    mode: anchorV2Enabled ? 'normalized' : 'exact',
+    occurrence: 'first',
+  };
 }
 
-function resolveInsertAfterIndex(markdown: string, after: string): number {
-  if (!after) return -1;
+function resolveTextAnchor(
+  source: string,
+  opIndex: number,
+  target: AgentEditTarget,
+  options: {
+    anchorV2Enabled: boolean;
+    failClosedDuplicates: boolean;
+    authoredSpanRemapEnabled: boolean;
+  },
+): AnchorResolveSuccess | AgentEditApplyFailure {
+  const resolved = resolveAnchorTarget(source, target, {
+    defaultMode: target.mode,
+    failClosedDuplicates: options.anchorV2Enabled ? options.failClosedDuplicates : false,
+    stripAuthoredSpans: options.anchorV2Enabled ? options.authoredSpanRemapEnabled : false,
+  });
 
-  const directIdx = markdown.indexOf(after);
-  if (directIdx >= 0) {
-    return moveIndexPastTrailingAuthoredSpans(markdown, directIdx + after.length);
+  if (!resolved.ok) {
+    return {
+      ok: false,
+      code: resolved.code,
+      message: resolved.message,
+      opIndex,
+      details: {
+        candidateCount: resolved.candidateCount,
+        mode: resolved.mode,
+        remapUsed: resolved.remapUsed,
+        selectedIndex: null,
+      },
+      nextSteps: buildAnchorRetrySteps(resolved.code),
+    };
   }
 
-  const { stripped, map } = buildStrippedIndexMap(markdown);
-  const strippedIdx = stripped.indexOf(after);
-  if (strippedIdx < 0) return -1;
-
-  const origEnd = map[strippedIdx + after.length - 1];
-  if (origEnd === undefined) return -1;
-  return moveIndexPastTrailingAuthoredSpans(markdown, origEnd + 1);
+  return resolved;
 }
 
 export function applyAgentEditOperations(
   markdown: string,
   operations: AgentEditOperation[],
-  options?: { by?: string },
+  options?: {
+    by?: string;
+    anchorV2Enabled?: boolean;
+    failClosedDuplicates?: boolean;
+    structuralCleanupEnabled?: boolean;
+    authoredSpanRemapEnabled?: boolean;
+  },
 ): AgentEditApplyResult {
   let src = normalizeNewlines(markdown ?? '');
   const by = options?.by;
 
-  for (let opIndex = 0; opIndex < operations.length; opIndex++) {
+  const anchorV2Enabled = options?.anchorV2Enabled ?? isAgentEditAnchorV2Enabled();
+  const failClosedDuplicates = options?.failClosedDuplicates ?? isFailClosedDuplicateHandlingEnabled();
+  const structuralCleanupEnabled = options?.structuralCleanupEnabled ?? isStructuralCleanupEnabled();
+  const authoredSpanRemapEnabled = options?.authoredSpanRemapEnabled ?? isAuthoredSpanRemapEnabled();
+
+  const metadata: AgentEditOperationMetadata[] = [];
+  const structuralCleanupOffsets: number[] = [];
+
+  for (let opIndex = 0; opIndex < operations.length; opIndex += 1) {
     const operation = operations[opIndex];
     if (operation.op === 'append') {
       const idx = findHeadingAppendIndex(src, operation.section);
@@ -202,44 +252,56 @@ export function applyAgentEditOperations(
       }
       const allowWrap = !isWithinFencedCodeBlock(src, idx);
       const content = maybeWrapAuthored(operation.content ?? '', by, allowWrap);
-      const insertion = `\n\n${content.trim()}\n`;
-      src = spliceAt(src, idx, insertion);
+      src = spliceAt(src, idx, `\n\n${content.trim()}\n`);
       continue;
     }
 
     if (operation.op === 'replace') {
-      const search = operation.search ?? '';
-      const range = resolveReplaceRange(src, search);
-      if (!range) {
-        return {
-          ok: false,
-          code: 'ANCHOR_NOT_FOUND',
-          message: `replace anchor not found: ${JSON.stringify(search)}`,
-          opIndex,
-        };
-      }
-      const allowWrap = !isWithinFencedCodeBlock(src, range.start);
+      const anchor = operation.target
+        ?? buildImplicitLegacyTarget(operation.search ?? '', anchorV2Enabled);
+      const resolved = resolveTextAnchor(src, opIndex, anchor, {
+        anchorV2Enabled,
+        failClosedDuplicates,
+        authoredSpanRemapEnabled,
+      });
+      if (!resolved.ok) return resolved;
+
+      const rawRangeStart = Math.min(resolved.selection.sourceStart, resolved.selection.sourceEnd);
+      const rawRangeEnd = Math.max(resolved.selection.sourceStart, resolved.selection.sourceEnd);
+      const expandedRange = expandRangeToIncludeFullyWrappedAuthoredSpan(src, rawRangeStart, rawRangeEnd);
+      const rangeStart = expandedRange.start;
+      const rangeEnd = expandedRange.end;
+      const allowWrap = !isWithinFencedCodeBlock(src, rangeStart);
       const content = maybeWrapAuthored(operation.content ?? '', by, allowWrap);
-      src = `${src.slice(0, range.start)}${content}${src.slice(range.end)}`;
+      src = `${src.slice(0, rangeStart)}${content}${src.slice(rangeEnd)}`;
+      if (operation.content === '') {
+        structuralCleanupOffsets.push(Math.min(rangeStart, src.length));
+      }
+      metadata.push({
+        opIndex,
+        selectedIndex: resolved.selectedIndex,
+        candidateCount: resolved.candidateCount,
+        mode: resolved.mode,
+        remapUsed: resolved.remapUsed,
+      });
       continue;
     }
 
     if (operation.op === 'insert') {
-      const after = operation.after ?? '';
-      const insertAt = resolveInsertAfterIndex(src, after);
+      const anchor = operation.target
+        ?? buildImplicitLegacyTarget(operation.after ?? '', anchorV2Enabled);
+      const resolved = resolveTextAnchor(src, opIndex, anchor, {
+        anchorV2Enabled,
+        failClosedDuplicates,
+        authoredSpanRemapEnabled,
+      });
+      if (!resolved.ok) return resolved;
 
-      if (insertAt < 0) {
-        return {
-          ok: false,
-          code: 'ANCHOR_NOT_FOUND',
-          message: `insert anchor not found: ${JSON.stringify(after)}`,
-          opIndex,
-        };
-      }
+      const resolvedInsertAt = Math.max(resolved.selection.sourceStart, resolved.selection.sourceEnd);
+      const insertAt = moveIndexPastTrailingAuthoredSpans(src, resolvedInsertAt);
       const allowWrap = !isWithinFencedCodeBlock(src, insertAt);
       const content = maybeWrapAuthored(operation.content ?? '', by, allowWrap);
 
-      // Heuristic: if inserting after a heading line, insert on the next line with spacing.
       const beforeChar = insertAt > 0 ? src[insertAt - 1] : null;
       const afterChar = insertAt < src.length ? src[insertAt] : null;
       let insertion = content;
@@ -251,9 +313,25 @@ export function applyAgentEditOperations(
       }
 
       src = spliceAt(src, insertAt, insertion);
-      continue;
+      metadata.push({
+        opIndex,
+        selectedIndex: resolved.selectedIndex,
+        candidateCount: resolved.candidateCount,
+        mode: resolved.mode,
+        remapUsed: resolved.remapUsed,
+      });
     }
   }
 
-  return { ok: true, markdown: src };
+  const cleanup = applyPostMutationCleanup(src, {
+    structuralCleanupEnabled,
+    structuralCleanupOffsets,
+  });
+  return {
+    ok: true,
+    markdown: cleanup.markdown,
+    metadata,
+    structuralCleanupApplied: cleanup.structuralCleanupApplied,
+    authoredWrapperCleanupApplied: cleanup.authoredWrapperCleanupApplied,
+  };
 }

@@ -3,6 +3,7 @@ import { HocuspocusProvider } from '@hocuspocus/provider';
 import type { Awareness } from 'y-protocols/awareness';
 import { shareClient, type CollabSessionInfo, type ShareRole } from './share-client';
 import { shouldPreserveMissingLocalMark } from './marks-preservation';
+import { recordClientIncidentEvent } from '../agent/client-incident-buffer';
 
 type PresenceHandler = (count: number) => void;
 type ConnectionStatus = 'connecting' | 'connected' | 'disconnected';
@@ -185,6 +186,7 @@ export class CollabClient {
   private connectionStatus: ConnectionStatus = 'disconnected';
   private unsyncedChanges = 0;
   private localUser: CollabLocalUser | null = null;
+  private pendingMarksSnapshot: Record<string, unknown> | null = null;
   private durableBufferKey: string | null = null;
   private durablePendingUpdates: string[] = [];
   private durablePendingSince: number | null = null;
@@ -495,6 +497,17 @@ export class CollabClient {
     return marks;
   }
 
+  private applyPendingMarksSnapshot(): void {
+    if (!this.pendingMarksSnapshot || !this.ydoc || !this.marksMap) return;
+    if (!this.sessionRole || !this.canPersistDurableUpdates(this.sessionRole)) {
+      this.pendingMarksSnapshot = null;
+      return;
+    }
+    const nextMarks = { ...this.pendingMarksSnapshot };
+    this.pendingMarksSnapshot = null;
+    this.setMarksMetadata(nextMarks);
+  }
+
   private getProviderParameters(session: CollabSessionInfo): Record<string, string> {
     return {
       token: session.token,
@@ -594,6 +607,19 @@ export class CollabClient {
           shareClient.reportCollabReconnect(durationMs, 'web');
         }
       }
+      recordClientIncidentEvent({
+        type: 'collab.status_changed',
+        level: event.status === 'disconnected' ? 'warn' : 'info',
+        message: `Collab status changed to ${event.status}`,
+        data: {
+          slug: session.slug,
+          role: session.role,
+          status: event.status,
+          hasSynced: this.hasSynced,
+          unsyncedChanges: this.unsyncedChanges,
+          pendingLocalUpdates: this.durablePendingUpdates.length,
+        },
+      });
       this.maybeClearDurableBuffer();
       this.emitSyncStatus();
     });
@@ -613,6 +639,16 @@ export class CollabClient {
       this.connectionStatus = 'disconnected';
       this.hasSynced = false;
       this.lastDisconnectAt = Date.now();
+      recordClientIncidentEvent({
+        type: 'collab.authentication_failed',
+        level: 'error',
+        message: `Collab authentication failed: ${reason}`,
+        data: {
+          slug: session.slug,
+          role: session.role,
+          reason,
+        },
+      });
       this.emitSyncStatus();
     });
 
@@ -643,6 +679,7 @@ export class CollabClient {
     this.ydoc = ydoc;
     this.markdownText = markdownText;
     this.marksMap = marksMap;
+    this.applyPendingMarksSnapshot();
     this.replayDurableUpdates(ydoc);
     this.emitSyncStatus();
 
@@ -683,7 +720,8 @@ export class CollabClient {
     this.debugLog('reconnect', { preserveLocalState, canPreserveLocalState, nextRole: session.role });
     const localState = canPreserveLocalState && this.ydoc ? Y.encodeStateAsUpdate(this.ydoc) : null;
     this.disconnect();
-    this.skipDurableReplayOnce = canPreserveLocalState;
+    const wantsDurableReplay = preserveLocalState && canPreserveLocalState && !localState;
+    this.skipDurableReplayOnce = !wantsDurableReplay;
     this.connect(session);
     if (localState && this.ydoc) {
       Y.applyUpdate(this.ydoc, localState, 'local-reconnect-bootstrap');
@@ -691,6 +729,14 @@ export class CollabClient {
   }
 
   setProjectionMarkdown(markdown: string): void {
+    if (this.activeSession) {
+      this.debugLog('skip-projection-write-live-session', {
+        markdownLength: markdown.length,
+        slug: this.activeSession.slug,
+        role: this.sessionRole,
+      });
+      return;
+    }
     if (!this.sessionRole || !this.canPersistDurableUpdates(this.sessionRole)) {
       this.debugLog('skip-projection-write-readonly', { markdownLength: markdown.length });
       return;
@@ -710,11 +756,14 @@ export class CollabClient {
   }
 
   setMarksMetadata(marks: Record<string, unknown>): void {
+    if (!this.ydoc || !this.marksMap) {
+      this.pendingMarksSnapshot = { ...marks };
+      return;
+    }
     if (!this.sessionRole || !this.canPersistDurableUpdates(this.sessionRole)) {
       this.debugLog('skip-marks-write-readonly', { markCount: Object.keys(marks).length });
       return;
     }
-    if (!this.ydoc || !this.marksMap) return;
     const currentMarksSnapshot = this.readMarks();
     const mergedMarks: Record<string, unknown> = { ...marks };
     this.marksMap.forEach((value, key) => {

@@ -5,14 +5,20 @@ import { prosemirrorToYXmlFragment, yXmlFragmentToProseMirrorRootNode } from 'y-
 import { type Node as ProseMirrorNode, type Schema } from '@milkdown/prose/model';
 import {
   appendYUpdate,
+  bumpDocumentAccessEpoch,
+  clearPersistedGlobalCollabAdmissionGuard,
   clearYjsState,
+  OversizedYjsUpdateError,
   getDocumentAuthStateBySlug,
   getDocumentBySlug,
+  getDocumentProjectionBySlug,
+  getPersistedGlobalCollabAdmissionGuard,
   getProjectedDocumentBySlug,
   getDb,
   getLatestYUpdate,
   getLatestYStateVersion,
   getLatestYSnapshot,
+  getYUpdatesAtOrAfter,
   getYUpdatesAfter,
   listDocsWithStaleProjection,
   listSuspiciousProjectionCandidates,
@@ -22,25 +28,35 @@ import {
   setDocumentProjectionHealth,
   removeActiveCollabConnection,
   upsertActiveCollabConnection,
+  upsertPersistedGlobalCollabAdmissionGuard,
   updateDocument,
   type DocumentProjectionRow,
   type DocumentRow,
   type ProjectedDocumentRow,
 } from './db.js';
 import {
+  recordCollabAdmissionGuard,
+  recordCollabPathologyQuarantine,
+  recordCollabSessionBuildLatency,
   recordCollabLogSuppressed,
   recordProjectionChars,
   recordProjectionDrift,
+  recordFragmentCacheMismatch,
   recordProjectionGuardBlock,
   recordProjectionLag,
   recordProjectionMarkedStale,
   recordProjectionRepair,
   recordProjectionReadFallback,
   recordProjectionWipe,
+  recordLegacyReverseFlowBlocked,
+  recordPersistedYjsUpdateBytes,
+  recordLegacyReseedAttempt,
+  recordSuspiciousDocBlocked,
 } from './metrics.js';
 import { canonicalizeStoredMarks, type StoredMark } from '../src/formats/marks.js';
 import { refreshSnapshotForSlug } from './snapshot.js';
 import { isShareRole, type ShareRole, type ShareState } from './share-types.js';
+import { getEffectiveShareStateForRole } from './share-access.js';
 import {
   getHeadlessMilkdownParser,
   parseMarkdownWithHtmlFallback,
@@ -48,6 +64,9 @@ import {
   summarizeParseError,
 } from './milkdown-headless.js';
 import { normalizeAgentScopedId } from '../src/shared/agent-identity.js';
+import { traceServerIncident, toErrorTraceData } from './incident-tracing.js';
+import { getActiveCollabClientBreakdown } from './ws.js';
+import { summarizeDocumentIntegrity } from './document-integrity.js';
 
 type HocuspocusInstance = {
   listen?: () => void | Promise<void>;
@@ -66,6 +85,9 @@ export interface CollabSessionInfo {
   syncProtocol: 'pm-yjs-v1';
   collabWsUrl: string;
   token: string;
+  // Monotonic persisted Yjs state version used by the client to decide whether a
+  // room is truly blank/seedable. This must advance for persisted updates even
+  // before a compaction snapshot exists.
   snapshotVersion: number;
   expiresAt: string;
 }
@@ -74,6 +96,248 @@ export interface CollabRuntime {
   enabled: boolean;
   wsUrlBase: string;
   reason?: string;
+}
+
+export const LIVE_COLLAB_BLOCKED_MESSAGE = 'This document is temporarily unavailable.';
+
+export type LiveCollabBlockCode =
+  | 'HOT_SLUG_QUARANTINED'
+  | 'COLLAB_ADMISSION_GUARDED'
+  | 'COLLAB_AUTO_QUARANTINED';
+
+export type LiveCollabBlockStatus = {
+  active: boolean;
+  code: LiveCollabBlockCode | null;
+  message: string | null;
+  reason: string | null;
+  untilMs: number | null;
+  retryAfterMs: number | null;
+  durable: boolean;
+};
+
+function getHotSlugDenylist(): Set<string> {
+  const raw = (process.env.PROOF_COLLAB_HOT_SLUG_DENYLIST || '').trim();
+  if (!raw) return new Set();
+  return new Set(
+    raw
+      .split(',')
+      .map((entry) => entry.trim())
+      .filter((entry) => entry.length > 0),
+  );
+}
+
+function isHotSlugQuarantined(slug: string): boolean {
+  if (!slug) return false;
+  return getHotSlugDenylist().has(slug);
+}
+
+function getAutoCollabQuarantineEntry(slug: string): AutoCollabQuarantineEntry | null {
+  if (!slug) return null;
+  const entry = autoCollabQuarantines.get(slug);
+  if (!entry) return null;
+  if (entry.untilMs > Date.now()) return entry;
+  autoCollabQuarantines.delete(slug);
+  return null;
+}
+
+function isAutoCollabQuarantined(slug: string): boolean {
+  return Boolean(getAutoCollabQuarantineEntry(slug));
+}
+
+function isDurablyCollabQuarantined(slug: string): boolean {
+  return isAutoCollabQuarantined(slug) || hasPersistedProjectionQuarantine(slug);
+}
+
+function isCollabQuarantined(slug: string): boolean {
+  return isHotSlugQuarantined(slug) || isDurablyCollabQuarantined(slug);
+}
+
+export function getAutoCollabQuarantineStatus(slug: string): {
+  active: boolean;
+  reason: string | null;
+  untilMs: number | null;
+  remainingMs: number | null;
+} {
+  const entry = getAutoCollabQuarantineEntry(slug);
+  if (!entry) {
+    return {
+      active: false,
+      reason: null,
+      untilMs: null,
+      remainingMs: null,
+    };
+  }
+  const now = Date.now();
+  return {
+    active: true,
+    reason: entry.reason,
+    untilMs: entry.untilMs,
+    remainingMs: Math.max(0, entry.untilMs - now),
+  };
+}
+
+function hasPersistedProjectionQuarantine(slug: string): boolean {
+  if (!slug) return false;
+  return getProjectedDocumentBySlug(slug)?.projection_health === 'quarantined';
+}
+
+function getPersistedProjectionQuarantineReason(slug: string): string | null {
+  if (!slug) return null;
+  return getProjectedDocumentBySlug(slug)?.projection_health_reason ?? null;
+}
+
+export function isIntegrityWarningQuarantineReason(reason: string | null | undefined): boolean {
+  return typeof reason === 'string' && reason.startsWith('integrity_warning_');
+}
+
+function getGlobalCollabAdmissionGuardEntry(): GlobalCollabAdmissionGuardEntry | null {
+  const now = Date.now();
+  if (globalCollabAdmissionGuard && globalCollabAdmissionGuard.untilMs > now) return globalCollabAdmissionGuard;
+  const persisted = getPersistedGlobalCollabAdmissionGuard();
+  if (persisted && persisted.untilMs > now) {
+    globalCollabAdmissionGuard = {
+      reason: persisted.reason,
+      untilMs: persisted.untilMs,
+      triggeredAt: persisted.triggeredAt,
+      lastTriggeredAt: persisted.lastTriggeredAt,
+      count: persisted.count,
+      ...(persisted.details ? { details: persisted.details } : {}),
+    };
+    return globalCollabAdmissionGuard;
+  }
+  globalCollabAdmissionGuard = null;
+  return null;
+}
+
+function countDurablyQuarantinedCollabDocuments(): number {
+  const now = Date.now();
+  for (const [slug, entry] of autoCollabQuarantines.entries()) {
+    if (entry.untilMs <= now) autoCollabQuarantines.delete(slug);
+  }
+  const row = getDb().prepare(`
+    SELECT COUNT(*) AS count
+    FROM document_projections
+    WHERE health = 'quarantined'
+      AND (health_reason IS NULL OR health_reason NOT LIKE 'integrity_warning_%')
+  `).get() as { count?: number | bigint | string } | undefined;
+  const value = row?.count;
+  if (typeof value === 'number') return value;
+  if (typeof value === 'bigint') return Number(value);
+  if (typeof value === 'string') {
+    const parsed = Number.parseInt(value, 10);
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+  return 0;
+}
+
+export function getGlobalCollabAdmissionGuardStatus(): {
+  active: boolean;
+  reason: string | null;
+  untilMs: number | null;
+  remainingMs: number | null;
+} {
+  const entry = getGlobalCollabAdmissionGuardEntry();
+  if (!entry) {
+    return {
+      active: false,
+      reason: null,
+      untilMs: null,
+      remainingMs: null,
+    };
+  }
+  const now = Date.now();
+  return {
+    active: true,
+    reason: entry.reason,
+    untilMs: entry.untilMs,
+    remainingMs: Math.max(0, entry.untilMs - now),
+  };
+}
+
+export function getCollabQuarantineGateStatus(slug: string): {
+  active: boolean;
+  reason: string | null;
+  untilMs: number | null;
+  remainingMs: number | null;
+  durable: boolean;
+} {
+  const auto = getAutoCollabQuarantineStatus(slug);
+  if (auto.active) {
+    return {
+      active: true,
+      reason: auto.reason ?? 'COLLAB_AUTO_QUARANTINED',
+      untilMs: auto.untilMs,
+      remainingMs: auto.remainingMs,
+      durable: true,
+    };
+  }
+  if (hasPersistedProjectionQuarantine(slug)) {
+    const reason = getPersistedProjectionQuarantineReason(slug);
+    return {
+      active: true,
+      reason: reason ?? 'COLLAB_AUTO_QUARANTINED',
+      untilMs: null,
+      remainingMs: null,
+      durable: true,
+    };
+  }
+  return {
+    active: false,
+    reason: null,
+    untilMs: null,
+    remainingMs: null,
+    durable: false,
+  };
+}
+
+export function getLiveCollabBlockStatus(slug: string): LiveCollabBlockStatus {
+  if (isHotSlugQuarantined(slug)) {
+    return {
+      active: true,
+      code: 'HOT_SLUG_QUARANTINED',
+      message: LIVE_COLLAB_BLOCKED_MESSAGE,
+      reason: 'HOT_SLUG_QUARANTINED',
+      untilMs: null,
+      retryAfterMs: null,
+      durable: true,
+    };
+  }
+
+  const admissionGuard = getGlobalCollabAdmissionGuardStatus();
+  if (admissionGuard.active) {
+    return {
+      active: true,
+      code: 'COLLAB_ADMISSION_GUARDED',
+      message: LIVE_COLLAB_BLOCKED_MESSAGE,
+      reason: admissionGuard.reason ?? 'COLLAB_ADMISSION_GUARDED',
+      untilMs: admissionGuard.untilMs,
+      retryAfterMs: admissionGuard.remainingMs,
+      durable: true,
+    };
+  }
+
+  const quarantine = getCollabQuarantineGateStatus(slug);
+  if (quarantine.active) {
+    return {
+      active: true,
+      code: 'COLLAB_AUTO_QUARANTINED',
+      message: LIVE_COLLAB_BLOCKED_MESSAGE,
+      reason: quarantine.reason ?? 'COLLAB_AUTO_QUARANTINED',
+      untilMs: quarantine.untilMs,
+      retryAfterMs: quarantine.remainingMs,
+      durable: quarantine.durable,
+    };
+  }
+
+  return {
+    active: false,
+    code: null,
+    message: null,
+    reason: null,
+    untilMs: null,
+    retryAfterMs: null,
+    durable: false,
+  };
 }
 
 let runtime: CollabRuntime = {
@@ -95,9 +359,25 @@ const docPersistGenerations = new WeakMap<Y.Doc, number>();
 type FragmentEditState = { dirty: boolean };
 const fragmentEditStateByDoc = new WeakMap<Y.Doc, FragmentEditState>();
 const fragmentEditListenerAttached = new WeakSet<Y.Doc>();
+
+// Tracks Y.Doc instances where we've already attempted empty-fragment seeding.
+const fragmentSeedAttempted = new WeakSet<Y.Doc>();
+
+type PersistedDocCacheHydration = 'sync' | 'async';
+type PersistedDocCacheKey = { fingerprint: string; updateCount: number };
+type PersistedDocCacheEntry = PersistedDocCacheKey & {
+  ydoc: Y.Doc;
+  hydration: PersistedDocCacheHydration;
+};
+
+// Cache for persisted canonical Y.Doc loads keyed by slug. Tracks the persisted
+// Yjs snapshot/update fingerprint so both sync and async read paths can reuse
+// the same authoritative state until the underlying snapshot changes.
+const persistedDocCache = new Map<string, PersistedDocCacheEntry>();
 const durablePersistListenerAttached = new WeakSet<Y.Doc>();
 const FRAGMENT_REPAIR_ORIGINS = new Set(['server-fragment-repair', 'persisted-fragment-repair']);
 const lastPersistedStateVectors = new Map<string, Uint8Array>();
+const lastPersistedAuthoritativeSnapshots = new Map<string, Uint8Array>();
 const updatesSinceCompaction = new Map<string, number>();
 const docLastAccessedAt = new Map<string, number>();
 const docLastChangedAt = new Map<string, number>();
@@ -106,6 +386,7 @@ type LoadedDocDbMeta = {
   updatedAt: string | null;
   yStateVersion: number;
   accessEpoch: number | null;
+  baselineSnapshot: Uint8Array;
   baselineStateVector: Uint8Array;
 };
 const loadedDocDbMeta = new Map<string, LoadedDocDbMeta>();
@@ -115,7 +396,7 @@ const loadedDocDbMeta = new Map<string, LoadedDocDbMeta>();
 // When canonical state changes outside collab (PUT markdown, agent ops), we need to
 // drop the in-memory Y.Doc and ensure no stale onStoreDocument write sneaks in.
 const collabInvalidations = new Set<string>();
-const skipOnStoreStateVectors = new Map<string, Uint8Array>();
+const skipOnStoreFingerprints = new Map<string, string>();
 const DEFAULT_COLLAB_SESSION_TTL_SECONDS = 5 * 60;
 const DEFAULT_COLLAB_PERSIST_DEBOUNCE_MS = 250;
 const DEFAULT_COLLAB_COMPACTION_EVERY = 100;
@@ -131,13 +412,42 @@ const DEFAULT_STARTUP_STALE_PROJECTION_RECONCILE_DELAY_MS = 30_000;
 const DEFAULT_STARTUP_STALE_PROJECTION_RECONCILE_LIMIT = 25;
 const DEFAULT_PROJECTION_GUARD_MAX_CHARS = 1_500_000;
 const DEFAULT_PROJECTION_GUARD_MAX_GROWTH_MULTIPLIER = 8;
+const DEFAULT_PROJECTION_GUARD_SMALL_BASELINE_BYPASS_ENABLED = false;
+const DEFAULT_PROJECTION_GUARD_MIN_BASELINE_CHARS = 128;
+const DEFAULT_PROJECTION_GUARD_MAX_SMALL_BASELINE_GROWTH_CHARS = 12_000;
 const DEFAULT_PROJECTION_GUARD_MAX_LENGTH_DRIFT_RATIO = 0.6;
 const DEFAULT_PROJECTION_GUARD_MIN_TOKEN_OVERLAP = 0.3;
 const DEFAULT_PATHOLOGICAL_REPEAT_MIN_REPEATS = 3;
 const DEFAULT_PATHOLOGICAL_REPEAT_MIN_BASE_CHARS = 512;
 const DEFAULT_PROJECTION_PATHOLOGY_COOLDOWN_MS = 5 * 60 * 1000;
 const DEFAULT_STALE_ONSTORE_DRIFT_COOLDOWN_MS = 5 * 60 * 1000;
+const DEFAULT_STALE_ONSTORE_CONCURRENT_BREAKER_WINDOW_MS = 30 * 1000;
+const DEFAULT_STALE_ONSTORE_CONCURRENT_BREAKER_MAX = 6;
+const DEFAULT_COLLAB_REPAIR_LOOP_BREAKER_WINDOW_MS = 30 * 1000;
+const DEFAULT_COLLAB_REPAIR_LOOP_BREAKER_MAX = 6;
+const DEFAULT_COLLAB_REPAIR_GUARD_ESCALATION_WINDOW_MS = 60 * 1000;
+const DEFAULT_COLLAB_REPAIR_GUARD_ESCALATION_MAX = 2;
+const DEFAULT_FRAGMENT_DRIFT_BREAKER_WINDOW_MS = 60 * 1000;
+const DEFAULT_FRAGMENT_DRIFT_BREAKER_MAX = 2;
+const DEFAULT_STALE_ONSTORE_DB_MISSING_QUARANTINE_BYTES = 1_500_000;
+const DEFAULT_STALE_ONSTORE_LOCAL_UNSAVED_QUARANTINE_BYTES = 1_500_000;
+const DEFAULT_COLLAB_AUTO_QUARANTINE_COOLDOWN_MS = 5 * 60 * 1000;
+const DEFAULT_COLLAB_ADMISSION_GUARD_WINDOW_MS = 30 * 1000;
+const DEFAULT_COLLAB_ADMISSION_GUARD_MAX_EVENTS = 12;
+const DEFAULT_COLLAB_ADMISSION_GUARD_MAX_SLUGS = 4;
+const DEFAULT_COLLAB_ADMISSION_GUARD_MAX_BYTES = 4_000_000;
+const DEFAULT_COLLAB_ADMISSION_GUARD_MAX_QUARANTINED = 4;
+const DEFAULT_COLLAB_ADMISSION_GUARD_COOLDOWN_MS = 2 * 60 * 1000;
+const DEFAULT_MAX_UPDATE_BLOB_BYTES = 8 * 1024 * 1024;
+const DEFAULT_MAX_SLUG_YJS_BYTES_PER_WINDOW = 32 * 1024 * 1024;
+const DEFAULT_MAX_SLUG_YJS_WINDOW_MS = 10 * 60 * 1000;
+const DEFAULT_SUSPICIOUS_DOC_REPEAT_MAX = 2;
+const DEFAULT_SUSPICIOUS_DOC_REPEAT_WINDOW_MS = 60 * 1000;
 const DEFAULT_WS_OVERSIZE_LOG_COOLDOWN_MS = 60 * 1000;
+const DEFAULT_INTEGRITY_WARNING_LOG_COOLDOWN_MS = 60 * 1000;
+const DEFAULT_INTEGRITY_WARNING_BLOCK_EXPLOSION = 256;
+const DEFAULT_INTEGRITY_WARNING_REPEAT_BLOCK_THRESHOLD = 64;
+const DEFAULT_INTEGRITY_WARNING_REPEAT_HEADING_THRESHOLD = 3;
 const DEFAULT_PROJECTION_REPAIR_RETRY_SCHEDULE_MS = [0, 500, 2_000];
 const DEFAULT_PROJECTION_REPAIR_WORKER_ENABLED = true;
 const DEFAULT_PROJECTION_REPAIR_WORKER_DELAY_MS = 45_000;
@@ -155,6 +465,7 @@ const projectionRepairScheduled = new Map<string, ReturnType<typeof setTimeout>>
 const projectionRepairRunning = new Set<string>();
 const projectionRepairRetryIndex = new Map<string, number>();
 const projectionRepairReasons = new Map<string, Set<string>>();
+const projectionRepairCycleIds = new Map<string, number>();
 type PathologyCooldownEntry = {
   fingerprint: string;
   reason: string;
@@ -164,10 +475,76 @@ type PathologyCooldownEntry = {
 const projectionPathologyCooldowns = new Map<string, PathologyCooldownEntry>();
 const staleOnStoreDriftCooldowns = new Map<string, PathologyCooldownEntry>();
 const collabWsOversizeCooldowns = new Map<string, PathologyCooldownEntry>();
+type AutoCollabQuarantineEntry = {
+  reason: string;
+  untilMs: number;
+  triggeredAt: number;
+  lastTriggeredAt: number;
+  count: number;
+  details?: Record<string, unknown>;
+};
+const autoCollabQuarantines = new Map<string, AutoCollabQuarantineEntry>();
+type GlobalCollabAdmissionEvent = {
+  slug: string;
+  atMs: number;
+  bytes: number;
+  reason: string;
+};
+type GlobalCollabAdmissionGuardEntry = {
+  reason: string;
+  untilMs: number;
+  triggeredAt: number;
+  lastTriggeredAt: number;
+  count: number;
+  details?: Record<string, unknown>;
+};
+const globalCollabAdmissionEvents: GlobalCollabAdmissionEvent[] = [];
+let globalCollabAdmissionGuard: GlobalCollabAdmissionGuardEntry | null = null;
+type ConcurrentExternalEditBreakerState = {
+  windowStartMs: number;
+  count: number;
+};
+const concurrentExternalEditBreaker = new Map<string, ConcurrentExternalEditBreakerState>();
+type SlugYjsWriteWindowState = {
+  windowStartMs: number;
+  totalBytes: number;
+  count: number;
+};
+const slugYjsWriteWindows = new Map<string, SlugYjsWriteWindowState>();
+type RepeatedSuspiciousDocState = {
+  windowStartMs: number;
+  count: number;
+};
+const repeatedLegacyReseedAttempts = new Map<string, RepeatedSuspiciousDocState>();
+const repeatedPendingDeltaClearAttempts = new Map<string, RepeatedSuspiciousDocState>();
+const largeDocPathologyCooldowns = new Map<string, PathologyCooldownEntry>();
+const integrityWarningCooldowns = new Map<string, PathologyCooldownEntry>();
+type FragmentDriftBreakerState = {
+  windowStartMs: number;
+  count: number;
+  lastCountedCycleId: number | null;
+};
+const repeatedFragmentDriftCycles = new Map<string, FragmentDriftBreakerState>();
+const fragmentDriftCycleCooldowns = new Map<string, PathologyCooldownEntry>();
+type CollabRepairLoopBreakerState = {
+  windowStartMs: number;
+  count: number;
+};
+const collabRepairLoopBreaker = new Map<string, CollabRepairLoopBreakerState>();
+type CollabRepairGuardEscalationState = {
+  windowStartMs: number;
+  count: number;
+  fingerprint: string;
+  guardReason: string;
+  lastCountedCycleId: number | null;
+};
+const collabRepairGuardEscalationBreaker = new Map<string, CollabRepairGuardEscalationState>();
+const collabRepairGuardLogCooldowns = new Map<string, PathologyCooldownEntry>();
 const authenticatedCollabLeaseHeartbeatTimers = new Map<string, ReturnType<typeof setInterval>>();
 let projectionRepairWorkerTimer: ReturnType<typeof setTimeout> | null = null;
 let projectionRepairWorkerGeneration = 0;
 let startupProjectionReconcileTimer: ReturnType<typeof setTimeout> | null = null;
+let nextProjectionRepairCycleId = 1;
 const projectionRepairWorkerOversizedSeen = new Map<string, { fingerprint: string; queuedAt: number }>();
 
 // Guard: while a force-rewrite is in flight (or cooling down), block all client-originated
@@ -362,8 +739,6 @@ function clearAgentPresenceForSlug(slug: string, agentId: string, at: string): v
       if (typeof currentAt === 'string' && currentAt !== at) return;
       presenceMap.delete(agentId);
     }, 'agent-presence-expiry');
-    // Persist the expiry deletion so stale presence doesn't reappear after reconnect/restart.
-    schedulePersistDoc(slug, ydoc);
   } catch {
     // ignore
   }
@@ -443,17 +818,27 @@ function authenticateCollabSession(documentName: string, token: string): CollabA
   if (accessEpoch !== null && claims.accessEpoch !== accessEpoch) {
     throw new Error('session-stale');
   }
-  if (doc.share_state === 'REVOKED' && claims.role !== 'owner_bot') {
+  const effectiveShareState = getEffectiveShareStateForRole(doc, claims.role, true);
+  if (effectiveShareState === 'REVOKED' && claims.role !== 'owner_bot') {
     throw new Error('document-revoked');
   }
-  if (doc.share_state === 'PAUSED' && claims.role !== 'owner_bot') {
+  if (effectiveShareState === 'PAUSED' && claims.role !== 'owner_bot') {
     throw new Error('document-paused');
+  }
+  const liveCollabBlock = getLiveCollabBlockStatus(documentName);
+  if (liveCollabBlock.active) {
+    const blockCode = liveCollabBlock.code ?? 'COLLAB_AUTO_QUARANTINED';
+    if (blockCode === 'COLLAB_ADMISSION_GUARDED') {
+      recordCollabAdmissionGuard('block', liveCollabBlock.reason ?? 'unknown', 'authenticate');
+      throw new Error('collab-admission-guarded');
+    }
+    throw new Error('collab-quarantined');
   }
 
   const canWrite = (
     (claims.role === 'owner_bot'
-      && (doc.share_state === 'ACTIVE' || doc.share_state === 'PAUSED'))
-    || (claims.role === 'editor' && doc.share_state === 'ACTIVE')
+      && (effectiveShareState === 'ACTIVE' || effectiveShareState === 'PAUSED'))
+    || (claims.role === 'editor' && effectiveShareState === 'ACTIVE')
   );
 
   return {
@@ -475,7 +860,7 @@ function attachAuthenticatedCollabPresence(socketId: string, auth: CollabAuthCon
   const connectionId = buildActiveCollabConnectionId(socketId);
   if (typeof auth.accessEpoch === 'number' && Number.isFinite(auth.accessEpoch)) {
     noteDocumentLiveCollabLease(auth.slug, auth.accessEpoch);
-    console.warn('[collab] authenticated collab presence attached', {
+    console.log('[collab] authenticated collab presence attached', {
       slug: auth.slug,
       role: auth.role,
       accessEpoch: auth.accessEpoch,
@@ -551,18 +936,6 @@ function parsePositiveFloat(value: string | undefined, fallback: number): number
 
 function collabSessionLeaseKey(slug: string, accessEpoch: number | null): string {
   return `${slug}::${typeof accessEpoch === 'number' ? accessEpoch : 'none'}`;
-}
-
-function buildCollabSessionLeaseConnectionId(
-  slug: string,
-  accessEpoch: number,
-  role: ShareRole,
-  tokenId: string | null | undefined,
-): string {
-  const stableTokenPart = typeof tokenId === 'string' && tokenId.trim()
-    ? tokenId.trim()
-    : 'anonymous';
-  return `collab-session:${slug}:${accessEpoch}:${role}:${stableTokenPart}`;
 }
 
 function pruneRecentCollabSessionLeases(nowMs: number = Date.now()): void {
@@ -730,6 +1103,19 @@ export function logCollabSocketErrorWithSuppression(request: unknown, source: st
     statusCode: summary.statusCode,
     message: summary.message,
   });
+  traceServerIncident({
+    slug,
+    subsystem: 'collab',
+    level: 'error',
+    eventType: 'websocket.error',
+    message: 'Collab websocket connection error',
+    data: {
+      source,
+      code: summary.code,
+      statusCode: summary.statusCode,
+      errorMessage: summary.message,
+    },
+  });
 }
 
 function attachCollabSocketErrorHandler(socket: unknown, request: unknown, source: string): void {
@@ -785,6 +1171,17 @@ function logStaleEpochWrite(
   if (now - previous < 5000) return;
   staleEpochWriteWarnings.set(key, now);
   console.warn('[collab] stale-epoch write dropped', { slug, source, ...details });
+  traceServerIncident({
+    slug,
+    subsystem: 'collab',
+    level: 'warn',
+    eventType: 'stale_epoch_write_dropped',
+    message: 'Collab write was dropped because the access epoch was stale',
+    data: {
+      source,
+      ...details,
+    },
+  });
 }
 
 function getContextAccessEpoch(context: unknown): number | null {
@@ -819,20 +1216,162 @@ function sameStateVector(a: Uint8Array, b: Uint8Array): boolean {
   return true;
 }
 
+type SharedYDocEntry = {
+  size?: number;
+  length?: number;
+};
+
+export function cloneAuthoritativeDocState(source: Y.Doc): Y.Doc {
+  const authoritative = new Y.Doc();
+  authoritative.transact(() => {
+    const markdown = source.getText('markdown').toString();
+    if (markdown) {
+      authoritative.getText('markdown').insert(0, markdown);
+    }
+    applyMarksMapDiff(authoritative.getMap('marks'), encodeMarksMap(source.getMap('marks')));
+
+    const sourceFragment = source.getXmlFragment('prosemirror');
+    const targetFragment = authoritative.getXmlFragment('prosemirror');
+    const clonedNodes = sourceFragment.toArray().map((node) => node.clone());
+    if (clonedNodes.length > 0) {
+      targetFragment.insert(0, clonedNodes as Array<Y.XmlElement | Y.XmlText>);
+    }
+  }, 'authoritative-clone');
+  return authoritative;
+}
+
+function getAuthoritativeFragmentXml(fragment: Y.XmlFragment): string {
+  try {
+    return fragment.toString();
+  } catch {
+    return String(fragment.length);
+  }
+}
+
+function syncAuthoritativeDocState(target: Y.Doc, source: Y.Doc): void {
+  target.transact(() => {
+    applyYTextDiff(target.getText('markdown'), source.getText('markdown').toString());
+    applyMarksMapDiff(target.getMap('marks'), encodeMarksMap(source.getMap('marks')));
+
+    const sourceFragment = source.getXmlFragment('prosemirror');
+    const targetFragment = target.getXmlFragment('prosemirror');
+    if (getAuthoritativeFragmentXml(sourceFragment) === getAuthoritativeFragmentXml(targetFragment)) {
+      return;
+    }
+
+    if (targetFragment.length > 0) {
+      targetFragment.delete(0, targetFragment.length);
+    }
+    const clonedNodes = sourceFragment.toArray().map((node) => node.clone());
+    if (clonedNodes.length > 0) {
+      targetFragment.insert(0, clonedNodes as Array<Y.XmlElement | Y.XmlText>);
+    }
+  }, 'authoritative-sync');
+}
+
+type AuthoritativeBaseline = {
+  snapshot: Uint8Array;
+  stateVector: Uint8Array;
+};
+
+const EMPTY_AUTHORITATIVE_BASELINE: AuthoritativeBaseline = (() => {
+  const empty = new Y.Doc();
+  return {
+    snapshot: Y.encodeStateAsUpdate(empty),
+    stateVector: Y.encodeStateVector(empty),
+  };
+})();
+
+function buildAuthoritativeBaseline(source: Y.Doc): AuthoritativeBaseline {
+  return {
+    snapshot: encodeAuthoritativeStateAsUpdate(source),
+    stateVector: encodeAuthoritativeStateVector(source),
+  };
+}
+
+function buildComparableAuthoritativeDoc(
+  baselineSnapshot: Uint8Array | null | undefined,
+  source: Y.Doc,
+): Y.Doc {
+  if (!(baselineSnapshot && baselineSnapshot.byteLength > 0)) {
+    return cloneAuthoritativeDocState(source);
+  }
+  const comparable = new Y.Doc();
+  Y.applyUpdate(comparable, baselineSnapshot);
+  syncAuthoritativeDocState(comparable, source);
+  return comparable;
+}
+
+function buildAuthoritativeDocFingerprint(source: Y.Doc): string {
+  return createHash('sha256')
+    .update(source.getText('markdown').toString())
+    .update('\0')
+    .update(stableStringify(encodeMarksMap(source.getMap('marks'))))
+    .update('\0')
+    .update(getAuthoritativeFragmentXml(source.getXmlFragment('prosemirror')))
+    .digest('hex');
+}
+
+function hasLegacyEphemeralCollabState(ydoc: Y.Doc): boolean {
+  const share = (ydoc as { share?: Map<string, SharedYDocEntry> }).share;
+  if (!share || share.size === 0) return false;
+  return share.has('agentPresence')
+    || share.has('agentCursors')
+    || share.has('agentActivity');
+}
+
+function encodeAuthoritativeStateVector(ydoc: Y.Doc): Uint8Array {
+  // Use the original doc's state vector so that delta computation later uses matching
+  // client IDs. cloneAuthoritativeDocState creates a fresh Y.Doc with a new client ID
+  // which causes encodeStateAsUpdate to treat all content as new inserts, leading to
+  // content duplication when the delta is applied on top of existing snapshots.
+  // For docs with legacy ephemeral state, we still need to strip it from the state
+  // vector by cloning, but modern docs should use the original directly.
+  return hasLegacyEphemeralCollabState(ydoc)
+    ? Y.encodeStateVector(cloneAuthoritativeDocState(ydoc))
+    : Y.encodeStateVector(ydoc);
+}
+
+function encodePersistedStateVector(ydoc: Y.Doc): Uint8Array {
+  // Older persisted rows may still carry agent ephemera. Normalize only when needed.
+  return hasLegacyEphemeralCollabState(ydoc)
+    ? encodeAuthoritativeStateVector(ydoc)
+    : Y.encodeStateVector(ydoc);
+}
+
+function encodeAuthoritativeStateAsUpdate(
+  ydoc: Y.Doc,
+  stateVector?: Uint8Array,
+): Uint8Array {
+  // Use the original doc for delta computation to preserve client ID continuity.
+  // Cloning creates a fresh client ID which makes the delta include ALL content
+  // rather than just the diff, causing duplication on reload.
+  // For legacy docs with ephemeral state, still clone to strip it.
+  if (hasLegacyEphemeralCollabState(ydoc)) {
+    const authoritative = cloneAuthoritativeDocState(ydoc);
+    return stateVector
+      ? Y.encodeStateAsUpdate(authoritative, stateVector)
+      : Y.encodeStateAsUpdate(authoritative);
+  }
+  return stateVector
+    ? Y.encodeStateAsUpdate(ydoc, stateVector)
+    : Y.encodeStateAsUpdate(ydoc);
+}
+
 function markSkipNextOnStorePersist(slug: string, ydoc: Y.Doc): void {
-  skipOnStoreStateVectors.set(slug, Y.encodeStateVector(ydoc));
+  skipOnStoreFingerprints.set(slug, buildAuthoritativeDocFingerprint(ydoc));
 }
 
 function shouldSkipOnStorePersistAfterExternalApply(slug: string, ydoc: Y.Doc): boolean {
-  const expectedStateVector = skipOnStoreStateVectors.get(slug);
-  if (!expectedStateVector) return false;
-  const currentStateVector = Y.encodeStateVector(ydoc);
-  if (!sameStateVector(expectedStateVector, currentStateVector)) {
+  const expectedFingerprint = skipOnStoreFingerprints.get(slug);
+  if (!expectedFingerprint) return false;
+  const currentFingerprint = buildAuthoritativeDocFingerprint(ydoc);
+  if (expectedFingerprint !== currentFingerprint) {
     // External-apply skip only applies to the exact state we just wrote.
-    skipOnStoreStateVectors.delete(slug);
+    skipOnStoreFingerprints.delete(slug);
     return false;
   }
-  skipOnStoreStateVectors.delete(slug);
+  skipOnStoreFingerprints.delete(slug);
   const pending = persistTimers.get(slug);
   if (pending) {
     clearTimeout(pending);
@@ -1124,6 +1663,123 @@ function stableStringify(value: unknown): string {
   return JSON.stringify(stableSortValue(value));
 }
 
+function canonicalRowDiffersFromPersistedState(
+  row: DocumentRow,
+  persistedState: PersistedDocState,
+): {
+  markdown: string;
+  marks: Record<string, unknown>;
+  markdownChanged: boolean;
+  marksChanged: boolean;
+} {
+  const markdown = persistedState.ydoc.getText('markdown').toString();
+  const marks = encodeMarksMap(persistedState.ydoc.getMap('marks'));
+  const markdownChanged = normalizeMutationBaseMarkdown(row.markdown ?? '') !== normalizeMutationBaseMarkdown(markdown);
+  const marksChanged = stableStringify(normalizeMutationBaseMarks(parseStoredMarks(row.marks)))
+    !== stableStringify(normalizeMutationBaseMarks(marks));
+  return {
+    markdown,
+    marks,
+    markdownChanged,
+    marksChanged,
+  };
+}
+
+export const MUTATION_BASE_SCHEMA_VERSION = 'mt1' as const;
+
+export type MutationBaseSource =
+  | 'projection'
+  | 'live_yjs'
+  | 'persisted_yjs'
+  | 'canonical_row';
+
+export type AuthoritativeMutationBase = {
+  token: string;
+  source: MutationBaseSource;
+  schemaVersion: typeof MUTATION_BASE_SCHEMA_VERSION;
+  markdown: string;
+  marks: Record<string, unknown>;
+  accessEpoch: number;
+};
+
+export type AuthoritativeMutationBaseResolution =
+  | { ok: true; base: AuthoritativeMutationBase }
+  | { ok: false; reason: 'missing_document' | 'live_doc_unavailable' };
+
+export type AuthoritativeStateVerificationResult = {
+  confirmed: boolean;
+  reason?: 'missing_document' | 'live_doc_unavailable' | 'authoritative_read_mismatch' | 'authoritative_stability_regressed';
+  source: MutationBaseSource | null;
+  expectedHash: string;
+  observedHash: string | null;
+};
+
+function normalizeMutationBaseMarkdown(markdown: string | null | undefined): string {
+  return stripEphemeralCollabSpans(markdown ?? '').replace(/\r\n/g, '\n');
+}
+
+function hashAuthoritativeDocumentState(markdown: string, marks: Record<string, unknown>): string {
+  return createHash('sha256').update(stableStringify({
+    markdown: normalizeMutationBaseMarkdown(markdown),
+    marks: normalizeMutationBaseMarks(marks),
+  })).digest('hex');
+}
+
+function normalizeMutationBaseMarks(marks: Record<string, unknown>): Record<string, unknown> {
+  try {
+    return canonicalizeStoredMarks(marks as Record<string, StoredMark>) as unknown as Record<string, unknown>;
+  } catch {
+    return marks;
+  }
+}
+
+function buildMutationBaseToken(
+  markdown: string,
+  marks: Record<string, unknown>,
+  accessEpoch: number,
+): string {
+  return `${MUTATION_BASE_SCHEMA_VERSION}:${createHash('sha256').update(stableStringify({
+    schemaVersion: MUTATION_BASE_SCHEMA_VERSION,
+    markdown: normalizeMutationBaseMarkdown(markdown),
+    marks: normalizeMutationBaseMarks(marks),
+    accessEpoch: Math.max(0, Math.trunc(accessEpoch)),
+  })).digest('hex')}`;
+}
+
+export function isValidMutationBaseToken(value: string | null | undefined): boolean {
+  return typeof value === 'string' && /^mt1:[0-9a-f]{64}$/.test(value.trim());
+}
+
+export function buildAuthoritativeMutationBase(
+  row: DocumentRow,
+  source: MutationBaseSource,
+  markdown: string,
+  marks: Record<string, unknown>,
+): AuthoritativeMutationBase {
+  const normalizedMarkdown = normalizeMutationBaseMarkdown(markdown);
+  const normalizedMarks = normalizeMutationBaseMarks(marks);
+  const accessEpoch = typeof row.access_epoch === 'number' && Number.isFinite(row.access_epoch)
+    ? Math.max(0, Math.trunc(row.access_epoch))
+    : 0;
+
+  return {
+    token: buildMutationBaseToken(normalizedMarkdown, normalizedMarks, accessEpoch),
+    source,
+    schemaVersion: MUTATION_BASE_SCHEMA_VERSION,
+    markdown: normalizedMarkdown,
+    marks: normalizedMarks,
+    accessEpoch,
+  };
+}
+
+function sameAuthoritativeMutationBase(
+  left: AuthoritativeMutationBase | null,
+  right: AuthoritativeMutationBase | null,
+): boolean {
+  if (!left || !right) return false;
+  return left.token === right.token;
+}
+
 function shouldPreserveMissingMark(value: unknown): boolean {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const kind = (value as { kind?: unknown }).kind;
@@ -1136,7 +1792,7 @@ function shouldPreserveMissingMark(value: unknown): boolean {
   return true;
 }
 
-function mergePreservedActionMarks(
+export function mergePreservedActionMarks(
   slug: string,
   incomingMarks: Record<string, unknown>,
 ): Record<string, unknown> {
@@ -1171,16 +1827,43 @@ function markDocChanged(slug: string): void {
   touchDoc(slug);
 }
 
-function recordProjectionWipeWarning(slug: string, previousLength: number, nextLength: number): void {
-  if (previousLength <= 0) return;
+function recordProjectionWipeWarning(
+  slug: string,
+  previousLength: number,
+  nextLength: number,
+): { quarantined: boolean; reason?: string } {
+  if (previousLength <= 0) return { quarantined: false };
   if (nextLength === 0) {
+    const driftQuarantine = maybeQuarantineRepeatedFragmentDrift(slug, {
+      source: 'materialize',
+      event: 'projection_wipe',
+      details: {
+        previousLength,
+        nextLength,
+      },
+    });
     console.warn('[collab] Projection markdown emptied unexpectedly', {
       slug,
       previousLength,
       nextLength,
+      autoQuarantined: driftQuarantine.quarantined,
+    });
+    traceServerIncident({
+      slug,
+      subsystem: 'collab',
+      level: 'warn',
+      eventType: 'projection_wipe.empty',
+      message: 'Projection markdown emptied unexpectedly during materialization',
+      data: {
+        previousLength,
+        nextLength,
+      },
     });
     recordProjectionWipe('empty');
-    return;
+    return {
+      quarantined: driftQuarantine.quarantined,
+      reason: driftQuarantine.reason,
+    };
   }
   const shrinkRatio = nextLength / previousLength;
   if (shrinkRatio < 0.2) {
@@ -1190,8 +1873,70 @@ function recordProjectionWipeWarning(slug: string, previousLength: number, nextL
       nextLength,
       shrinkRatio,
     });
+    traceServerIncident({
+      slug,
+      subsystem: 'collab',
+      level: 'warn',
+      eventType: 'projection_wipe.shrink',
+      message: 'Projection markdown shrank by more than 80% during materialization',
+      data: {
+        previousLength,
+        nextLength,
+        shrinkRatio,
+      },
+    });
     recordProjectionWipe('shrink');
   }
+  return { quarantined: false };
+}
+
+const NON_DIRTY_FRAGMENT_REFRESH_MAX_SHRINK_RATIO = 0.2;
+
+type FragmentRefreshCollapseGuardResult =
+  | { blocked: false }
+  | {
+      blocked: true;
+      collapseKind: 'empty' | 'shrink';
+      currentChars: number;
+      derivedChars: number;
+      rowChars: number;
+      shrinkRatio: number;
+    };
+
+function evaluateNonDirtyFragmentRefreshCollapse(
+  currentMarkdown: string,
+  derivedFragmentMarkdown: string,
+  currentRowMarkdown: string,
+): FragmentRefreshCollapseGuardResult {
+  const currentChars = currentMarkdown.length;
+  if (currentChars <= 0) return { blocked: false };
+
+  const derivedChars = derivedFragmentMarkdown.length;
+  const rowChars = currentRowMarkdown.length;
+  if (derivedChars === 0) {
+    return {
+      blocked: true,
+      collapseKind: 'empty',
+      currentChars,
+      derivedChars,
+      rowChars,
+      shrinkRatio: 0,
+    };
+  }
+
+  const shrinkRatio = derivedChars / currentChars;
+  if (shrinkRatio >= NON_DIRTY_FRAGMENT_REFRESH_MAX_SHRINK_RATIO) {
+    return { blocked: false };
+  }
+
+  return {
+    blocked: true,
+    collapseKind: 'shrink',
+    currentChars,
+    derivedChars,
+    rowChars,
+    shrinkRatio,
+  };
 }
 
 export function detectPathologicalProjectionRepeat(
@@ -1214,6 +1959,74 @@ export function detectPathologicalProjectionRepeat(
   return repeatCount;
 }
 
+const CANONICAL_REPLAY_MIN_REPEATS = 2;
+const CANONICAL_REPLAY_MIN_BASE_CHARS = 64;
+const CANONICAL_REPLAY_PREFIX_MIN_CHARS = 96;
+const CANONICAL_REPLAY_PREFIX_MAX_CHARS = 256;
+
+function countSubstringOccurrences(haystack: string, needle: string): number {
+  if (!needle) return 0;
+  let count = 0;
+  let cursor = 0;
+  while (cursor < haystack.length) {
+    const index = haystack.indexOf(needle, cursor);
+    if (index < 0) return count;
+    count += 1;
+    cursor = index + needle.length;
+  }
+  return count;
+}
+
+function detectCanonicalReplayRepeatCount(
+  canonicalMarkdown: string,
+  candidateMarkdown: string,
+): number {
+  const baseline = normalizeMutationBaseMarkdown(canonicalMarkdown);
+  const candidate = normalizeMutationBaseMarkdown(candidateMarkdown);
+  if (!baseline || candidate === baseline) return 0;
+  if (baseline.length < CANONICAL_REPLAY_MIN_BASE_CHARS) return 0;
+
+  let cursor = 0;
+  let repeatCount = 0;
+  while (cursor < candidate.length) {
+    if (!candidate.startsWith(baseline, cursor)) break;
+    repeatCount += 1;
+    cursor += baseline.length;
+    while (cursor < candidate.length && /\s/.test(candidate.charAt(cursor))) {
+      cursor += 1;
+    }
+  }
+
+  if (repeatCount >= CANONICAL_REPLAY_MIN_REPEATS) return repeatCount;
+  const pathologicalRepeatCount = detectPathologicalProjectionRepeat(
+    baseline,
+    candidate,
+    CANONICAL_REPLAY_MIN_REPEATS,
+    CANONICAL_REPLAY_MIN_BASE_CHARS,
+  );
+  if (pathologicalRepeatCount >= CANONICAL_REPLAY_MIN_REPEATS) return pathologicalRepeatCount;
+
+  const prefixLength = Math.min(
+    CANONICAL_REPLAY_PREFIX_MAX_CHARS,
+    Math.max(CANONICAL_REPLAY_PREFIX_MIN_CHARS, Math.floor(baseline.length / 3)),
+  );
+  const prefix = baseline.slice(0, prefixLength).trim();
+  if (prefix.length < CANONICAL_REPLAY_PREFIX_MIN_CHARS) return 0;
+
+  const baselinePrefixCount = countSubstringOccurrences(baseline, prefix);
+  const candidatePrefixCount = countSubstringOccurrences(candidate, prefix);
+  const candidateMuchLonger = candidate.length >= Math.max(
+    baseline.length + prefix.length,
+    Math.floor(baseline.length * 1.5),
+  );
+
+  if (baselinePrefixCount === 1 && candidatePrefixCount >= CANONICAL_REPLAY_MIN_REPEATS && candidateMuchLonger) {
+    return candidatePrefixCount;
+  }
+
+  return 0;
+}
+
 const PROSEMIRROR_BLOCK_NODE_NAMES = new Set([
   'paragraph',
   'heading',
@@ -1232,8 +2045,11 @@ const PROSEMIRROR_BLOCK_NODE_NAMES = new Set([
 
 function collectFragmentPlainText(node: unknown, parts: string[]): void {
   if (node instanceof Y.XmlText) {
-    const text = node.toString();
-    if (text.length > 0) parts.push(text);
+    const delta = typeof node.toDelta === 'function' ? node.toDelta() : [];
+    for (const entry of delta) {
+      const text = typeof entry?.insert === 'string' ? entry.insert : '';
+      if (text.length > 0) parts.push(text);
+    }
     return;
   }
   if (!(node instanceof Y.XmlElement) && !(node instanceof Y.XmlFragment)) return;
@@ -1302,6 +2118,8 @@ type ProjectionSafetyDecision = {
   details?: Record<string, unknown>;
 };
 
+type ProjectionOperationSource = 'persist' | 'repair' | 'startup' | 'share' | 'unknown';
+
 export function evaluateProjectionSafety(
   baselineMarkdown: string,
   candidateMarkdown: string,
@@ -1315,6 +2133,18 @@ export function evaluateProjectionSafety(
     process.env.COLLAB_PROJECTION_GUARD_MAX_GROWTH_MULTIPLIER,
     DEFAULT_PROJECTION_GUARD_MAX_GROWTH_MULTIPLIER,
   );
+  const smallBaselineBypassEnabled = parseBooleanFlag(
+    process.env.COLLAB_PROJECTION_GUARD_SMALL_BASELINE_BYPASS_ENABLED,
+    DEFAULT_PROJECTION_GUARD_SMALL_BASELINE_BYPASS_ENABLED,
+  );
+  const minBaselineChars = parsePositiveInt(
+    process.env.COLLAB_PROJECTION_GUARD_MIN_BASELINE_CHARS,
+    DEFAULT_PROJECTION_GUARD_MIN_BASELINE_CHARS,
+  );
+  const maxSmallBaselineGrowthChars = parsePositiveInt(
+    process.env.COLLAB_PROJECTION_GUARD_MAX_SMALL_BASELINE_GROWTH_CHARS,
+    DEFAULT_PROJECTION_GUARD_MAX_SMALL_BASELINE_GROWTH_CHARS,
+  );
   const maxLengthDriftRatio = parsePositiveFloat(
     process.env.COLLAB_PROJECTION_GUARD_MAX_LENGTH_DRIFT_RATIO,
     DEFAULT_PROJECTION_GUARD_MAX_LENGTH_DRIFT_RATIO,
@@ -1323,31 +2153,58 @@ export function evaluateProjectionSafety(
     process.env.COLLAB_PROJECTION_GUARD_MIN_TOKEN_OVERLAP,
     DEFAULT_PROJECTION_GUARD_MIN_TOKEN_OVERLAP,
   );
+  const repeatCount = detectPathologicalProjectionRepeat(baselineMarkdown, candidateMarkdown);
 
   if (candidateMarkdown.length > maxChars) {
     return {
       safe: false,
       reason: 'max_chars_exceeded',
       details: {
+        baselineChars: baselineMarkdown.length,
         candidateChars: candidateMarkdown.length,
         maxChars,
+        repeatCount: repeatCount > 0 ? repeatCount : undefined,
+      },
+    };
+  }
+
+  const canonicalReplayRepeatCount = detectCanonicalReplayRepeatCount(baselineMarkdown, candidateMarkdown);
+  if (canonicalReplayRepeatCount >= CANONICAL_REPLAY_MIN_REPEATS) {
+    return {
+      safe: false,
+      reason: 'pathological_repeat',
+      details: {
+        baselineChars: baselineMarkdown.length,
+        candidateChars: candidateMarkdown.length,
+        repeatCount: canonicalReplayRepeatCount,
+        canonicalReplay: true,
       },
     };
   }
 
   if (baselineMarkdown.length > 0 && candidateMarkdown.length > (baselineMarkdown.length * maxGrowthMultiplier)) {
-    return {
-      safe: false,
-      reason: 'growth_multiplier_exceeded',
-      details: {
-        baselineChars: baselineMarkdown.length,
-        candidateChars: candidateMarkdown.length,
-        maxGrowthMultiplier,
-      },
-    };
+    const absoluteGrowthChars = candidateMarkdown.length - baselineMarkdown.length;
+    const allowSmallBaselineGrowth = smallBaselineBypassEnabled
+      && baselineMarkdown.length < minBaselineChars
+      && absoluteGrowthChars <= maxSmallBaselineGrowthChars;
+    if (!allowSmallBaselineGrowth) {
+      return {
+        safe: false,
+        reason: 'growth_multiplier_exceeded',
+        details: {
+          baselineChars: baselineMarkdown.length,
+          candidateChars: candidateMarkdown.length,
+          absoluteGrowthChars,
+          maxGrowthMultiplier,
+          smallBaselineBypassEnabled,
+          minBaselineChars,
+          maxSmallBaselineGrowthChars,
+          repeatCount: repeatCount > 0 ? repeatCount : undefined,
+        },
+      };
+    }
   }
 
-  const repeatCount = detectPathologicalProjectionRepeat(baselineMarkdown, candidateMarkdown);
   if (repeatCount > 0) {
     return {
       safe: false,
@@ -1392,15 +2249,23 @@ function materializeProjection(
     bumpRevision?: boolean;
     refreshSnapshot?: boolean;
     markdownOverride?: string;
-    source?: 'persist' | 'repair' | 'startup' | 'unknown';
+    source?: ProjectionOperationSource;
   },
 ): void {
-  const markdownText = options?.markdownOverride ?? doc.getText('markdown').toString();
+  const markdownText = options?.markdownOverride;
+  if (typeof markdownText !== 'string') {
+    throw new Error(`[collab] materializeProjection requires fragment-derived markdownOverride for ${slug}`);
+  }
   const source = options?.source ?? 'unknown';
   recordProjectionChars(markdownText.length, source);
   const previousLength = lastProjectionLengths.get(slug);
+  let wipeQuarantine: { quarantined: boolean; reason?: string } = { quarantined: false };
   if (previousLength !== undefined) {
-    recordProjectionWipeWarning(slug, previousLength, markdownText.length);
+    wipeQuarantine = recordProjectionWipeWarning(slug, previousLength, markdownText.length);
+  }
+  if (wipeQuarantine.quarantined) {
+    recordProjectionRepair('failure', wipeQuarantine.reason ?? 'projection_wipe_quarantined');
+    return;
   }
   lastProjectionLengths.set(slug, markdownText.length);
   const marksMap = doc.getMap('marks');
@@ -1429,7 +2294,7 @@ function clearProjectionRepairState(slug: string): void {
   projectionRepairRunning.delete(slug);
   projectionRepairRetryIndex.delete(slug);
   projectionRepairReasons.delete(slug);
-  clearAllSlugPathologyCooldowns(slug);
+  clearProjectionRepairCycleId(slug);
 }
 
 function getProjectionRepairRetryScheduleMs(): number[] {
@@ -1502,9 +2367,31 @@ function clearStaleOnStoreDriftCooldown(slug: string): void {
   staleOnStoreDriftCooldowns.delete(slug);
 }
 
-function clearAllSlugPathologyCooldowns(slug: string): void {
+function clearCollabRepairLoopBreaker(slug: string): void {
+  if (!slug) return;
+  collabRepairLoopBreaker.delete(slug);
+}
+
+function clearProjectionPathologyCooldownsForSlug(slug: string): void {
   clearProjectionPathologyCooldown(slug);
   clearStaleOnStoreDriftCooldown(slug);
+  clearRepairGuardEscalationState(slug);
+  clearProjectionRepairCycleId(slug);
+  repeatedLegacyReseedAttempts.delete(slug);
+  repeatedPendingDeltaClearAttempts.delete(slug);
+  repeatedFragmentDriftCycles.delete(slug);
+  fragmentDriftCycleCooldowns.delete(slug);
+  for (const key of largeDocPathologyCooldowns.keys()) {
+    if (key === slug || key.startsWith(`${slug}:`)) {
+      largeDocPathologyCooldowns.delete(key);
+    }
+  }
+}
+
+function clearAllSlugPathologyCooldowns(slug: string): void {
+  clearProjectionPathologyCooldownsForSlug(slug);
+  clearCollabRepairLoopBreaker(slug);
+  integrityWarningCooldowns.delete(slug);
 }
 
 function buildProjectionPathologyFingerprint(
@@ -1533,6 +2420,899 @@ function shouldEmitSuppressionSummary(suppressedCount: number): boolean {
   return suppressedCount === 10 || suppressedCount === 50 || suppressedCount === 100;
 }
 
+const COLLAB_REPAIR_LOOP_GUARD_REASONS = new Set([
+  'fragment_markdown_drift',
+  'pathological_repeat',
+]);
+const FAST_QUARANTINE_PROJECTION_GUARD_REASONS = new Set([
+  'pathological_repeat',
+]);
+const MASKED_REPEAT_PROJECTION_GUARD_REASONS = new Set([
+  'max_chars_exceeded',
+  'growth_multiplier_exceeded',
+]);
+const REPAIR_GUARD_ESCALATION_REASONS = new Set([
+  'max_chars_exceeded',
+  'growth_multiplier_exceeded',
+]);
+
+function extractCollabRepairLoopRepeatCount(details: Record<string, unknown>): number {
+  const direct = details.repeatCount;
+  if (typeof direct === 'number' && Number.isFinite(direct) && direct > 0) {
+    return direct;
+  }
+  const nested = details.details;
+  if (nested && typeof nested === 'object' && !Array.isArray(nested)) {
+    const repeatCount = (nested as { repeatCount?: unknown }).repeatCount;
+    if (typeof repeatCount === 'number' && Number.isFinite(repeatCount) && repeatCount > 0) {
+      return repeatCount;
+    }
+  }
+  return 0;
+}
+
+function shouldCountTowardsCollabRepairLoopBreaker(
+  pathology: 'empty_fragment_repair' | 'empty_fragment_projection' | 'projection_guard_block',
+  details: Record<string, unknown>,
+): boolean {
+  if (pathology !== 'projection_guard_block') return true;
+  const guardReason = typeof details.guardReason === 'string' ? details.guardReason : '';
+  if (COLLAB_REPAIR_LOOP_GUARD_REASONS.has(guardReason)) return true;
+  if (guardReason === 'max_chars_exceeded' || guardReason === 'growth_multiplier_exceeded') {
+    return extractCollabRepairLoopRepeatCount(details) >= DEFAULT_PATHOLOGICAL_REPEAT_MIN_REPEATS;
+  }
+  return false;
+}
+
+function shouldFastQuarantineProjectionGuard(
+  reason: string,
+  details: Record<string, unknown> | undefined,
+): boolean {
+  if (FAST_QUARANTINE_PROJECTION_GUARD_REASONS.has(reason)) return true;
+  if (!MASKED_REPEAT_PROJECTION_GUARD_REASONS.has(reason)) return false;
+  return extractCollabRepairLoopRepeatCount({
+    repeatCount: details?.repeatCount,
+    details,
+  }) >= DEFAULT_PATHOLOGICAL_REPEAT_MIN_REPEATS;
+}
+
+function getFastQuarantineReasonForProjectionGuard(reason: string): string {
+  if (reason === 'pathological_repeat') return 'projection_guard_pathological_repeat';
+  return 'projection_guard_masked_repeat';
+}
+
+function shouldCountTowardsRepairGuardEscalation(guardReason: string): boolean {
+  return REPAIR_GUARD_ESCALATION_REASONS.has(guardReason);
+}
+
+function getOrStartProjectionRepairCycleId(slug: string): number {
+  const existing = projectionRepairCycleIds.get(slug);
+  if (typeof existing === 'number') return existing;
+  const cycleId = nextProjectionRepairCycleId;
+  nextProjectionRepairCycleId += 1;
+  projectionRepairCycleIds.set(slug, cycleId);
+  return cycleId;
+}
+
+function clearProjectionRepairCycleId(slug: string): void {
+  if (!slug) return;
+  projectionRepairCycleIds.delete(slug);
+}
+
+function buildRepairGuardEscalationFingerprint(guardReason: string): string {
+  return stableStringify({
+    family: 'growth_guard_block',
+    guardReason: guardReason || 'unknown',
+  });
+}
+
+function buildFragmentDriftSuppressionFingerprint(slug: string): string {
+  return stableStringify({
+    family: 'fragment_drift_cycle',
+    slug,
+  });
+}
+
+function registerFragmentDriftSuppression(
+  slug: string,
+): ProjectionPathologyCooldownResult {
+  return registerPathologyCooldown(
+    fragmentDriftCycleCooldowns,
+    slug,
+    'fragment_markdown_drift',
+    buildFragmentDriftSuppressionFingerprint(slug),
+    Date.now(),
+    parsePositiveInt(
+      process.env.COLLAB_PROJECTION_PATHOLOGY_COOLDOWN_MS,
+      DEFAULT_PROJECTION_PATHOLOGY_COOLDOWN_MS,
+    ),
+  );
+}
+
+function logFragmentDriftSuppressionSummary(slug: string, suppressedCount: number): void {
+  if (!shouldEmitSuppressionSummary(suppressedCount)) return;
+  console.warn('[collab] suppressed repeated fragment drift loop logs', {
+    slug,
+    suppressedCount,
+  });
+}
+
+function logRepairGuardSuppressionSummary(slug: string, guardReason: string, suppressedCount: number): void {
+  if (!shouldEmitSuppressionSummary(suppressedCount)) return;
+  console.warn('[collab] suppressed repeated repair guard block logs', {
+    slug,
+    guardReason,
+    suppressedCount,
+  });
+}
+
+function noteRepairGuardEscalationPathology(
+  slug: string,
+  guardReason: string,
+  fingerprint: string,
+  cycleId: number,
+): {
+  tripped: boolean;
+  count: number;
+  windowMs: number;
+  max: number;
+  windowStartMs: number;
+} {
+  const windowMs = parsePositiveInt(
+    process.env.COLLAB_REPAIR_GUARD_ESCALATION_WINDOW_MS,
+    DEFAULT_COLLAB_REPAIR_GUARD_ESCALATION_WINDOW_MS,
+  );
+  const max = parsePositiveInt(
+    process.env.COLLAB_REPAIR_GUARD_ESCALATION_MAX,
+    DEFAULT_COLLAB_REPAIR_GUARD_ESCALATION_MAX,
+  );
+  const now = Date.now();
+  let state = collabRepairGuardEscalationBreaker.get(slug);
+  if (
+    !state
+    || (now - state.windowStartMs) > windowMs
+    || state.fingerprint !== fingerprint
+  ) {
+    state = {
+      windowStartMs: now,
+      count: 0,
+      fingerprint,
+      guardReason,
+      lastCountedCycleId: null,
+    };
+  }
+  if (state.lastCountedCycleId !== cycleId) {
+    state.count += 1;
+    state.lastCountedCycleId = cycleId;
+  }
+  collabRepairGuardEscalationBreaker.set(slug, state);
+  const tripped = state.count >= max;
+  if (tripped) {
+    collabRepairGuardEscalationBreaker.delete(slug);
+  }
+  return {
+    tripped,
+    count: state.count,
+    windowMs,
+    max,
+    windowStartMs: state.windowStartMs,
+  };
+}
+
+function clearRepairGuardEscalationState(slug: string): void {
+  if (!slug) return;
+  collabRepairGuardEscalationBreaker.delete(slug);
+  collabRepairGuardLogCooldowns.delete(slug);
+}
+
+function noteFragmentDriftCycle(
+  slug: string,
+  cycleId: number,
+): {
+  tripped: boolean;
+  count: number;
+  windowMs: number;
+  max: number;
+  windowStartMs: number;
+} {
+  const windowMs = parsePositiveInt(
+    process.env.COLLAB_FRAGMENT_DRIFT_BREAKER_WINDOW_MS,
+    DEFAULT_FRAGMENT_DRIFT_BREAKER_WINDOW_MS,
+  );
+  const max = parsePositiveInt(
+    process.env.COLLAB_FRAGMENT_DRIFT_BREAKER_MAX,
+    DEFAULT_FRAGMENT_DRIFT_BREAKER_MAX,
+  );
+  const now = Date.now();
+  let state = repeatedFragmentDriftCycles.get(slug);
+  if (!state || (now - state.windowStartMs) > windowMs) {
+    state = {
+      windowStartMs: now,
+      count: 0,
+      lastCountedCycleId: null,
+    };
+  }
+  if (state.lastCountedCycleId !== cycleId) {
+    state.count += 1;
+    state.lastCountedCycleId = cycleId;
+  }
+  repeatedFragmentDriftCycles.set(slug, state);
+  const tripped = state.count >= max;
+  if (tripped) {
+    repeatedFragmentDriftCycles.delete(slug);
+  }
+  return {
+    tripped,
+    count: state.count,
+    windowMs,
+    max,
+    windowStartMs: state.windowStartMs,
+  };
+}
+
+function maybeQuarantineRepeatedFragmentDrift(
+  slug: string,
+  options: {
+    source: 'persist' | 'repair' | 'materialize';
+    event: 'persist_block' | 'repair_success' | 'projection_wipe';
+    details?: Record<string, unknown>;
+  },
+): { quarantined: boolean; reason?: string; suppressed: boolean } {
+  if (!slug) return { quarantined: false, suppressed: false };
+  const gate = getCollabQuarantineGateStatus(slug);
+  if (gate.active) {
+    return {
+      quarantined: true,
+      reason: gate.reason ?? 'COLLAB_AUTO_QUARANTINED',
+      suppressed: true,
+    };
+  }
+  const cooldown = registerFragmentDriftSuppression(slug);
+  if (cooldown.suppressed) {
+    recordCollabLogSuppressed('projection_drift_loop', 'fragment_markdown_drift');
+    logFragmentDriftSuppressionSummary(slug, cooldown.suppressedCount);
+  }
+  const cycleId = getOrStartProjectionRepairCycleId(slug);
+  const repeat = noteFragmentDriftCycle(slug, cycleId);
+  if (!repeat.tripped) {
+    return { quarantined: false, suppressed: cooldown.suppressed };
+  }
+  const reason = 'fragment_drift_repeated_blocker';
+  recordCollabPathologyQuarantine(reason, options.source);
+  registerAutoCollabQuarantine(slug, reason, {
+    source: options.source,
+    event: options.event,
+    count: repeat.count,
+    windowMs: repeat.windowMs,
+    max: repeat.max,
+    windowStartMs: repeat.windowStartMs,
+    ...(options.details ?? {}),
+  });
+  return { quarantined: true, reason, suppressed: cooldown.suppressed };
+}
+
+function maybeQuarantineRepeatedRepairGuardBlock(
+  slug: string,
+  options: {
+    source: ProjectionOperationSource;
+    guardReason: string;
+    details?: Record<string, unknown>;
+    extras?: Record<string, unknown>;
+  },
+): { quarantined: boolean; reason?: string; suppressed: boolean } {
+  if (!slug) return { quarantined: false, suppressed: false };
+  if (!shouldCountTowardsRepairGuardEscalation(options.guardReason)) {
+    return { quarantined: false, suppressed: false };
+  }
+  const existingGate = getCollabQuarantineGateStatus(slug);
+  if (existingGate.active) {
+    return {
+      quarantined: true,
+      reason: existingGate.reason ?? 'COLLAB_AUTO_QUARANTINED',
+      suppressed: true,
+    };
+  }
+
+  const fingerprint = buildRepairGuardEscalationFingerprint(options.guardReason);
+  const cycleId = getOrStartProjectionRepairCycleId(slug);
+  const cooldown = registerPathologyCooldown(
+    collabRepairGuardLogCooldowns,
+    slug,
+    options.guardReason,
+    fingerprint,
+    Date.now(),
+    parsePositiveInt(
+      process.env.COLLAB_PROJECTION_PATHOLOGY_COOLDOWN_MS,
+      DEFAULT_PROJECTION_PATHOLOGY_COOLDOWN_MS,
+    ),
+  );
+  if (cooldown.suppressed) {
+    recordCollabLogSuppressed('repair_guard', options.guardReason);
+    logRepairGuardSuppressionSummary(slug, options.guardReason, cooldown.suppressedCount);
+  }
+
+  const breaker = noteRepairGuardEscalationPathology(slug, options.guardReason, fingerprint, cycleId);
+  if (!breaker.tripped) {
+    return { quarantined: false, suppressed: cooldown.suppressed };
+  }
+
+  const reason = 'projection_guard_repeated_blocker';
+  recordCollabPathologyQuarantine(reason, options.source);
+  registerAutoCollabQuarantine(slug, reason, {
+    source: options.source,
+    guardReason: options.guardReason,
+    count: breaker.count,
+    windowMs: breaker.windowMs,
+    max: breaker.max,
+    windowStartMs: breaker.windowStartMs,
+    ...(options.extras ?? {}),
+    ...(options.details ? { details: options.details } : {}),
+  });
+  return { quarantined: true, reason, suppressed: cooldown.suppressed };
+}
+
+export function maybeFastQuarantineProjectionPathology(
+  slug: string,
+  options: {
+    source: ProjectionOperationSource;
+    guardReason: string;
+    details?: Record<string, unknown>;
+    extras?: Record<string, unknown>;
+  },
+): { quarantined: boolean; reason?: string } {
+  if (!slug) return { quarantined: false };
+  if (!shouldFastQuarantineProjectionGuard(options.guardReason, options.details)) {
+    return { quarantined: false };
+  }
+  const existingGate = getCollabQuarantineGateStatus(slug);
+  if (existingGate.active) {
+    return {
+      quarantined: true,
+      reason: existingGate.reason ?? 'COLLAB_AUTO_QUARANTINED',
+    };
+  }
+  const quarantineReason = getFastQuarantineReasonForProjectionGuard(options.guardReason);
+  const fingerprint = buildProjectionPathologyFingerprint(quarantineReason, options.details, {
+    fastQuarantine: true,
+    source: options.source,
+    ...(options.extras ?? {}),
+  });
+  const cooldown = registerProjectionPathologyCooldown(
+    projectionPathologyCooldowns,
+    slug,
+    quarantineReason,
+    fingerprint,
+  );
+  if (!cooldown.suppressed) {
+    console.error('[collab] fast-quarantined pathological slug', {
+      slug,
+      source: options.source,
+      reason: quarantineReason,
+      guardReason: options.guardReason,
+      details: options.details,
+      ...(options.extras ?? {}),
+    });
+    recordProjectionGuardBlock(options.guardReason, options.source);
+    recordCollabPathologyQuarantine(options.guardReason, options.source);
+  }
+  registerAutoCollabQuarantine(slug, quarantineReason, {
+    source: options.source,
+    guardReason: options.guardReason,
+    ...(options.extras ?? {}),
+    ...(options.details ? { details: options.details } : {}),
+  });
+  return {
+    quarantined: true,
+    reason: quarantineReason,
+  };
+}
+
+function noteCollabRepairLoopPathology(slug: string): {
+  tripped: boolean;
+  count: number;
+  windowMs: number;
+  max: number;
+  windowStartMs: number;
+} {
+  const windowMs = parsePositiveInt(
+    process.env.COLLAB_REPAIR_LOOP_BREAKER_WINDOW_MS,
+    DEFAULT_COLLAB_REPAIR_LOOP_BREAKER_WINDOW_MS,
+  );
+  const max = parsePositiveInt(
+    process.env.COLLAB_REPAIR_LOOP_BREAKER_MAX,
+    DEFAULT_COLLAB_REPAIR_LOOP_BREAKER_MAX,
+  );
+  const now = Date.now();
+  let state = collabRepairLoopBreaker.get(slug);
+  if (!state || (now - state.windowStartMs) > windowMs) {
+    state = { windowStartMs: now, count: 0 };
+  }
+  state.count += 1;
+  collabRepairLoopBreaker.set(slug, state);
+  const tripped = state.count >= max;
+  if (tripped) {
+    collabRepairLoopBreaker.delete(slug);
+  }
+  return {
+    tripped,
+    count: state.count,
+    windowMs,
+    max,
+    windowStartMs: state.windowStartMs,
+  };
+}
+
+function maybeQuarantineCollabRepairLoop(
+  slug: string,
+  pathology: 'empty_fragment_repair' | 'empty_fragment_projection' | 'projection_guard_block',
+  details: Record<string, unknown> = {},
+): { quarantined: boolean; reason?: string } {
+  if (!slug) return { quarantined: false };
+  const gate = getCollabQuarantineGateStatus(slug);
+  if (gate.active) {
+    return { quarantined: true, reason: gate.reason ?? 'COLLAB_AUTO_QUARANTINED' };
+  }
+  if (!shouldCountTowardsCollabRepairLoopBreaker(pathology, details)) {
+    return { quarantined: false };
+  }
+  const breaker = noteCollabRepairLoopPathology(slug);
+  if (!breaker.tripped) {
+    return { quarantined: false };
+  }
+  const reason = 'collab_repair_loop_breaker';
+  registerAutoCollabQuarantine(slug, reason, {
+    pathology,
+    count: breaker.count,
+    windowMs: breaker.windowMs,
+    max: breaker.max,
+    windowStartMs: breaker.windowStartMs,
+    ...details,
+  });
+  return { quarantined: true, reason };
+}
+
+function getProjectionHealthForSlug(slug: string): ProjectedDocumentRow['projection_health'] | null {
+  return getProjectedDocumentBySlug(slug)?.projection_health ?? null;
+}
+
+function registerLargeDocPathologyCooldown(
+  slug: string,
+  reason: string,
+  fingerprint: string,
+): ProjectionPathologyCooldownResult {
+  return registerPathologyCooldown(
+    largeDocPathologyCooldowns,
+    `${slug}:${reason}`,
+    reason,
+    fingerprint,
+    Date.now(),
+    parsePositiveInt(
+      process.env.COLLAB_PROJECTION_PATHOLOGY_COOLDOWN_MS,
+      DEFAULT_PROJECTION_PATHOLOGY_COOLDOWN_MS,
+    ),
+  );
+}
+
+function logLargeDocSuppressionSummary(slug: string, reason: string, suppressedCount: number): void {
+  if (!shouldEmitSuppressionSummary(suppressedCount)) return;
+  console.warn('[collab] suppressed repeated large-doc pathology logs', {
+    slug,
+    reason,
+    suppressedCount,
+  });
+}
+
+function noteRepeatedSuspiciousDocPathology(
+  state: Map<string, RepeatedSuspiciousDocState>,
+  slug: string,
+): { tripped: boolean; count: number; windowMs: number; max: number } {
+  const windowMs = parsePositiveInt(
+    process.env.COLLAB_SUSPICIOUS_DOC_REPEAT_WINDOW_MS,
+    DEFAULT_SUSPICIOUS_DOC_REPEAT_WINDOW_MS,
+  );
+  const max = parsePositiveInt(
+    process.env.COLLAB_SUSPICIOUS_DOC_REPEAT_MAX,
+    DEFAULT_SUSPICIOUS_DOC_REPEAT_MAX,
+  );
+  const now = Date.now();
+  let current = state.get(slug);
+  if (!current || (now - current.windowStartMs) > windowMs) {
+    current = {
+      windowStartMs: now,
+      count: 0,
+    };
+  }
+  current.count += 1;
+  state.set(slug, current);
+  const tripped = current.count >= max;
+  if (tripped) {
+    state.delete(slug);
+  }
+  return {
+    tripped,
+    count: current.count,
+    windowMs,
+    max,
+  };
+}
+
+function quarantineLargeDocPathology(
+  slug: string,
+  reason: string,
+  source: string,
+  details?: Record<string, unknown>,
+): void {
+  recordCollabPathologyQuarantine(reason, source || 'unknown');
+  registerAutoCollabQuarantine(slug, reason, {
+    source,
+    ...(details ?? {}),
+  });
+}
+
+function maybeQuarantineRepeatedLargeDocPathology(
+  slug: string,
+  kind: 'legacy_reseed' | 'pending_delta_clear',
+  options: {
+    source: string;
+    details?: Record<string, unknown>;
+  },
+): { quarantined: boolean; reason?: string; suppressed: boolean } {
+  if (!slug) return { quarantined: false, suppressed: false };
+  const gate = getCollabQuarantineGateStatus(slug);
+  if (gate.active) {
+    return {
+      quarantined: true,
+      reason: gate.reason ?? 'COLLAB_AUTO_QUARANTINED',
+      suppressed: true,
+    };
+  }
+  const tracker = kind === 'legacy_reseed'
+    ? repeatedLegacyReseedAttempts
+    : repeatedPendingDeltaClearAttempts;
+  const reason = kind === 'legacy_reseed'
+    ? 'legacy_reseed_repeated_blocker'
+    : 'pending_delta_clear_repeated_blocker';
+  const fingerprint = stableStringify({
+    family: kind,
+    reason,
+    details: options.details ?? null,
+  });
+  const cooldown = registerLargeDocPathologyCooldown(slug, reason, fingerprint);
+  if (cooldown.suppressed) {
+    recordCollabLogSuppressed('large_doc', reason);
+    logLargeDocSuppressionSummary(slug, reason, cooldown.suppressedCount);
+  }
+  const repeat = noteRepeatedSuspiciousDocPathology(tracker, slug);
+  if (!repeat.tripped) {
+    return { quarantined: false, suppressed: cooldown.suppressed };
+  }
+  quarantineLargeDocPathology(slug, reason, options.source, {
+    count: repeat.count,
+    windowMs: repeat.windowMs,
+    max: repeat.max,
+    ...(options.details ?? {}),
+  });
+  return { quarantined: true, reason, suppressed: cooldown.suppressed };
+}
+
+function getLargeDocWriteWindowState(slug: string, bytes: number): {
+  tripped: boolean;
+  totalBytes: number;
+  count: number;
+  windowMs: number;
+  maxBytes: number;
+} {
+  const windowMs = parsePositiveInt(
+    process.env.COLLAB_MAX_SLUG_YJS_WINDOW_MS,
+    DEFAULT_MAX_SLUG_YJS_WINDOW_MS,
+  );
+  const maxBytes = parsePositiveInt(
+    process.env.COLLAB_MAX_SLUG_YJS_BYTES_PER_WINDOW,
+    DEFAULT_MAX_SLUG_YJS_BYTES_PER_WINDOW,
+  );
+  const now = Date.now();
+  let state = slugYjsWriteWindows.get(slug);
+  if (!state || (now - state.windowStartMs) > windowMs) {
+    state = {
+      windowStartMs: now,
+      totalBytes: 0,
+      count: 0,
+    };
+  }
+  state.totalBytes += Math.max(0, bytes);
+  state.count += 1;
+  slugYjsWriteWindows.set(slug, state);
+  return {
+    tripped: state.totalBytes > maxBytes,
+    totalBytes: state.totalBytes,
+    count: state.count,
+    windowMs,
+    maxBytes,
+  };
+}
+
+function maybeQuarantineOversizedYjsWriteBurst(
+  slug: string,
+  bytes: number,
+  source: string,
+  sourceActor?: string | null,
+): { quarantined: boolean; reason?: string } {
+  if (!slug || bytes <= 0) return { quarantined: false };
+  const gate = getCollabQuarantineGateStatus(slug);
+  if (gate.active) {
+    return {
+      quarantined: true,
+      reason: gate.reason ?? 'COLLAB_AUTO_QUARANTINED',
+    };
+  }
+  const window = getLargeDocWriteWindowState(slug, bytes);
+  if (!window.tripped) {
+    return { quarantined: false };
+  }
+  const reason = 'oversized_yjs_write_burst';
+  const fingerprint = stableStringify({
+    family: 'oversized_yjs_write_burst',
+    source,
+    sourceActor: sourceActor ?? null,
+    totalBytes: window.totalBytes,
+    maxBytes: window.maxBytes,
+    count: window.count,
+  });
+  const cooldown = registerLargeDocPathologyCooldown(slug, reason, fingerprint);
+  if (cooldown.suppressed) {
+    recordCollabLogSuppressed('large_doc', reason);
+    logLargeDocSuppressionSummary(slug, reason, cooldown.suppressedCount);
+  } else {
+    console.error('[collab] quarantining slug after oversized persisted Yjs write burst', {
+      slug,
+      source,
+      sourceActor: sourceActor ?? null,
+      bytes,
+      totalBytes: window.totalBytes,
+      maxBytes: window.maxBytes,
+      count: window.count,
+      windowMs: window.windowMs,
+    });
+  }
+  recordPersistedYjsUpdateBytes(bytes, source, 'quarantined', reason);
+  quarantineLargeDocPathology(slug, reason, source, {
+    bytes,
+    totalBytes: window.totalBytes,
+    maxBytes: window.maxBytes,
+    count: window.count,
+    windowMs: window.windowMs,
+    sourceActor: sourceActor ?? null,
+  });
+  return { quarantined: true, reason };
+}
+
+export function quarantineOversizedYjsUpdate(
+  slug: string,
+  options: {
+    bytes: number;
+    limitBytes: number;
+    source: string;
+    sourceActor?: string | null;
+  },
+): { quarantined: boolean; reason: string } {
+  const reason = 'oversized_yjs_update';
+  const fingerprint = stableStringify({
+    family: 'oversized_yjs_update',
+    source: options.source,
+    sourceActor: options.sourceActor ?? null,
+    bytes: options.bytes,
+    limitBytes: options.limitBytes,
+  });
+  const cooldown = registerLargeDocPathologyCooldown(slug, reason, fingerprint);
+  if (cooldown.suppressed) {
+    recordCollabLogSuppressed('large_doc', reason);
+    logLargeDocSuppressionSummary(slug, reason, cooldown.suppressedCount);
+  } else {
+    console.error('[collab] blocked oversized persisted Yjs update', {
+      slug,
+      source: options.source,
+      sourceActor: options.sourceActor ?? null,
+      bytes: options.bytes,
+      limitBytes: options.limitBytes,
+    });
+  }
+  recordPersistedYjsUpdateBytes(options.bytes, options.source, 'quarantined', reason);
+  quarantineLargeDocPathology(slug, reason, options.source, {
+    bytes: options.bytes,
+    limitBytes: options.limitBytes,
+    sourceActor: options.sourceActor ?? null,
+  });
+  return { quarantined: true, reason };
+}
+
+type DocumentIntegrityWarning = {
+  topLevelBlockCount: number;
+  headingSequenceHash: string;
+  repeatedHeadings: string[];
+};
+
+function classifyIntegrityWarningReason(integrity: DocumentIntegrityWarning): string | null {
+  if (integrity.topLevelBlockCount >= DEFAULT_INTEGRITY_WARNING_BLOCK_EXPLOSION) {
+    return 'integrity_warning_block_explosion';
+  }
+  if (
+    integrity.topLevelBlockCount >= DEFAULT_INTEGRITY_WARNING_REPEAT_BLOCK_THRESHOLD
+    && integrity.repeatedHeadings.length >= DEFAULT_INTEGRITY_WARNING_REPEAT_HEADING_THRESHOLD
+  ) {
+    return 'integrity_warning_repeated_heading_loop';
+  }
+  return null;
+}
+
+function buildIntegrityWarningFingerprint(
+  reason: string,
+  integrity: DocumentIntegrityWarning,
+): string {
+  return stableStringify({
+    family: 'integrity_warning',
+    reason: reason || 'integrity_warning_observed',
+    topLevelBlockCount: integrity.topLevelBlockCount,
+    headingSequenceHash: integrity.headingSequenceHash,
+    repeatedHeadings: integrity.repeatedHeadings,
+  });
+}
+
+function logIntegrityWarningSuppressionSummary(
+  slug: string,
+  reason: string,
+  suppressedCount: number,
+): void {
+  if (!shouldEmitSuppressionSummary(suppressedCount)) return;
+  console.warn('[collab] suppressed repeated integrity warning logs', {
+    slug,
+    reason,
+    suppressedCount,
+  });
+}
+
+export function noteDocumentIntegrityWarning(
+  slug: string,
+  options: {
+    actor: string;
+    revision: number;
+    integrity: DocumentIntegrityWarning;
+    source?: string;
+  },
+): { severe: boolean; quarantined: boolean; reason: string | null; suppressed: boolean } {
+  if (!slug) {
+    return {
+      severe: false,
+      quarantined: false,
+      reason: null,
+      suppressed: false,
+    };
+  }
+  const source = options.source ?? 'rest-put';
+  const severityReason = classifyIntegrityWarningReason(options.integrity);
+  const fingerprint = buildIntegrityWarningFingerprint(
+    severityReason ?? 'integrity_warning_observed',
+    options.integrity,
+  );
+  const cooldown = registerPathologyCooldown(
+    integrityWarningCooldowns,
+    slug,
+    severityReason ?? 'integrity_warning_observed',
+    fingerprint,
+    Date.now(),
+    parsePositiveInt(
+      process.env.COLLAB_INTEGRITY_WARNING_LOG_COOLDOWN_MS,
+      DEFAULT_INTEGRITY_WARNING_LOG_COOLDOWN_MS,
+    ),
+  );
+  if (cooldown.suppressed) {
+    recordCollabLogSuppressed('integrity_warning', severityReason ?? 'integrity_warning_observed');
+    logIntegrityWarningSuppressionSummary(
+      slug,
+      severityReason ?? 'integrity_warning_observed',
+      cooldown.suppressedCount,
+    );
+  } else {
+    console.warn('[document.updated.integrity_warning]', {
+      slug,
+      actor: options.actor,
+      revision: options.revision,
+      ...options.integrity,
+    });
+  }
+
+  if (!severityReason) {
+    return {
+      severe: false,
+      quarantined: false,
+      reason: null,
+      suppressed: cooldown.suppressed,
+    };
+  }
+
+  const gate = getCollabQuarantineGateStatus(slug);
+  if (gate.active) {
+    return {
+      severe: true,
+      quarantined: true,
+      reason: gate.reason ?? severityReason,
+      suppressed: cooldown.suppressed,
+    };
+  }
+
+  recordCollabPathologyQuarantine(severityReason, source);
+  registerAutoCollabQuarantine(slug, severityReason, {
+    source,
+    actor: options.actor,
+    revision: options.revision,
+    topLevelBlockCount: options.integrity.topLevelBlockCount,
+    headingSequenceHash: options.integrity.headingSequenceHash,
+    repeatedHeadings: options.integrity.repeatedHeadings,
+  });
+  return {
+    severe: true,
+    quarantined: true,
+    reason: severityReason,
+    suppressed: cooldown.suppressed,
+  };
+}
+
+function shouldBlockLegacyReseed(slug: string): { blocked: boolean; reason: string | null } {
+  if (!slug) return { blocked: false, reason: null };
+  if (isHotSlugQuarantined(slug)) {
+    return { blocked: true, reason: 'hot_slug_quarantined' };
+  }
+  const gate = getCollabQuarantineGateStatus(slug);
+  if (gate.active) {
+    return { blocked: true, reason: gate.reason ?? 'COLLAB_AUTO_QUARANTINED' };
+  }
+  const projectionHealth = getProjectionHealthForSlug(slug);
+  if (projectionHealth && projectionHealth !== 'healthy') {
+    return { blocked: true, reason: projectionHealth };
+  }
+  return { blocked: false, reason: null };
+}
+
+function shouldBlockAutomaticRepairForSuspiciousDoc(slug: string): { blocked: boolean; reason: string | null } {
+  if (!slug) return { blocked: false, reason: null };
+  if (isHotSlugQuarantined(slug)) {
+    return { blocked: true, reason: 'hot_slug_quarantined' };
+  }
+  const gate = getCollabQuarantineGateStatus(slug);
+  if (gate.active) {
+    return { blocked: true, reason: gate.reason ?? 'COLLAB_AUTO_QUARANTINED' };
+  }
+  return { blocked: false, reason: null };
+}
+
+function maybeRecordBlockedLegacyReseed(
+  slug: string,
+  source: string,
+  row: DocumentRow,
+): void {
+  const gate = shouldBlockLegacyReseed(slug);
+  if (!gate.blocked) return;
+  recordSuspiciousDocBlocked('legacy_reseed', gate.reason ?? 'unknown');
+  const details = {
+    source,
+    blockedReason: gate.reason ?? 'unknown',
+    markdownChars: (row.markdown ?? '').length,
+    updatedAt: row.updated_at ?? null,
+    projectionHealth: getProjectionHealthForSlug(slug),
+  };
+  const quarantine = maybeQuarantineRepeatedLargeDocPathology(slug, 'legacy_reseed', {
+    source,
+    details,
+  });
+  recordLegacyReseedAttempt(quarantine.quarantined ? 'quarantined' : 'blocked', source);
+  if (!quarantine.suppressed) {
+    console.warn('[collab] blocked legacy Yjs reseed for unhealthy doc', {
+      slug,
+      ...details,
+      autoQuarantined: quarantine.quarantined,
+    });
+  }
+}
+
 async function deriveMarkdownProjectionFromFragment(doc: Y.Doc): Promise<string | null> {
   if ((process.env.COLLAB_FORCE_DERIVE_FRAGMENT_MARKDOWN_FAILURE || '').trim() === '1') {
     return null;
@@ -1552,22 +3332,187 @@ async function deriveMarkdownProjectionFromFragment(doc: Y.Doc): Promise<string 
   }
 }
 
+function buildPersistedDocCacheKey(
+  snapshot: { version: number; snapshot: Uint8Array } | null,
+  updates: Array<{ seq: number; update: Uint8Array }>,
+): PersistedDocCacheKey | null {
+  if (!snapshot && updates.length === 0) return null;
+  return {
+    fingerprint: snapshot
+      ? `${snapshot.version}:${snapshot.snapshot.byteLength}`
+      : 'none',
+    updateCount: updates.length,
+  };
+}
+
+function readPersistedDocCacheKey(slug: string): PersistedDocCacheKey | null {
+  const snapshot = getLatestYSnapshot(slug);
+  const updates = snapshot
+    ? getYUpdatesAtOrAfter(slug, snapshot.version)
+    : getYUpdatesAfter(slug, 0);
+  return buildPersistedDocCacheKey(snapshot, updates);
+}
+
+function getPersistedDocCacheEntry(
+  slug: string,
+  key: PersistedDocCacheKey,
+  requiredHydration: PersistedDocCacheHydration = 'sync',
+): PersistedDocCacheEntry | null {
+  const cached = persistedDocCache.get(slug);
+  if (!cached) return null;
+  if (cached.fingerprint !== key.fingerprint || cached.updateCount !== key.updateCount) {
+    persistedDocCache.delete(slug);
+    return null;
+  }
+  if (requiredHydration === 'async' && cached.hydration !== 'async') {
+    return null;
+  }
+  touchDoc(slug);
+  return cached;
+}
+
+function setPersistedDocCacheEntry(
+  slug: string,
+  ydoc: Y.Doc,
+  key: PersistedDocCacheKey,
+  hydration: PersistedDocCacheHydration,
+): void {
+  persistedDocCache.set(slug, {
+    ydoc,
+    fingerprint: key.fingerprint,
+    updateCount: key.updateCount,
+    hydration,
+  });
+  touchDoc(slug);
+}
+
+function refreshPersistedDocCacheFromDb(
+  slug: string,
+  ydoc: Y.Doc,
+  hydration: PersistedDocCacheHydration,
+): void {
+  const key = readPersistedDocCacheKey(slug);
+  if (!key) {
+    persistedDocCache.delete(slug);
+    touchDoc(slug);
+    return;
+  }
+  setPersistedDocCacheEntry(slug, ydoc, key, hydration);
+}
+
+async function resolveLoadedDocFragmentMarkdown(
+  slug: string,
+  ydoc: Y.Doc,
+  options: {
+    allowRecovery?: boolean;
+    refreshCache?: boolean;
+    sourceActor?: string;
+  } = {},
+): Promise<{
+  markdown: string | null;
+  source: 'fragment' | 'none';
+  refreshedCache: boolean;
+  fragmentEmpty: boolean;
+  yTextMarkdown: string;
+}> {
+  const allowRecovery = options.allowRecovery !== false;
+  const refreshCache = options.refreshCache === true;
+  const sourceActor = options.sourceActor ?? 'server-fragment-authority';
+  if (allowRecovery) {
+    await ensureFragmentSeededFromMarkdownIfEmpty(slug, ydoc, sourceActor);
+  }
+  const fragment = ydoc.getXmlFragment('prosemirror');
+  const fragmentEmpty = isProsemirrorFragmentStructurallyEmpty(fragment);
+  const yTextMarkdown = stripEphemeralCollabSpans(ydoc.getText('markdown').toString());
+  const derivedMarkdown = await deriveMarkdownProjectionFromFragment(ydoc);
+  if (derivedMarkdown === null) {
+    return {
+      markdown: null,
+      source: 'none',
+      refreshedCache: false,
+      fragmentEmpty,
+      yTextMarkdown,
+    };
+  }
+  let refreshedCache = false;
+  if (refreshCache && derivedMarkdown !== yTextMarkdown) {
+    recordFragmentCacheMismatch(sourceActor);
+    ydoc.transact(() => {
+      applyYTextDiff(ydoc.getText('markdown'), derivedMarkdown);
+    }, sourceActor);
+    touchDoc(slug);
+    refreshedCache = true;
+  } else if (derivedMarkdown !== yTextMarkdown) {
+    recordFragmentCacheMismatch(sourceActor);
+  }
+  return {
+    markdown: derivedMarkdown,
+    source: 'fragment',
+    refreshedCache,
+    fragmentEmpty,
+    yTextMarkdown,
+  };
+}
+async function sampleYDocMarkdownForVerification(
+  slug: string,
+  ydoc: Y.Doc,
+): Promise<{ markdown: string | null; source: 'ytext' | 'fragment' | 'none' }> {
+  try {
+    const resolved = await resolveLoadedDocFragmentMarkdown(slug, ydoc, {
+      allowRecovery: true,
+      refreshCache: false,
+      sourceActor: 'server-verification-fragment',
+    });
+    if (resolved.markdown !== null) {
+      return { markdown: resolved.markdown, source: 'fragment' };
+    }
+    return { markdown: null, source: 'none' };
+  } catch {
+    return { markdown: null, source: 'none' };
+  }
+}
+
 function ensureFragmentSeededFromMarkdownIfEmptySync(
   slug: string,
   ydoc: Y.Doc,
   sourceActor: string,
 ): boolean {
+  if (shouldBlockAutomaticRepairForSuspiciousDoc(slug).blocked) return false;
+  if (fragmentSeedAttempted.has(ydoc)) return false;
   const fragment = ydoc.getXmlFragment('prosemirror');
   if (!isProsemirrorFragmentStructurallyEmpty(fragment)) return false;
+  fragmentSeedAttempted.add(ydoc);
 
   const markdown = stripEphemeralCollabSpans(ydoc.getText('markdown').toString());
+
+  // If the Yjs text has content but the canonical DB row is empty, the user
+  // intentionally deleted everything.  Don't resurrect from stale Yjs text
+  // (#345-#348 content resurrection on reconnect).  Also clear the stale
+  // Yjs text field so it doesn't leak into subsequent reads.
+  if (markdown.length > 0) {
+    const canonicalRow = getDocumentBySlug(slug);
+    if (canonicalRow && (canonicalRow.markdown ?? '').trim().length === 0) {
+      ydoc.transact(() => {
+        const text = ydoc.getText('markdown');
+        if (text.length > 0) text.delete(0, text.length);
+      }, sourceActor);
+      return false;
+    }
+  }
   ydoc.transact(() => {
     seedFragmentFromLegacyMarkdownFallback(ydoc, markdown);
   }, sourceActor);
   ensureFragmentEditTracking(ydoc).dirty = false;
   touchDoc(slug);
+  if (markdown.length === 0) {
+    return true;
+  }
   console.warn('[collab] repaired empty prosemirror fragment from markdown text', {
     slug,
+    markdownChars: markdown.length,
+    mode: 'fallback',
+  });
+  maybeQuarantineCollabRepairLoop(slug, 'empty_fragment_repair', {
     markdownChars: markdown.length,
     mode: 'fallback',
   });
@@ -1579,15 +3524,45 @@ async function ensureFragmentSeededFromMarkdownIfEmpty(
   ydoc: Y.Doc,
   sourceActor: string,
 ): Promise<boolean> {
+  if (shouldBlockAutomaticRepairForSuspiciousDoc(slug).blocked) return false;
+  if (fragmentSeedAttempted.has(ydoc)) return false;
   const fragment = ydoc.getXmlFragment('prosemirror');
   if (!isProsemirrorFragmentStructurallyEmpty(fragment)) return false;
+  fragmentSeedAttempted.add(ydoc);
 
   const markdown = stripEphemeralCollabSpans(ydoc.getText('markdown').toString());
+
+  // If the Yjs text has content but the canonical DB row is empty, the user
+  // intentionally deleted everything.  Don't resurrect (#345-#348).
+  // Also clear the stale Yjs text field.
+  if (markdown.length > 0) {
+    const canonicalRow = getDocumentBySlug(slug);
+    if (canonicalRow && (canonicalRow.markdown ?? '').trim().length === 0) {
+      ydoc.transact(() => {
+        const text = ydoc.getText('markdown');
+        if (text.length > 0) text.delete(0, text.length);
+      }, sourceActor);
+      return false;
+    }
+  }
+
+  if (markdown.length === 0) {
+    ydoc.transact(() => {
+      seedFragmentFromLegacyMarkdownFallback(ydoc, markdown);
+    }, sourceActor);
+    ensureFragmentEditTracking(ydoc).dirty = false;
+    touchDoc(slug);
+    return true;
+  }
   await seedFragmentFromLegacyMarkdown(ydoc, markdown);
   ensureFragmentEditTracking(ydoc).dirty = false;
   touchDoc(slug);
   console.warn('[collab] repaired empty prosemirror fragment from markdown text', {
     slug,
+    markdownChars: markdown.length,
+    mode: 'headless',
+  });
+  maybeQuarantineCollabRepairLoop(slug, 'empty_fragment_repair', {
     markdownChars: markdown.length,
     mode: 'headless',
   });
@@ -1598,22 +3573,108 @@ async function refreshMarkdownTextFromFragment(
   slug: string,
   ydoc: Y.Doc,
   sourceActor: string,
-): Promise<{ deriveFailed: boolean; refreshed: boolean; markdown: string | null }> {
-  const fragmentState = ensureFragmentEditTracking(ydoc);
-  if (!fragmentState.dirty) {
-    await ensureFragmentSeededFromMarkdownIfEmpty(slug, ydoc, 'server-fragment-repair');
+): Promise<{
+  deriveFailed: boolean;
+  refreshed: boolean;
+  markdown: string | null;
+  blockedSuspiciousCollapse?: boolean;
+}> {
+  if (isHotSlugQuarantined(slug)) {
+    return { deriveFailed: false, refreshed: false, markdown: null };
   }
+  if (getCollabQuarantineGateStatus(slug).active) {
+    setDocumentProjectionHealth(slug, 'quarantined');
+    return { deriveFailed: false, refreshed: false, markdown: null };
+  }
+  const fragmentState = ensureFragmentEditTracking(ydoc);
   const currentRowMarkdown = getDocumentBySlug(slug)?.markdown ?? '';
-  const currentMarkdown = ydoc.getText('markdown').toString();
-  const derivedFragmentMarkdown = await deriveMarkdownProjectionFromFragment(ydoc);
+  const resolved = await resolveLoadedDocFragmentMarkdown(slug, ydoc, {
+    allowRecovery: true,
+    refreshCache: false,
+    sourceActor,
+  });
+  const currentMarkdown = resolved.yTextMarkdown;
+  const derivedFragmentMarkdown = resolved.markdown;
   if (derivedFragmentMarkdown === null) {
     return { deriveFailed: true, refreshed: false, markdown: null };
   }
   if (derivedFragmentMarkdown !== currentMarkdown) {
     const fragmentMatchesRow = derivedFragmentMarkdown === currentRowMarkdown;
     const projectionMatchesRow = currentMarkdown === currentRowMarkdown;
+    if (!fragmentState.dirty && !projectionMatchesRow && fragmentMatchesRow) {
+      const synced = await syncFragmentFromMarkdownText(slug, ydoc, currentMarkdown, 'server-markdown-refresh');
+      fragmentState.dirty = false;
+      return {
+        deriveFailed: false,
+        refreshed: synced.markdown !== currentMarkdown,
+        markdown: synced.markdown,
+      };
+    }
     if (projectionMatchesRow && !fragmentMatchesRow && !fragmentState.dirty) {
       return { deriveFailed: false, refreshed: false, markdown: currentMarkdown };
+    }
+    if (!fragmentState.dirty) {
+      const suspiciousCollapse = evaluateNonDirtyFragmentRefreshCollapse(
+        currentMarkdown,
+        derivedFragmentMarkdown,
+        currentRowMarkdown,
+      );
+      if (suspiciousCollapse.blocked) {
+        recordProjectionWipe(suspiciousCollapse.collapseKind);
+        const driftQuarantine = maybeQuarantineRepeatedFragmentDrift(slug, {
+          source: 'persist',
+          event: 'projection_wipe',
+          details: {
+            sourceActor,
+            currentChars: suspiciousCollapse.currentChars,
+            derivedChars: suspiciousCollapse.derivedChars,
+            rowChars: suspiciousCollapse.rowChars,
+            shrinkRatio: suspiciousCollapse.shrinkRatio,
+            fragmentMatchesRow,
+            projectionMatchesRow,
+          },
+        });
+        const incidentData = {
+          sourceActor,
+          collapseKind: suspiciousCollapse.collapseKind,
+          currentChars: suspiciousCollapse.currentChars,
+          derivedChars: suspiciousCollapse.derivedChars,
+          rowChars: suspiciousCollapse.rowChars,
+          shrinkRatio: suspiciousCollapse.shrinkRatio,
+          fragmentMatchesRow,
+          projectionMatchesRow,
+          autoQuarantined: driftQuarantine.quarantined,
+          autoQuarantineReason: driftQuarantine.reason ?? null,
+        };
+        console.warn('[collab] blocked non-dirty fragment refresh collapse', {
+          slug,
+          ...incidentData,
+        });
+        traceServerIncident({
+          slug,
+          subsystem: 'collab',
+          level: 'warn',
+          eventType: 'fragment_refresh_collapse.blocked',
+          message: 'Blocked non-dirty fragment refresh collapse before Y.Text overwrite',
+          data: incidentData,
+        });
+        if (driftQuarantine.quarantined) {
+          setDocumentProjectionHealth(slug, 'quarantined');
+        } else {
+          setDocumentProjectionHealth(slug, 'projection_stale');
+          recordProjectionMarkedStale('fragment_markdown_drift', 'persist');
+        }
+        invalidateLoadedCollabDocument(slug);
+        if (!driftQuarantine.quarantined) {
+          queueProjectionRepair(slug, 'fragment_markdown_drift');
+        }
+        return {
+          deriveFailed: false,
+          refreshed: false,
+          markdown: currentMarkdown,
+          blockedSuspiciousCollapse: true,
+        };
+      }
     }
     ydoc.transact(() => {
       applyYTextDiff(ydoc.getText('markdown'), derivedFragmentMarkdown);
@@ -1625,11 +3686,67 @@ async function refreshMarkdownTextFromFragment(
   return { deriveFailed: false, refreshed: false, markdown: derivedFragmentMarkdown };
 }
 
+async function syncFragmentFromMarkdownText(
+  slug: string,
+  ydoc: Y.Doc,
+  markdown: string,
+  sourceActor: string,
+): Promise<{ markdown: string }> {
+  const sanitizedMarkdown = stripEphemeralCollabSpans(markdown);
+  let parsedDoc: ProseMirrorNode | null = null;
+  let parsedMode: string | null = null;
+  let parseError: unknown = null;
+
+  try {
+    const parser = await getHeadlessMilkdownParser();
+    const parsed = parseMarkdownWithHtmlFallback(parser, sanitizedMarkdown);
+    parsedDoc = parsed.doc;
+    parsedMode = parsed.mode;
+    if (!parsedDoc) {
+      parseError = parsed.error ?? new Error('unknown_markdown_parse_error');
+    }
+  } catch (error) {
+    parseError = error;
+  }
+
+  ydoc.transact(() => {
+    if (parsedDoc) {
+      replaceYXmlFragment(ydoc.getXmlFragment('prosemirror'), parsedDoc);
+    } else {
+      seedFragmentFromLegacyMarkdownFallback(ydoc, sanitizedMarkdown);
+    }
+    if (sanitizedMarkdown !== markdown) {
+      applyYTextDiff(ydoc.getText('markdown'), sanitizedMarkdown);
+    }
+  }, sourceActor);
+
+  touchDoc(slug);
+
+  if (parsedDoc && parsedMode && parsedMode !== 'original') {
+    console.warn('[collab] synced fragment from markdown via HTML fallback mode', {
+      slug,
+      mode: parsedMode,
+    });
+  } else if (!parsedDoc) {
+    console.warn('[collab] synced fragment from markdown via heuristic fallback after parse failure', {
+      slug,
+      error: summarizeParseError(parseError),
+    });
+  }
+
+  return { markdown: sanitizedMarkdown };
+}
+
 async function repairProjectionFromFragment(
   slug: string,
   reasons: string[],
   source: 'repair' | 'startup' = 'repair',
 ): Promise<'success' | 'retry' | 'stop'> {
+  const suspiciousGate = shouldBlockAutomaticRepairForSuspiciousDoc(slug);
+  if (suspiciousGate.blocked) {
+    recordProjectionRepair('skipped', reasons.join('|') || suspiciousGate.reason || 'quarantined');
+    return 'stop';
+  }
   const row = getDocumentBySlug(slug);
   const projectedRow = getProjectedDocumentBySlug(slug);
   if (!row || row.share_state === 'DELETED') {
@@ -1641,7 +3758,18 @@ async function repairProjectionFromFragment(
   const persistedState = readPersistedDocState(slug);
   let ydoc = persistedState.ydoc;
   if (liveDoc) {
-    const dbMissingLive = Y.encodeStateAsUpdate(persistedState.ydoc, Y.encodeStateVector(liveDoc));
+    const comparablePersistedDoc = buildComparableAuthoritativeDoc(
+      persistedState.authoritativeSnapshot,
+      persistedState.ydoc,
+    );
+    const comparableLiveDoc = buildComparableAuthoritativeDoc(
+      persistedState.authoritativeSnapshot,
+      liveDoc,
+    );
+    const dbMissingLive = Y.encodeStateAsUpdate(
+      comparablePersistedDoc,
+      Y.encodeStateVector(comparableLiveDoc),
+    );
     if (dbMissingLive.byteLength === 0) {
       ydoc = liveDoc;
     }
@@ -1656,7 +3784,12 @@ async function repairProjectionFromFragment(
       reasons,
       rowChars: row.markdown.length,
     });
-    return 'retry';
+    const quarantine = maybeQuarantineCollabRepairLoop(slug, 'empty_fragment_projection', {
+      source,
+      reasons,
+      rowChars: row.markdown.length,
+    });
+    return quarantine.quarantined ? 'stop' : 'retry';
   }
   const derivedMarkdown = await deriveMarkdownProjectionFromFragment(ydoc);
   if (derivedMarkdown === null) {
@@ -1680,35 +3813,117 @@ async function repairProjectionFromFragment(
       }
     }
     recordProjectionRepair('skipped', reasons.join('|') || 'already_converged');
-    clearProjectionPathologyCooldown(slug);
+    clearAllSlugPathologyCooldowns(slug);
     return 'success';
   }
 
   const safety = evaluateProjectionSafety(row.markdown, derivedMarkdown, ydoc);
   if (!safety.safe) {
     const reason = safety.reason || 'unknown';
-    const fingerprint = buildProjectionPathologyFingerprint(reason, safety.details, {
-      baselineChars: row.markdown.length,
-      candidateChars: derivedMarkdown.length,
-      source,
-    });
-    const pathology = registerProjectionPathologyCooldown(
-      projectionPathologyCooldowns,
-      slug,
-      reason,
-      fingerprint,
+    const shouldReloadSmallRepairReplay = (
+      source === 'repair'
+      && reason === 'pathological_repeat'
+      && row.markdown.length < DEFAULT_PATHOLOGICAL_REPEAT_MIN_BASE_CHARS
     );
-    if (!pathology.suppressed) {
+    if (shouldReloadSmallRepairReplay) {
       recordProjectionGuardBlock(reason, source);
-      recordProjectionRepair('failure', reason || reasons.join('|') || 'repair_guard_blocked');
-      console.error('[collab] projection repair blocked by guardrail', {
-        slug,
+      const repairLoopQuarantine = maybeQuarantineCollabRepairLoop(slug, 'projection_guard_block', {
+        source,
+        guardReason: reason,
         reasons,
-        guardReason: safety.reason,
+        details: safety.details,
+        baselineChars: row.markdown.length,
+        candidateChars: derivedMarkdown.length,
+      });
+      if (!repairLoopQuarantine.quarantined) {
+        recordProjectionRepair('failure', 'small_pathological_repeat_reload');
+        console.warn('[collab] rejected small pathological replay during projection repair; reloading live doc from canonical state', {
+          slug,
+          reasons,
+          guardReason: reason,
+          baselineChars: row.markdown.length,
+          candidateChars: derivedMarkdown.length,
+          details: safety.details,
+        });
+        invalidateLoadedCollabDocument(slug);
+        return 'stop';
+      }
+      recordProjectionRepair('failure', repairLoopQuarantine.reason ?? reason);
+      return 'stop';
+    }
+    const fastQuarantine = maybeFastQuarantineProjectionPathology(slug, {
+      source,
+      guardReason: reason,
+      details: safety.details,
+      extras: {
+        reasons,
+        baselineChars: row.markdown.length,
+        candidateChars: derivedMarkdown.length,
+      },
+    });
+    if (fastQuarantine.quarantined) {
+      recordProjectionRepair('failure', fastQuarantine.reason ?? reason);
+      return 'stop';
+    }
+    const repairGuardQuarantine = maybeQuarantineRepeatedRepairGuardBlock(slug, {
+      source,
+      guardReason: reason,
+      details: safety.details,
+      extras: {
+        reasons,
+        baselineChars: row.markdown.length,
+        candidateChars: derivedMarkdown.length,
+      },
+    });
+    if (repairGuardQuarantine.quarantined) {
+      recordProjectionRepair('failure', repairGuardQuarantine.reason ?? reason);
+      return 'stop';
+    }
+    if (reason === 'fragment_markdown_drift') {
+      recordProjectionDrift(reason, 'repair');
+      const driftQuarantine = maybeQuarantineRepeatedFragmentDrift(slug, {
+        source: source === 'startup' ? 'repair' : source,
+        event: 'repair_success',
+        details: {
+          reasons,
+          baselineChars: row.markdown.length,
+          candidateChars: derivedMarkdown.length,
+        },
+      });
+      if (driftQuarantine.quarantined) {
+        recordProjectionRepair('failure', driftQuarantine.reason ?? reason);
+        return 'stop';
+      }
+    } else {
+      const fingerprint = buildProjectionPathologyFingerprint(reason, safety.details, {
+        baselineChars: row.markdown.length,
+        candidateChars: derivedMarkdown.length,
+        source,
+      });
+      const pathology = registerProjectionPathologyCooldown(
+        projectionPathologyCooldowns,
+        slug,
+        reason,
+        fingerprint,
+      );
+      if (!(pathology.suppressed || repairGuardQuarantine.suppressed)) {
+        recordProjectionGuardBlock(reason, source);
+        recordProjectionRepair('failure', reason || reasons.join('|') || 'repair_guard_blocked');
+        console.error('[collab] projection repair blocked by guardrail', {
+          slug,
+          reasons,
+          guardReason: safety.reason,
+          details: safety.details,
+        });
+      }
+      maybeQuarantineCollabRepairLoop(slug, 'projection_guard_block', {
+        source,
+        guardReason: reason,
+        reasons,
         details: safety.details,
       });
+      return 'stop';
     }
-    return 'stop';
   }
 
   try {
@@ -1728,13 +3943,32 @@ async function repairProjectionFromFragment(
     return 'retry';
   }
   recordProjectionRepair('success', reasons.join('|') || 'unspecified');
-  clearProjectionPathologyCooldown(slug);
-  console.warn('[collab] projection repair succeeded', {
-    slug,
-    reasons,
-    markdownChars: derivedMarkdown.length,
-    yStateVersion,
-  });
+  if (reasons.includes('fragment_markdown_drift')) {
+    clearProjectionPathologyCooldown(slug);
+    clearStaleOnStoreDriftCooldown(slug);
+    clearRepairGuardEscalationState(slug);
+    clearProjectionRepairCycleId(slug);
+    const driftLog = registerFragmentDriftSuppression(slug);
+    if (driftLog.suppressed) {
+      recordCollabLogSuppressed('projection_drift_loop', 'fragment_markdown_drift');
+      logFragmentDriftSuppressionSummary(slug, driftLog.suppressedCount);
+    } else {
+      console.warn('[collab] projection repair succeeded', {
+        slug,
+        reasons,
+        markdownChars: derivedMarkdown.length,
+        yStateVersion,
+      });
+    }
+  } else {
+    clearAllSlugPathologyCooldowns(slug);
+    console.warn('[collab] projection repair succeeded', {
+      slug,
+      reasons,
+      markdownChars: derivedMarkdown.length,
+      yStateVersion,
+    });
+  }
   return 'success';
 }
 
@@ -1775,6 +4009,7 @@ async function runQueuedProjectionRepair(slug: string): Promise<void> {
 
 export function queueProjectionRepair(slug: string, reason: string): void {
   if (!slug) return;
+  if (isCollabQuarantined(slug)) return;
   const trimmedReason = reason && reason.trim().length > 0 ? reason.trim() : 'unspecified';
   const reasons = projectionRepairReasons.get(slug) ?? new Set<string>();
   reasons.add(trimmedReason);
@@ -1783,6 +4018,7 @@ export function queueProjectionRepair(slug: string, reason: string): void {
 
   if (projectionRepairRunning.has(slug) || projectionRepairScheduled.has(slug)) return;
 
+  getOrStartProjectionRepairCycleId(slug);
   projectionRepairRetryIndex.set(slug, 0);
   const delay = getProjectionRepairRetryScheduleMs()[0] ?? 0;
   const timer = setTimeout(() => {
@@ -1800,6 +4036,7 @@ type PersistedDocState = {
   updatedAt: string | null;
   yStateVersion: number;
   accessEpoch: number | null;
+  authoritativeSnapshot: Uint8Array;
   stateVector: Uint8Array;
 };
 
@@ -1814,14 +4051,33 @@ function setLoadedDocDbMeta(
   updatedAt: string | null,
   yStateVersion: number,
   accessEpoch: number | null,
+  baselineSnapshot: Uint8Array,
   baselineStateVector: Uint8Array,
 ): void {
   loadedDocDbMeta.set(slug, {
     updatedAt,
     yStateVersion,
     accessEpoch,
+    baselineSnapshot,
     baselineStateVector,
   });
+}
+
+function setAuthoritativeBaseline(slug: string, baseline: AuthoritativeBaseline): void {
+  lastPersistedAuthoritativeSnapshots.set(slug, baseline.snapshot);
+  lastPersistedStateVectors.set(slug, baseline.stateVector);
+}
+
+function clearAuthoritativeBaseline(slug: string): void {
+  lastPersistedAuthoritativeSnapshots.delete(slug);
+  lastPersistedStateVectors.delete(slug);
+}
+
+function getAuthoritativeBaseline(slug: string): AuthoritativeBaseline | null {
+  const snapshot = lastPersistedAuthoritativeSnapshots.get(slug);
+  const stateVector = lastPersistedStateVectors.get(slug);
+  if (!(snapshot && stateVector)) return null;
+  return { snapshot, stateVector };
 }
 
 function refreshLoadedDocDbMeta(
@@ -1830,13 +4086,19 @@ function refreshLoadedDocDbMeta(
   updatedAt: string | null,
   yStateVersion: number,
   accessEpoch: number | null,
+  baseline: AuthoritativeBaseline | null = null,
 ): void {
+  const effectiveBaseline = baseline ?? getAuthoritativeBaseline(slug) ?? buildAuthoritativeBaseline(ydoc);
+  if (!baseline && !getAuthoritativeBaseline(slug)) {
+    setAuthoritativeBaseline(slug, effectiveBaseline);
+  }
   setLoadedDocDbMeta(
     slug,
     updatedAt,
     yStateVersion,
     accessEpoch,
-    Y.encodeStateVector(ydoc),
+    effectiveBaseline.snapshot,
+    effectiveBaseline.stateVector,
   );
 }
 
@@ -1911,7 +4173,8 @@ function persistCanonicalYjsBaseline(
 ): PersistedDocState {
   const markdown = stripEphemeralCollabSpans(row.markdown ?? '');
   const marks = parseStoredMarks(row.marks);
-  const snapshot = Y.encodeStateAsUpdate(ydoc);
+  const authoritativeBaseline = buildAuthoritativeBaseline(ydoc);
+  const snapshot = authoritativeBaseline.snapshot;
   if (snapshot.byteLength > 0) {
     saveYSnapshot(slug, 1, snapshot);
     replaceDocumentProjection(slug, markdown, marks, 1);
@@ -1929,7 +4192,8 @@ function persistCanonicalYjsBaseline(
       : typeof row.access_epoch === 'number'
         ? row.access_epoch
         : null,
-    stateVector: Y.encodeStateVector(ydoc),
+    authoritativeSnapshot: authoritativeBaseline.snapshot,
+    stateVector: authoritativeBaseline.stateVector,
   };
 }
 
@@ -1968,8 +4232,9 @@ export async function ensureCanonicalYjsBaselineForDocument(slug: string): Promi
   if (!row || row.share_state === 'DELETED' || row.share_state === 'REVOKED') return false;
 
   const snapshot = getLatestYSnapshot(slug);
-  const startSeq = snapshot?.version ?? 0;
-  const updates = getYUpdatesAfter(slug, startSeq);
+  const updates = snapshot
+    ? getYUpdatesAtOrAfter(slug, snapshot.version)
+    : getYUpdatesAfter(slug, 0);
   const persistedYStateVersion = getLatestYStateVersion(slug);
   if (snapshot || updates.length > 0) {
     if (persistedYStateVersion > 0) {
@@ -1986,20 +4251,47 @@ export async function ensureCanonicalYjsBaselineForDocument(slug: string): Promi
     return false;
   }
 
+  const reseedGate = shouldBlockLegacyReseed(slug);
+  if (reseedGate.blocked) {
+    maybeRecordBlockedLegacyReseed(slug, 'ensure_canonical_yjs_baseline', row);
+    return false;
+  }
+
   await seedLegacyDocumentToPersistedYjsAsync(slug, row);
+  recordLegacyReseedAttempt('seeded', 'ensure_canonical_yjs_baseline');
   return true;
 }
 
 function readPersistedDocState(slug: string): PersistedDocState {
   const row = getDocumentBySlug(slug);
+  const latestYStateVersion = getLatestYStateVersion(slug);
   let snapshot = getLatestYSnapshot(slug);
-  let startSeq = snapshot?.version ?? 0;
-  let updates = getYUpdatesAfter(slug, startSeq);
+  let updates = snapshot
+    ? getYUpdatesAtOrAfter(slug, snapshot.version)
+    : getYUpdatesAfter(slug, 0);
 
   if (!snapshot && updates.length === 0 && row) {
+    const reseedGate = shouldBlockLegacyReseed(slug);
+    if (reseedGate.blocked) {
+      maybeRecordBlockedLegacyReseed(slug, 'read_persisted_doc_state_sync', row);
+      const ydoc = buildReadOnlyLegacyYDoc(row);
+      const authoritativeBaseline = buildAuthoritativeBaseline(ydoc);
+      return {
+        ydoc,
+        updatedAt: row.updated_at ?? null,
+        yStateVersion: row.y_state_version ?? 0,
+        accessEpoch: typeof row.access_epoch === 'number' ? row.access_epoch : null,
+        authoritativeSnapshot: authoritativeBaseline.snapshot,
+        stateVector: authoritativeBaseline.stateVector,
+      };
+    }
     console.warn('[collab] seeding missing canonical Yjs baseline from legacy projection row', { slug });
-    return seedLegacyDocumentToPersistedYjs(slug, row);
+    const seeded = seedLegacyDocumentToPersistedYjs(slug, row);
+    recordLegacyReseedAttempt('seeded', 'read_persisted_doc_state_sync');
+    return seeded;
   }
+
+  repeatedLegacyReseedAttempts.delete(slug);
 
   const ydoc = new Y.Doc();
   if (snapshot) {
@@ -2008,27 +4300,61 @@ function readPersistedDocState(slug: string): PersistedDocState {
   for (const update of updates) {
     Y.applyUpdate(ydoc, update.update);
   }
-  ensureFragmentSeededFromMarkdownIfEmptySync(slug, ydoc, 'persisted-fragment-repair');
-
+  if (!isCollabQuarantined(slug)) {
+    ensureFragmentSeededFromMarkdownIfEmptySync(slug, ydoc, 'persisted-fragment-repair');
+  }
+  // If the Yjs text has accumulated stale content but the canonical row is
+  // empty (user deleted everything), clear the text to prevent resurrection
+  // on reconnect (issues #345-#348).
+  if (row && (row.markdown ?? '').trim().length === 0) {
+    const yjsText = ydoc.getText('markdown');
+    if (yjsText.length > 0) {
+      ydoc.transact(() => {
+        yjsText.delete(0, yjsText.length);
+      }, 'persisted-empty-reconcile');
+    }
+  }
+  const authoritativeBaseline = buildAuthoritativeBaseline(ydoc);
   return {
     ydoc,
     updatedAt: row?.updated_at ?? null,
-    yStateVersion: getLatestYStateVersion(slug),
+    yStateVersion: latestYStateVersion,
     accessEpoch: typeof row?.access_epoch === 'number' ? row.access_epoch : null,
-    stateVector: Y.encodeStateVector(ydoc),
+    authoritativeSnapshot: authoritativeBaseline.snapshot,
+    stateVector: authoritativeBaseline.stateVector,
   };
 }
 
 async function readPersistedDocStateAsync(slug: string): Promise<PersistedDocState> {
   const row = getDocumentBySlug(slug);
+  const latestYStateVersion = getLatestYStateVersion(slug);
   const snapshot = getLatestYSnapshot(slug);
-  const startSeq = snapshot?.version ?? 0;
-  const updates = getYUpdatesAfter(slug, startSeq);
+  const updates = snapshot
+    ? getYUpdatesAtOrAfter(slug, snapshot.version)
+    : getYUpdatesAfter(slug, 0);
 
   if (!snapshot && updates.length === 0 && row) {
+    const reseedGate = shouldBlockLegacyReseed(slug);
+    if (reseedGate.blocked) {
+      maybeRecordBlockedLegacyReseed(slug, 'read_persisted_doc_state_async', row);
+      const ydoc = buildReadOnlyLegacyYDoc(row);
+      const authoritativeBaseline = buildAuthoritativeBaseline(ydoc);
+      return {
+        ydoc,
+        updatedAt: row.updated_at ?? null,
+        yStateVersion: row.y_state_version ?? 0,
+        accessEpoch: typeof row.access_epoch === 'number' ? row.access_epoch : null,
+        authoritativeSnapshot: authoritativeBaseline.snapshot,
+        stateVector: authoritativeBaseline.stateVector,
+      };
+    }
     console.warn('[collab] seeding missing canonical Yjs baseline from legacy projection row', { slug });
-    return seedLegacyDocumentToPersistedYjsAsync(slug, row);
+    const seeded = await seedLegacyDocumentToPersistedYjsAsync(slug, row);
+    recordLegacyReseedAttempt('seeded', 'read_persisted_doc_state_async');
+    return seeded;
   }
+
+  repeatedLegacyReseedAttempts.delete(slug);
 
   const ydoc = new Y.Doc();
   if (snapshot) {
@@ -2037,14 +4363,28 @@ async function readPersistedDocStateAsync(slug: string): Promise<PersistedDocSta
   for (const update of updates) {
     Y.applyUpdate(ydoc, update.update);
   }
-  await ensureFragmentSeededFromMarkdownIfEmpty(slug, ydoc, 'persisted-fragment-repair');
-
+  if (!isCollabQuarantined(slug)) {
+    await ensureFragmentSeededFromMarkdownIfEmpty(slug, ydoc, 'persisted-fragment-repair');
+  }
+  // If the Yjs text has accumulated stale content but the canonical row is
+  // empty (user deleted everything), clear the text to prevent resurrection
+  // on reconnect (issues #345-#348).
+  if (row && (row.markdown ?? '').trim().length === 0) {
+    const yjsText = ydoc.getText('markdown');
+    if (yjsText.length > 0) {
+      ydoc.transact(() => {
+        yjsText.delete(0, yjsText.length);
+      }, 'persisted-empty-reconcile');
+    }
+  }
+  const authoritativeBaseline = buildAuthoritativeBaseline(ydoc);
   return {
     ydoc,
     updatedAt: row?.updated_at ?? null,
-    yStateVersion: getLatestYStateVersion(slug),
+    yStateVersion: latestYStateVersion,
     accessEpoch: typeof row?.access_epoch === 'number' ? row.access_epoch : null,
-    stateVector: Y.encodeStateVector(ydoc),
+    authoritativeSnapshot: authoritativeBaseline.snapshot,
+    stateVector: authoritativeBaseline.stateVector,
   };
 }
 
@@ -2056,8 +4396,188 @@ export type CanonicalReadableDocument = DocumentRow & {
   projection_updated_at: string | null;
   projection_fresh: boolean;
   mutation_ready: boolean;
+  repair_pending: boolean;
   read_source: 'projection' | 'canonical_row' | 'yjs_fallback';
 };
+
+async function deriveAuthoritativeMutationBaseFromHandle(
+  slug: string,
+  row: DocumentRow,
+  handle: CanonicalYDocHandle,
+): Promise<AuthoritativeMutationBase> {
+  const resolved = await resolveLoadedDocFragmentMarkdown(slug, handle.ydoc, {
+    allowRecovery: true,
+    refreshCache: false,
+    sourceActor: 'server-mutation-base',
+  });
+  const canonicalMarkdown = normalizeMutationBaseMarkdown(row.markdown ?? '');
+  let markdown = resolved.markdown;
+  let source: MutationBaseSource = handle.source === 'live' ? 'live_yjs' : 'persisted_yjs';
+  if (markdown === null) {
+    markdown = canonicalMarkdown;
+    source = 'canonical_row';
+  } else {
+    const normalizedMarkdown = normalizeMutationBaseMarkdown(markdown);
+    const fallbackSafety = evaluateProjectionSafety(canonicalMarkdown, normalizedMarkdown, handle.ydoc);
+    const replayRepeatCount = detectCanonicalReplayRepeatCount(canonicalMarkdown, normalizedMarkdown);
+    if (replayRepeatCount > 0 || fallbackSafety.reason === 'pathological_repeat') {
+      markdown = canonicalMarkdown;
+      source = 'canonical_row';
+    } else {
+      markdown = normalizedMarkdown;
+    }
+  }
+  const marks = mergePreservedActionMarks(slug, encodeMarksMap(handle.ydoc.getMap('marks')));
+  return buildAuthoritativeMutationBase(
+    row,
+    source,
+    markdown,
+    marks,
+  );
+}
+
+export async function resolveAuthoritativeMutationBase(
+  slug: string,
+  options: { liveRequired?: boolean; preferProjection?: boolean } = {},
+): Promise<AuthoritativeMutationBaseResolution> {
+  const row = getDocumentBySlug(slug);
+  if (!row) return { ok: false, reason: 'missing_document' };
+
+  const projected = getProjectedDocumentBySlug(slug);
+  const projectionFresh = isProjectionFresh(projected);
+  const projectionMatchesCanonical = projectionPayloadMatchesCanonical(projected);
+  const canonicalBase = buildAuthoritativeMutationBase(row, 'canonical_row', row.markdown, parseStoredMarks(row.marks));
+  const preferProjection = options.preferProjection === true;
+  const latestPersistedYStateVersion = getLatestYStateVersion(slug);
+  const hasPersistedYjs = latestPersistedYStateVersion > 0;
+
+  const liveHandle = await loadCanonicalYDoc(slug, { liveRequired: options.liveRequired === true });
+  if (options.liveRequired === true && !liveHandle) {
+    return { ok: false, reason: 'live_doc_unavailable' };
+  }
+
+  try {
+    const liveBase = liveHandle?.source === 'live'
+      ? await deriveAuthoritativeMutationBaseFromHandle(slug, row, liveHandle)
+      : null;
+    const persistedBaseFromPrimaryHandle = liveHandle?.source === 'persisted'
+      ? await deriveAuthoritativeMutationBaseFromHandle(slug, row, liveHandle)
+      : null;
+    const yjsBase = liveBase ?? persistedBaseFromPrimaryHandle;
+
+    if (preferProjection && projectionFresh && projectionMatchesCanonical && (!yjsBase || sameAuthoritativeMutationBase(canonicalBase, yjsBase))) {
+      return {
+        ok: true,
+        base: buildAuthoritativeMutationBase(
+          row,
+          'projection',
+          projected?.markdown ?? row.markdown,
+          parseStoredMarks(projected?.marks ?? row.marks),
+        ),
+      };
+    }
+
+    if (liveBase) {
+      return { ok: true, base: liveBase };
+    }
+
+    if (persistedBaseFromPrimaryHandle) {
+      return {
+        ok: true,
+        base: persistedBaseFromPrimaryHandle,
+      };
+    }
+
+    if (hasPersistedYjs || loadedDocs.has(slug)) {
+      const persistedHandle = await loadCanonicalYDoc(slug, { liveRequired: false });
+      if (persistedHandle) {
+        try {
+          return {
+            ok: true,
+            base: await deriveAuthoritativeMutationBaseFromHandle(slug, row, persistedHandle),
+          };
+        } finally {
+          await persistedHandle.cleanup?.();
+        }
+      }
+    }
+
+    return { ok: true, base: canonicalBase };
+  } finally {
+    await liveHandle?.cleanup?.();
+  }
+}
+
+export async function verifyAuthoritativeMutationBaseStable(
+  slug: string,
+  expectedMarkdown: string,
+  expectedMarks: Record<string, unknown>,
+  options: {
+    liveRequired?: boolean;
+    preferProjection?: boolean;
+    stabilityMs?: number;
+    sampleMs?: number;
+  } = {},
+): Promise<AuthoritativeStateVerificationResult> {
+  const expectedHash = hashAuthoritativeDocumentState(expectedMarkdown, expectedMarks);
+  const stabilityMs = Math.max(0, options.stabilityMs ?? 0);
+  const deadline = Date.now() + stabilityMs;
+  const sampleMs = Math.max(25, options.sampleMs ?? 50);
+  let matched = false;
+  let observedHash: string | null = null;
+  let observedSource: MutationBaseSource | null = null;
+
+  do {
+    const resolved = await resolveAuthoritativeMutationBase(slug, {
+      liveRequired: options.liveRequired === true,
+      preferProjection: options.preferProjection,
+    });
+    if (!resolved.ok) {
+      return {
+        confirmed: false,
+        reason: resolved.reason,
+        source: null,
+        expectedHash,
+        observedHash: null,
+      };
+    }
+
+    observedSource = resolved.base.source;
+    observedHash = hashAuthoritativeDocumentState(resolved.base.markdown, resolved.base.marks);
+    if (observedHash === expectedHash) {
+      matched = true;
+    } else if (matched) {
+      return {
+        confirmed: false,
+        reason: 'authoritative_stability_regressed',
+        source: observedSource,
+        expectedHash,
+        observedHash,
+      };
+    }
+
+    if (stabilityMs <= 0) break;
+    if (Date.now() > deadline) break;
+    await sleep(sampleMs);
+  } while (Date.now() <= deadline);
+
+  if (!matched) {
+    return {
+      confirmed: false,
+      reason: 'authoritative_read_mismatch',
+      source: observedSource,
+      expectedHash,
+      observedHash,
+    };
+  }
+
+  return {
+    confirmed: true,
+    source: observedSource,
+    expectedHash,
+    observedHash: expectedHash,
+  };
+}
 
 export function isCanonicalReadMutationReady(
   doc: { mutation_ready?: boolean } | null | undefined,
@@ -2082,38 +4602,66 @@ function buildReadOnlyLegacyYDoc(row: DocumentRow): Y.Doc {
 
 export function loadCanonicalYDocSync(slug: string): CanonicalYDocHandle | null {
   if (!slug) return null;
+  const row = getDocumentBySlug(slug);
+  if (!row) return null;
 
   const liveDoc = getLiveHocuspocusDoc(slug);
   if (liveDoc) {
-    return {
-      ydoc: liveDoc,
-      source: 'live',
-    };
+    if (typeof row.access_epoch === 'number') {
+      evictStaleLocalStateForAccessEpoch(slug, row.access_epoch);
+    }
+    const currentLiveDoc = getLiveHocuspocusDoc(slug);
+    if (currentLiveDoc) {
+      return {
+        ydoc: currentLiveDoc,
+        source: 'live',
+      };
+    }
   }
 
   const loaded = loadedDocs.get(slug);
   if (loaded) {
-    return {
-      ydoc: loaded,
-      source: 'persisted',
-    };
+    if (typeof row.access_epoch === 'number') {
+      evictStaleLocalStateForAccessEpoch(slug, row.access_epoch);
+    }
+    const currentLoaded = loadedDocs.get(slug);
+    if (currentLoaded) {
+      return {
+        ydoc: currentLoaded,
+        source: 'persisted',
+      };
+    }
   }
 
-  const row = getDocumentBySlug(slug);
-  if (!row) return null;
-
   const snapshot = getLatestYSnapshot(slug);
-  const startSeq = snapshot?.version ?? 0;
-  const updates = getYUpdatesAfter(slug, startSeq);
-  if (!snapshot && updates.length === 0) {
+  const updates = snapshot
+    ? getYUpdatesAtOrAfter(slug, snapshot.version)
+    : getYUpdatesAfter(slug, 0);
+  const cacheKey = buildPersistedDocCacheKey(snapshot, updates);
+
+  if (cacheKey) {
+    const cached = getPersistedDocCacheEntry(slug, cacheKey);
+    if (cached) {
+      return {
+        ydoc: cached.ydoc,
+        source: 'persisted',
+      };
+    }
+  }
+
+  // Avoid re-creating and re-seeding the fragment on every read
+  // (issues #345-#348: repair loop drifts baseToken).
+  if (!cacheKey) {
     return {
       ydoc: buildReadOnlyLegacyYDoc(row),
       source: 'persisted',
     };
   }
 
+  const persisted = readPersistedDocState(slug);
+  setPersistedDocCacheEntry(slug, persisted.ydoc, cacheKey, 'sync');
   return {
-    ydoc: readPersistedDocState(slug).ydoc,
+    ydoc: persisted.ydoc,
     source: 'persisted',
   };
 }
@@ -2142,69 +4690,74 @@ function getProjectionFallbackReason(doc: ProjectedDocumentRow | null | undefine
   return 'projection_unavailable';
 }
 
-export function getCanonicalReadableDocumentSync(
+function buildFallbackReadOptions(
+  source: 'state' | 'snapshot' | 'share' | 'unknown',
+): { mutationReady: boolean; repairPending: boolean } {
+  // When any served read surface has to fall back to Yjs because the canonical row
+  // or projection drifted, we keep that surface explicitly read-degraded until the
+  // derived projection catches up. Snapshot/share should not look "settled" while
+  // state is still reporting authoritative fallback content.
+  return source === 'unknown'
+    ? { mutationReady: false, repairPending: false }
+    : { mutationReady: false, repairPending: true };
+}
+
+function buildYjsFallbackReadableDocument(
   slug: string,
-  source: 'state' | 'snapshot' | 'share' | 'unknown' = 'unknown',
-): CanonicalReadableDocument | undefined {
-  const projected = getProjectedDocumentBySlug(slug);
-  const projectionFresh = isProjectionFresh(projected);
-  const projectionMatchesCanonical = projectionPayloadMatchesCanonical(projected);
-  if (projectionFresh && projectionMatchesCanonical) {
-    return {
-      ...projected,
-      projection_fresh: true,
-      mutation_ready: true,
-      read_source: 'projection',
-    };
-  }
-
-  const row = getDocumentBySlug(slug);
-  if (!row) {
-    return projected
-      ? {
-        ...projected,
-        projection_fresh: false,
-        mutation_ready: false,
-        read_source: 'projection',
-      }
-      : undefined;
-  }
-
-  if (projectionFresh && !projectionMatchesCanonical) {
-    recordProjectionReadFallback(source, 'projection_content_mismatch');
+  row: DocumentRow,
+  projected: ProjectedDocumentRow | null | undefined,
+  handle: CanonicalYDocHandle,
+  source: 'state' | 'snapshot' | 'share' | 'unknown',
+  fallbackReason: string,
+  markdownOverride?: string,
+  marksOverride?: Record<string, unknown>,
+  options: {
+    mutationReady?: boolean;
+    repairPending?: boolean;
+  } = {},
+): CanonicalReadableDocument {
+  recordProjectionReadFallback(source, fallbackReason);
+  const markdown = markdownOverride ?? stripEphemeralCollabSpans(handle.ydoc.getText('markdown').toString());
+  const fallbackSafety = evaluateProjectionSafety(row.markdown ?? '', markdown, handle.ydoc);
+  if (fallbackSafety.reason === 'pathological_repeat') {
+    if (source === 'share') {
+      maybeFastQuarantineProjectionPathology(slug, {
+        source: 'share',
+        guardReason: 'pathological_repeat',
+        details: fallbackSafety.details,
+        extras: {
+          readSurface: source,
+          fallbackReason,
+          yjsSource: handle.source,
+          baselineChars: row.markdown.length,
+          candidateChars: markdown.length,
+          canonicalRowFallback: true,
+        },
+      });
+    }
     return {
       ...row,
-      plain_text: row.markdown,
+      plain_text: projected?.plain_text ?? row.markdown,
       projection_health: projected?.projection_health ?? 'projection_stale',
       projection_revision: projected?.projection_revision ?? null,
       projection_y_state_version: projected?.projection_y_state_version ?? null,
       projection_updated_at: projected?.projection_updated_at ?? null,
       projection_fresh: false,
       mutation_ready: true,
+      repair_pending: true,
       read_source: 'canonical_row',
     };
   }
-
-  const handle = loadCanonicalYDocSync(slug);
-  if (!handle) {
-    return projected
-      ? {
-        ...projected,
-        projection_fresh: false,
-        mutation_ready: false,
-        read_source: 'projection',
-      }
-      : undefined;
-  }
-
-  const fallbackReason = getProjectionFallbackReason(projected);
-  recordProjectionReadFallback(source, fallbackReason);
-  const markdown = stripEphemeralCollabSpans(handle.ydoc.getText('markdown').toString());
-  const marks = mergePreservedActionMarks(slug, encodeMarksMap(handle.ydoc.getMap('marks')));
+  const marks = marksOverride ?? mergePreservedActionMarks(slug, encodeMarksMap(handle.ydoc.getMap('marks')));
   const rowMarks = parseStoredMarks(row.marks);
   const sanitizedRowMarkdown = stripEphemeralCollabSpans(row.markdown ?? '');
-  const mutationReady = sanitizedRowMarkdown === markdown
-    && stableStringify(rowMarks) === stableStringify(marks);
+  const computedMutationReady = handle.source === 'live'
+    || (
+      sanitizedRowMarkdown === markdown
+      && stableStringify(rowMarks) === stableStringify(marks)
+    );
+  const mutationReady = options.mutationReady ?? computedMutationReady;
+  const repairPending = options.repairPending ?? true;
 
   return {
     ...row,
@@ -2217,8 +4770,199 @@ export function getCanonicalReadableDocumentSync(
     projection_updated_at: projected?.projection_updated_at ?? null,
     projection_fresh: false,
     mutation_ready: mutationReady,
+    repair_pending: repairPending,
     read_source: 'yjs_fallback',
   };
+}
+
+export function getCanonicalReadableDocumentSync(
+  slug: string,
+  source: 'state' | 'snapshot' | 'share' | 'unknown' = 'unknown',
+): CanonicalReadableDocument | undefined {
+  const projected = getProjectedDocumentBySlug(slug);
+  const projectionFresh = isProjectionFresh(projected);
+  const projectionMatchesCanonical = projectionPayloadMatchesCanonical(projected);
+  const row = getDocumentBySlug(slug);
+  const handle = row ? loadCanonicalYDocSync(slug) : null;
+
+  if (projectionFresh && projectionMatchesCanonical && row && handle?.source === 'live') {
+    const liveMarkdown = stripEphemeralCollabSpans(handle.ydoc.getText('markdown').toString());
+    const liveMarks = mergePreservedActionMarks(slug, encodeMarksMap(handle.ydoc.getMap('marks')));
+    const rowMarks = parseStoredMarks(row.marks);
+    const liveMatchesRow = stripEphemeralCollabSpans(row.markdown ?? '') === liveMarkdown
+      && stableStringify(rowMarks) === stableStringify(liveMarks);
+    if (!liveMatchesRow) {
+      return buildYjsFallbackReadableDocument(
+        slug,
+        row,
+        projected,
+        handle,
+        source,
+        'live_doc_ahead',
+        undefined,
+        undefined,
+        buildFallbackReadOptions(source),
+      );
+    }
+  }
+
+  if (projected && projectionFresh && row && handle) {
+    const authoritativeMarkdown = stripEphemeralCollabSpans(handle.ydoc.getText('markdown').toString());
+    const authoritativeMarks = mergePreservedActionMarks(slug, encodeMarksMap(handle.ydoc.getMap('marks')));
+    const projectionMatchesAuthoritative = projected.markdown === authoritativeMarkdown
+      && stableStringify(parseStoredMarks(projected.marks)) === stableStringify(authoritativeMarks);
+    if (projectionMatchesAuthoritative) {
+      return {
+        ...projected,
+        projection_fresh: true,
+        mutation_ready: true,
+        repair_pending: false,
+        read_source: 'projection',
+      };
+    }
+  }
+
+  if (row && handle) {
+    const markdown = stripEphemeralCollabSpans(handle.ydoc.getText('markdown').toString());
+    const marks = mergePreservedActionMarks(slug, encodeMarksMap(handle.ydoc.getMap('marks')));
+    const rowMarks = parseStoredMarks(row.marks);
+    const sanitizedRowMarkdown = stripEphemeralCollabSpans(row.markdown ?? '');
+    const yjsAheadOfCanonical = sanitizedRowMarkdown !== markdown
+      || stableStringify(rowMarks) !== stableStringify(marks);
+
+    if (yjsAheadOfCanonical) {
+      const fallbackReason = handle.source === 'live' ? 'live_doc_ahead' : 'loaded_doc_ahead';
+      // Apply the same authority rule across state, snapshot, and share reads so
+      // clients cannot see different truths depending on which read surface they hit.
+      return buildYjsFallbackReadableDocument(
+        slug,
+        row,
+        projected,
+        handle,
+        source,
+        fallbackReason,
+        undefined,
+        undefined,
+        buildFallbackReadOptions(source),
+      );
+    }
+  }
+  if (projected && projectionFresh && projectionMatchesCanonical) {
+    return {
+      ...projected,
+      projection_fresh: true,
+      mutation_ready: true,
+      repair_pending: false,
+      read_source: 'projection',
+    };
+  }
+
+  if (!row) {
+    return projected
+      ? {
+        ...projected,
+        projection_fresh: false,
+        mutation_ready: false,
+        repair_pending: false,
+        read_source: 'projection',
+      }
+      : undefined;
+  }
+
+  if (projectionFresh && !projectionMatchesCanonical) {
+    // When a Y.Doc handle is available, prefer Yjs fallback over canonical_row
+    // so reads surface authoritative Yjs content instead of a potentially stale
+    // canonical row (e.g. when an external edit landed only in Y updates / projection).
+    if (handle && row) {
+      return buildYjsFallbackReadableDocument(
+        slug,
+        row,
+        projected,
+        handle,
+        source,
+        'projection_content_mismatch',
+        undefined,
+        undefined,
+        { mutationReady: false, repairPending: true },
+      );
+    }
+    recordProjectionReadFallback(source, 'projection_content_mismatch');
+    return {
+      ...row,
+      plain_text: row.markdown,
+      projection_health: projected?.projection_health ?? 'projection_stale',
+      projection_revision: projected?.projection_revision ?? null,
+      projection_y_state_version: projected?.projection_y_state_version ?? null,
+      projection_updated_at: projected?.projection_updated_at ?? null,
+      projection_fresh: false,
+      mutation_ready: true,
+      repair_pending: true,
+      read_source: 'canonical_row',
+    };
+  }
+
+  if (!handle) {
+    return projected
+      ? {
+        ...projected,
+        projection_fresh: false,
+        mutation_ready: false,
+        repair_pending: false,
+        read_source: 'projection',
+      }
+      : undefined;
+  }
+
+  const fallbackReason = getProjectionFallbackReason(projected);
+  return buildYjsFallbackReadableDocument(slug, row, projected, handle, source, fallbackReason, undefined, undefined, buildFallbackReadOptions(source));
+}
+
+export async function getCanonicalReadableDocument(
+  slug: string,
+  source: 'state' | 'snapshot' | 'share' | 'unknown' = 'unknown',
+): Promise<CanonicalReadableDocument | undefined> {
+  const readable = getCanonicalReadableDocumentSync(slug, source);
+  if (!readable) return readable;
+
+  const authoritative = await resolveAuthoritativeMutationBase(slug, {
+    liveRequired: false,
+    preferProjection: false,
+  });
+  if (!authoritative.ok) return readable;
+
+  if (authoritative.base.source === 'live_yjs' || authoritative.base.source === 'persisted_yjs') {
+    const currentMarks = parseStoredMarks(readable.marks);
+    const authoritativeMarks = authoritative.base.marks;
+    const currentMatchesAuthoritative = readable.markdown === authoritative.base.markdown
+      && stableStringify(currentMarks) === stableStringify(authoritativeMarks);
+    if (currentMatchesAuthoritative && readable.read_source !== 'yjs_fallback') {
+      return readable;
+    }
+    return {
+      ...readable,
+      markdown: authoritative.base.markdown,
+      marks: JSON.stringify(authoritativeMarks),
+      plain_text: authoritative.base.markdown,
+      read_source: 'yjs_fallback',
+      projection_fresh: false,
+      repair_pending: true,
+      mutation_ready: readable.mutation_ready,
+    };
+  }
+
+  if (readable.read_source === 'yjs_fallback') {
+    return {
+      ...readable,
+      markdown: authoritative.base.markdown,
+      marks: JSON.stringify(authoritative.base.marks),
+      plain_text: authoritative.base.markdown,
+      read_source: authoritative.base.source === 'projection' ? 'projection' : 'canonical_row',
+      mutation_ready: authoritative.base.source !== 'projection',
+      repair_pending: authoritative.base.source === 'projection',
+    };
+  }
+
+  return readable;
 }
 
 export async function loadCanonicalYDoc(
@@ -2238,7 +4982,10 @@ export async function loadCanonicalYDoc(
     const { doc, cleanup } = await getOrLoadHocuspocusDoc(slug, {
       allowDirectConnection: options.liveRequired === true,
     });
-    const registeredLiveDoc = getLiveHocuspocusDoc(slug);
+    let registeredLiveDoc = getLiveHocuspocusDoc(slug);
+    if (!registeredLiveDoc && options.liveRequired) {
+      registeredLiveDoc = await waitForLiveHocuspocusDocRegistration(slug);
+    }
     if (registeredLiveDoc) {
       return {
         ydoc: registeredLiveDoc,
@@ -2261,6 +5008,17 @@ export async function loadCanonicalYDoc(
     };
   }
 
+  const cacheKey = readPersistedDocCacheKey(slug);
+  if (cacheKey) {
+    const cached = getPersistedDocCacheEntry(slug, cacheKey, 'async');
+    if (cached) {
+      return {
+        ydoc: cached.ydoc,
+        source: 'persisted',
+      };
+    }
+  }
+
   return {
     ydoc: await hydrateDocFromDbAsync(slug),
     source: 'persisted',
@@ -2273,12 +5031,27 @@ export function registerCanonicalYDocPersistence(
   meta: { updatedAt: string | null; yStateVersion: number; accessEpoch: number | null },
 ): void {
   rememberLoadedDoc(slug, ydoc);
-  lastPersistedStateVectors.set(slug, Y.encodeStateVector(ydoc));
+  let authoritativeBaseline: AuthoritativeBaseline | null = null;
+  if (meta.yStateVersion > 0) {
+    try {
+      const persisted = readPersistedDocState(slug);
+      if (persisted.yStateVersion === meta.yStateVersion) {
+        authoritativeBaseline = {
+          snapshot: persisted.authoritativeSnapshot,
+          stateVector: persisted.stateVector,
+        };
+      }
+    } catch {
+      authoritativeBaseline = null;
+    }
+  }
+  authoritativeBaseline = authoritativeBaseline ?? buildAuthoritativeBaseline(ydoc);
+  setAuthoritativeBaseline(slug, authoritativeBaseline);
   updatesSinceCompaction.set(
     slug,
     Math.max(0, meta.yStateVersion - (getLatestYSnapshot(slug)?.version ?? 0)),
   );
-  refreshLoadedDocDbMeta(slug, ydoc, meta.updatedAt, meta.yStateVersion, meta.accessEpoch);
+  refreshLoadedDocDbMeta(slug, ydoc, meta.updatedAt, meta.yStateVersion, meta.accessEpoch, authoritativeBaseline);
   markSkipNextOnStorePersist(slug, ydoc);
   touchDoc(slug);
 }
@@ -2299,10 +5072,23 @@ async function hydrateDocFromDbAsync(slug: string): Promise<Y.Doc> {
   const persisted = await readPersistedDocStateAsync(slug);
   const ydoc = persisted.ydoc;
   docPersistGenerations.set(ydoc, getPersistGeneration(slug));
-  lastPersistedStateVectors.set(slug, persisted.stateVector);
+  setAuthoritativeBaseline(slug, {
+    snapshot: persisted.authoritativeSnapshot,
+    stateVector: persisted.stateVector,
+  });
   updatesSinceCompaction.set(slug, 0);
-  refreshLoadedDocDbMeta(slug, ydoc, persisted.updatedAt, persisted.yStateVersion, persisted.accessEpoch);
-  touchDoc(slug);
+  refreshLoadedDocDbMeta(
+    slug,
+    ydoc,
+    persisted.updatedAt,
+    persisted.yStateVersion,
+    persisted.accessEpoch,
+    {
+      snapshot: persisted.authoritativeSnapshot,
+      stateVector: persisted.stateVector,
+    },
+  );
+  refreshPersistedDocCacheFromDb(slug, ydoc, 'async');
   return ydoc;
 }
 
@@ -2385,6 +5171,11 @@ async function persistDoc(
     }
   }
   if (sourceActor === 'collab') {
+    if (isCollabQuarantined(slug)) {
+      persistPending.delete(slug);
+      invalidateLoadedCollabDocument(slug);
+      return;
+    }
     const loadedMeta = loadedDocDbMeta.get(slug);
     const row = getDocumentBySlug(slug);
     const currentUpdatedAt = row?.updated_at ?? null;
@@ -2404,6 +5195,7 @@ async function persistDoc(
           });
         }
         applyPersistedStateToLoadedDoc(slug, resolution.persistedState);
+        const quarantine = maybeQuarantineStaleOnStoreReload(slug, resolution, { source: 'persistDoc', sourceActor });
         if (!resolution.logSuppressed) {
           console.warn('[collab_stale_onstore_reload]', {
             slug,
@@ -2417,6 +5209,8 @@ async function persistDoc(
             dbMissingBytes: resolution.dbMissingBytes,
             localUnsavedBytes: resolution.localUnsavedBytes,
             sourceActor,
+            autoQuarantined: quarantine.quarantined,
+            autoQuarantineReason: quarantine.reason ?? null,
           });
         }
         scheduleStaleOnStoreReload(slug);
@@ -2430,10 +5224,14 @@ async function persistDoc(
   let skipProjectionWriteDueToDeriveFailure = false;
   try {
     const refreshed = await refreshMarkdownTextFromFragment(slug, ydoc, 'server-projection-refresh');
+    if (refreshed.blockedSuspiciousCollapse) {
+      persistPending.delete(slug);
+      return;
+    }
     if (refreshed.deriveFailed) {
       skipProjectionWriteDueToDeriveFailure = true;
       queuedRepairReason = queuedRepairReason ?? 'derive_fragment_markdown_failed';
-    } else if (refreshed.refreshed && typeof refreshed.markdown === 'string') {
+    } else if (typeof refreshed.markdown === 'string') {
       projectionMarkdownOverride = refreshed.markdown;
     }
   } catch (error) {
@@ -2442,6 +5240,8 @@ async function persistDoc(
       sourceActor,
       error: summarizeParseError(error),
     });
+    skipProjectionWriteDueToDeriveFailure = true;
+    queuedRepairReason = queuedRepairReason ?? 'derive_fragment_markdown_failed';
   }
   const generation = currentGeneration;
   persistInFlight.set(slug, true);
@@ -2450,18 +5250,25 @@ async function persistDoc(
     if ((persistGeneration.get(slug) ?? 0) !== generation || collabInvalidations.has(slug)) {
       return;
     }
-    const priorVector = lastPersistedStateVectors.get(slug);
-    const deltaUpdate = priorVector
-      ? Y.encodeStateAsUpdate(ydoc, priorVector)
-      : Y.encodeStateAsUpdate(ydoc);
+    const priorBaseline = getAuthoritativeBaseline(slug);
+    const authoritativeDoc = buildComparableAuthoritativeDoc(priorBaseline?.snapshot ?? null, ydoc);
+    const authoritativeSnapshot = Y.encodeStateAsUpdate(authoritativeDoc);
+    const authoritativeStateVector = Y.encodeStateVector(authoritativeDoc);
+    const priorVector = priorBaseline?.stateVector;
+    const deltaUpdate = priorBaseline && sameStateVector(priorBaseline.snapshot, authoritativeSnapshot)
+      ? new Uint8Array()
+      : priorVector
+        ? Y.encodeStateAsUpdate(authoritativeDoc, priorVector)
+        : authoritativeSnapshot;
     const compactionInterval = parsePositiveInt(
       process.env.COLLAB_COMPACTION_EVERY,
       DEFAULT_COLLAB_COMPACTION_EVERY,
     );
     const priorUpdateCount = updatesSinceCompaction.get(slug) ?? 0;
     let nextUpdateCount = priorUpdateCount;
-    const shouldMaterializeProjection = sourceActor === 'collab';
+    const shouldMaterializeProjection = sourceActor === 'collab' && !isCollabQuarantined(slug);
     let shouldBumpRevision = shouldMaterializeProjection;
+    let skipPersistedStateWrite = false;
     const db = getDb();
     let aborted = false;
     const persistTx = db.transaction(() => {
@@ -2471,6 +5278,13 @@ async function persistDoc(
       }
       // Read docRow inside the transaction to avoid stale comparisons
       let shouldWriteProjection = true;
+      if (isCollabQuarantined(slug)) {
+        shouldWriteProjection = false;
+        skipPersistedStateWrite = sourceActor === 'collab';
+        if (getCollabQuarantineGateStatus(slug).active) {
+          setDocumentProjectionHealth(slug, 'quarantined');
+        }
+      }
       if (shouldMaterializeProjection) {
         if (skipProjectionWriteDueToDeriveFailure) {
           shouldWriteProjection = false;
@@ -2498,45 +5312,130 @@ async function persistDoc(
               const safety = evaluateProjectionSafety(currentRow.markdown, markdownText, ydoc);
               if (!safety.safe) {
                 const reason = safety.reason || 'unsafe_projection';
-                shouldWriteProjection = false;
-                setDocumentProjectionHealth(slug, 'projection_stale');
-                recordProjectionMarkedStale(reason, 'persist');
-                const fingerprint = buildProjectionPathologyFingerprint(reason, safety.details, {
-                  baselineChars: currentRow.markdown.length,
-                  candidateChars: markdownText.length,
-                });
-                const pathology = registerProjectionPathologyCooldown(
-                  projectionPathologyCooldowns,
-                  slug,
-                  reason,
-                  fingerprint,
-                );
-                if (!pathology.suppressed) {
-                  queuedRepairReason = queuedRepairReason ?? reason;
-                  recordProjectionGuardBlock(reason, 'persist');
-                  if (reason === 'fragment_markdown_drift') {
-                    recordProjectionDrift(reason, 'persist');
-                  }
-                  console.error('[collab] blocked unsafe projection write; keeping canonical DB projection', {
-                    slug,
-                    reason,
-                    details: safety.details,
+                const fastQuarantine = maybeFastQuarantineProjectionPathology(slug, {
+                  source: 'persist',
+                  guardReason: reason,
+                  details: safety.details,
+                  extras: {
                     baselineChars: currentRow.markdown.length,
                     candidateChars: markdownText.length,
+                  },
+                });
+                shouldWriteProjection = false;
+                if (fastQuarantine.quarantined) {
+                  queuedRepairReason = null;
+                  shouldBumpRevision = false;
+                  skipPersistedStateWrite = true;
+                } else {
+                  const repairGuardQuarantine = maybeQuarantineRepeatedRepairGuardBlock(slug, {
+                    source: 'persist',
+                    guardReason: reason,
+                    details: safety.details,
+                    extras: {
+                      baselineChars: currentRow.markdown.length,
+                      candidateChars: markdownText.length,
+                    },
                   });
+                  if (repairGuardQuarantine.quarantined) {
+                    queuedRepairReason = null;
+                    shouldBumpRevision = false;
+                  } else {
+                    setDocumentProjectionHealth(slug, 'projection_stale');
+                    recordProjectionMarkedStale(reason, 'persist');
+                    const fingerprint = reason === 'fragment_markdown_drift'
+                      ? buildFragmentDriftSuppressionFingerprint(slug)
+                      : buildProjectionPathologyFingerprint(reason, safety.details, {
+                        baselineChars: currentRow.markdown.length,
+                        candidateChars: markdownText.length,
+                      });
+                    const pathology = registerProjectionPathologyCooldown(
+                      projectionPathologyCooldowns,
+                      slug,
+                      reason,
+                      fingerprint,
+                    );
+                    if (!(pathology.suppressed || repairGuardQuarantine.suppressed)) {
+                      queuedRepairReason = queuedRepairReason ?? reason;
+                      recordProjectionGuardBlock(reason, 'persist');
+                      if (reason === 'fragment_markdown_drift') {
+                        recordProjectionDrift(reason, 'persist');
+                      }
+                      console.error('[collab] blocked unsafe projection write; keeping canonical DB projection', {
+                        slug,
+                        reason,
+                        details: safety.details,
+                        baselineChars: currentRow.markdown.length,
+                        candidateChars: markdownText.length,
+                      });
+                    }
+                    if (reason === 'fragment_markdown_drift') {
+                      if (pathology.suppressed) {
+                        recordCollabLogSuppressed('projection_drift_loop', reason);
+                        logFragmentDriftSuppressionSummary(slug, pathology.suppressedCount);
+                      }
+                      const driftQuarantine = maybeQuarantineRepeatedFragmentDrift(slug, {
+                        source: 'persist',
+                        event: 'persist_block',
+                        details: {
+                          baselineChars: currentRow.markdown.length,
+                          candidateChars: markdownText.length,
+                        },
+                      });
+                      if (driftQuarantine.quarantined) {
+                        queuedRepairReason = null;
+                        shouldBumpRevision = false;
+                      }
+                    }
+                    const repairLoopQuarantine = maybeQuarantineCollabRepairLoop(slug, 'projection_guard_block', {
+                      source: 'persist',
+                      guardReason: reason,
+                      details: safety.details,
+                      baselineChars: currentRow.markdown.length,
+                      candidateChars: markdownText.length,
+                    });
+                    if (repairLoopQuarantine.quarantined) {
+                      queuedRepairReason = null;
+                    }
+                  }
                 }
               }
             }
           }
         }
       }
-      if (deltaUpdate.byteLength > 0) {
-        const seq = appendYUpdate(slug, deltaUpdate, sourceActor);
-        nextUpdateCount = priorUpdateCount + 1;
-        if (nextUpdateCount >= compactionInterval) {
-          const fullSnapshot = Y.encodeStateAsUpdate(ydoc);
-          saveYSnapshot(slug, seq, fullSnapshot);
-          nextUpdateCount = 0;
+      if (!skipPersistedStateWrite && deltaUpdate.byteLength > 0) {
+        const writeBurst = maybeQuarantineOversizedYjsWriteBurst(slug, deltaUpdate.byteLength, 'persist', sourceActor);
+        if (writeBurst.quarantined) {
+          skipPersistedStateWrite = true;
+          shouldWriteProjection = false;
+          shouldBumpRevision = false;
+          queuedRepairReason = null;
+        } else {
+          try {
+            const seq = appendYUpdate(slug, deltaUpdate, sourceActor);
+            recordPersistedYjsUpdateBytes(deltaUpdate.byteLength, 'persist', 'accepted');
+            nextUpdateCount = priorUpdateCount + 1;
+            if (nextUpdateCount >= compactionInterval) {
+              const fullSnapshot = Y.encodeStateAsUpdate(cloneAuthoritativeDocState(ydoc));
+              saveYSnapshot(slug, seq, fullSnapshot);
+              nextUpdateCount = 0;
+            }
+          } catch (error) {
+            if (error instanceof OversizedYjsUpdateError) {
+              quarantineOversizedYjsUpdate(slug, {
+                bytes: error.bytes,
+                limitBytes: error.limitBytes,
+                source: 'persist',
+                sourceActor: error.sourceActor,
+              });
+              skipPersistedStateWrite = true;
+              shouldWriteProjection = false;
+              shouldBumpRevision = false;
+              queuedRepairReason = null;
+            } else {
+              throw error;
+            }
+          }
         }
       }
       if (shouldWriteProjection) {
@@ -2544,9 +5443,10 @@ async function persistDoc(
         materializeProjection(slug, ydoc, {
           bumpRevision: shouldBumpRevision,
           refreshSnapshot: false,
+          markdownOverride: projectionMarkdownOverride ?? undefined,
           source: 'persist',
         });
-      } else if (deltaUpdate.byteLength > 0) {
+      } else if (!skipPersistedStateWrite && deltaUpdate.byteLength > 0) {
         // Still advance y_state_version even when skipping projection writes
         // to prevent repeated stale-projection detection on startup.
         const yStateVersion = getLatestYStateVersion(slug);
@@ -2554,7 +5454,7 @@ async function persistDoc(
       }
     });
     persistTx();
-    if (aborted) {
+    if (aborted || skipPersistedStateWrite) {
       return;
     }
     if (deltaUpdate.byteLength > 0) {
@@ -2563,11 +5463,30 @@ async function persistDoc(
     if (queuedRepairReason) {
       queueProjectionRepair(slug, queuedRepairReason);
     }
-    lastPersistedStateVectors.set(slug, Y.encodeStateVector(ydoc));
-    refreshLoadedDocDbMetaFromDb(slug, ydoc);
+    const authoritativeBaseline = {
+      snapshot: authoritativeSnapshot,
+      stateVector: authoritativeStateVector,
+    };
+    setAuthoritativeBaseline(slug, authoritativeBaseline);
+    refreshLoadedDocDbMeta(
+      slug,
+      ydoc,
+      getDocumentBySlug(slug)?.updated_at ?? null,
+      getLatestYStateVersion(slug),
+      typeof getDocumentBySlug(slug)?.access_epoch === 'number' ? getDocumentBySlug(slug)?.access_epoch ?? null : null,
+      authoritativeBaseline,
+    );
     refreshSnapshotForSlug(slug);
   } catch (error) {
     console.error('[collab] Failed to persist document:', { slug, error });
+    traceServerIncident({
+      slug,
+      subsystem: 'collab',
+      level: 'error',
+      eventType: 'persist.failed',
+      message: 'Collab failed to persist the current document state',
+      data: toErrorTraceData(error),
+    });
     const currentRow = getDocumentBySlug(slug);
     if (currentRow?.share_state === 'REVOKED' || currentRow?.share_state === 'DELETED') {
       evictLocalDocState(slug);
@@ -2636,6 +5555,12 @@ function maybeLogStaleOnStoreSuppressionSummary(slug: string, reason: string, su
 type StoreConflictResolution =
   | { action: 'persist' }
   | {
+      action: 'canonical-reconcile';
+      markdown: string;
+      marks: Record<string, unknown>;
+      reason: 'canonical_marks_ahead';
+    }
+  | {
       action: 'reload';
       persistedState: PersistedDocState;
       reason: 'access_epoch_mismatch' | 'projection_drift_onstore_reload' | 'concurrent_external_edit';
@@ -2655,13 +5580,17 @@ function applyPersistedStateToLoadedDoc(slug: string, persistedState: PersistedD
   const nextDoc = liveDoc ?? persistedState.ydoc;
   rememberLoadedDoc(slug, nextDoc);
   touchDoc(slug);
-  lastPersistedStateVectors.set(slug, persistedState.stateVector);
+  setAuthoritativeBaseline(slug, {
+    snapshot: persistedState.authoritativeSnapshot,
+    stateVector: persistedState.stateVector,
+  });
   updatesSinceCompaction.set(slug, 0);
   setLoadedDocDbMeta(
     slug,
     persistedState.updatedAt,
     persistedState.yStateVersion,
     persistedState.accessEpoch,
+    persistedState.authoritativeSnapshot,
     persistedState.stateVector,
   );
 }
@@ -2676,18 +5605,353 @@ function scheduleStaleOnStoreReload(slug: string): void {
   }, 0);
 }
 
+function registerGlobalCollabAdmissionGuard(
+  reason: string,
+  details?: Record<string, unknown>,
+): void {
+  const now = Date.now();
+  const cooldownMs = parsePositiveInt(
+    process.env.COLLAB_ADMISSION_GUARD_COOLDOWN_MS,
+    DEFAULT_COLLAB_ADMISSION_GUARD_COOLDOWN_MS,
+  );
+  const existing = getGlobalCollabAdmissionGuardEntry();
+  const nextCount = (existing?.count ?? 0) + 1;
+  const untilMs = now + cooldownMs;
+  const shouldLog = !existing || existing.reason !== reason || untilMs > existing.untilMs;
+  const nextEntry: GlobalCollabAdmissionGuardEntry = {
+    reason,
+    untilMs,
+    triggeredAt: existing?.triggeredAt ?? now,
+    lastTriggeredAt: now,
+    count: nextCount,
+    details,
+  };
+  globalCollabAdmissionGuard = nextEntry;
+  upsertPersistedGlobalCollabAdmissionGuard(nextEntry);
+  recordCollabAdmissionGuard('trip', reason, 'stale_onstore_reload');
+  if (shouldLog) {
+    console.warn('[collab] global admission guard tripped', {
+      reason,
+      cooldownMs,
+      untilMs,
+      count: nextCount,
+      details,
+    });
+    traceServerIncident({
+      subsystem: 'collab',
+      level: 'warn',
+      eventType: 'collab.admission_guard.trip',
+      message: 'Global collab admission guard tripped',
+      data: {
+        reason,
+        cooldownMs,
+        untilMs,
+        count: nextCount,
+        ...(details ? { details } : {}),
+      },
+    });
+  }
+}
+
+function registerAutoCollabQuarantine(
+  slug: string,
+  reason: string,
+  details?: Record<string, unknown>,
+): void {
+  const now = Date.now();
+  const cooldownMs = parsePositiveInt(
+    process.env.COLLAB_AUTO_QUARANTINE_COOLDOWN_MS,
+    DEFAULT_COLLAB_AUTO_QUARANTINE_COOLDOWN_MS,
+  );
+  const existing = getAutoCollabQuarantineEntry(slug);
+  const nextCount = (existing?.count ?? 0) + 1;
+  const untilMs = now + cooldownMs;
+  const shouldLog = !existing || existing.reason !== reason || untilMs > existing.untilMs;
+  autoCollabQuarantines.set(slug, {
+    reason,
+    untilMs,
+    triggeredAt: existing?.triggeredAt ?? now,
+    lastTriggeredAt: now,
+    count: nextCount,
+    details,
+  });
+  setDocumentProjectionHealth(slug, 'quarantined', reason);
+  bumpDocumentAccessEpoch(slug);
+  // Quarantine should fence live sessions and evict stale room state, but keep
+  // the persisted Yjs history intact so canonical reads can recover from it.
+  invalidateLoadedCollabDocument(slug);
+  if (shouldLog) {
+    console.warn('[collab] auto quarantined slug', {
+      slug,
+      reason,
+      cooldownMs,
+      untilMs,
+      count: nextCount,
+      details,
+    });
+  }
+}
+
+function applyDurableCollabQuarantine(slug: string): { projectionQuarantined: boolean; accessEpoch: number | null } {
+  const projectionQuarantined = setDocumentProjectionHealth(slug, 'quarantined', 'COLLAB_AUTO_QUARANTINED');
+  const accessEpoch = bumpDocumentAccessEpoch(slug);
+  // Durable quarantines should fence live sessions but preserve persisted Yjs state.
+  invalidateLoadedCollabDocument(slug);
+  return {
+    projectionQuarantined,
+    accessEpoch,
+  };
+}
+
+export function activateDurableCollabQuarantine(
+  slug: string,
+  options: {
+    reason: string;
+    source?: string;
+    details?: Record<string, unknown>;
+  },
+): { projectionQuarantined: boolean; accessEpoch: number | null } {
+  const projectionQuarantined = setDocumentProjectionHealth(slug, 'quarantined', options.reason);
+  const accessEpoch = bumpDocumentAccessEpoch(slug);
+  invalidateLoadedCollabDocument(slug);
+  const result = {
+    projectionQuarantined,
+    accessEpoch,
+  };
+  console.warn('[collab] durable quarantine activated', {
+    slug,
+    reason: options.reason,
+    source: options.source ?? 'unknown',
+    accessEpoch: result.accessEpoch,
+    details: options.details,
+  });
+  return result;
+}
+
+function noteGlobalCollabAdmissionPathology(
+  slug: string,
+  resolution: Extract<StoreConflictResolution, { action: 'reload' }>,
+  context: { source: 'persistDoc' | 'onStoreDocument'; sourceActor?: string },
+): { tripped: boolean; reason?: string } {
+  const windowMs = parsePositiveInt(
+    process.env.COLLAB_ADMISSION_GUARD_WINDOW_MS,
+    DEFAULT_COLLAB_ADMISSION_GUARD_WINDOW_MS,
+  );
+  const maxEvents = parsePositiveInt(
+    process.env.COLLAB_ADMISSION_GUARD_MAX_EVENTS,
+    DEFAULT_COLLAB_ADMISSION_GUARD_MAX_EVENTS,
+  );
+  const maxSlugs = parsePositiveInt(
+    process.env.COLLAB_ADMISSION_GUARD_MAX_SLUGS,
+    DEFAULT_COLLAB_ADMISSION_GUARD_MAX_SLUGS,
+  );
+  const maxBytes = parsePositiveInt(
+    process.env.COLLAB_ADMISSION_GUARD_MAX_BYTES,
+    DEFAULT_COLLAB_ADMISSION_GUARD_MAX_BYTES,
+  );
+  const maxQuarantined = parsePositiveInt(
+    process.env.COLLAB_ADMISSION_GUARD_MAX_QUARANTINED,
+    DEFAULT_COLLAB_ADMISSION_GUARD_MAX_QUARANTINED,
+  );
+  const now = Date.now();
+  while (globalCollabAdmissionEvents.length > 0 && (now - globalCollabAdmissionEvents[0]!.atMs) > windowMs) {
+    globalCollabAdmissionEvents.shift();
+  }
+  const bytes = Math.max(0, resolution.dbMissingBytes) + Math.max(0, resolution.localUnsavedBytes);
+  globalCollabAdmissionEvents.push({
+    slug,
+    atMs: now,
+    bytes,
+    reason: resolution.reason,
+  });
+  const uniqueSlugs = new Set(globalCollabAdmissionEvents.map((event) => event.slug)).size;
+  const eventCount = globalCollabAdmissionEvents.length;
+  const totalBytes = globalCollabAdmissionEvents.reduce((sum, event) => sum + event.bytes, 0);
+  const activeQuarantined = countDurablyQuarantinedCollabDocuments();
+  const multiSlugStorm = uniqueSlugs > 1;
+  if (getGlobalCollabAdmissionGuardEntry()) {
+    return { tripped: false };
+  }
+
+  let guardReason: string | null = null;
+  if (uniqueSlugs >= maxSlugs) {
+    guardReason = 'stale_onstore_global_slug_breaker';
+  } else if (multiSlugStorm && eventCount >= maxEvents) {
+    guardReason = 'stale_onstore_global_event_breaker';
+  } else if (multiSlugStorm && totalBytes >= maxBytes) {
+    guardReason = 'stale_onstore_global_bytes_breaker';
+  } else if (multiSlugStorm && activeQuarantined >= maxQuarantined) {
+    guardReason = 'stale_onstore_global_quarantine_breaker';
+  }
+
+  if (!guardReason) return { tripped: false };
+
+  registerGlobalCollabAdmissionGuard(guardReason, {
+    source: context.source,
+    sourceActor: context.sourceActor ?? null,
+    lastSlug: slug,
+    lastReason: resolution.reason,
+    windowMs,
+    eventCount,
+    uniqueSlugs,
+    totalBytes,
+    activeQuarantined,
+    thresholds: {
+      maxEvents,
+      maxSlugs,
+      maxBytes,
+      maxQuarantined,
+    },
+  });
+  return { tripped: true, reason: guardReason };
+}
+
+function shouldCountTowardGlobalCollabAdmissionGuard(
+  resolution: Extract<StoreConflictResolution, { action: 'reload' }>,
+  quarantineReason: string | null,
+): boolean {
+  if (quarantineReason) return true;
+  if (resolution.reason === 'concurrent_external_edit') return true;
+  if (resolution.reason === 'projection_drift_onstore_reload') return true;
+  return resolution.projectionDrift === true;
+}
+function noteConcurrentExternalEditReload(slug: string): {
+  tripped: boolean;
+  count: number;
+  windowMs: number;
+  max: number;
+  windowStartMs: number;
+} {
+  const windowMs = parsePositiveInt(
+    process.env.COLLAB_STALE_ONSTORE_CONCURRENT_BREAKER_WINDOW_MS,
+    DEFAULT_STALE_ONSTORE_CONCURRENT_BREAKER_WINDOW_MS,
+  );
+  const max = parsePositiveInt(
+    process.env.COLLAB_STALE_ONSTORE_CONCURRENT_BREAKER_MAX,
+    DEFAULT_STALE_ONSTORE_CONCURRENT_BREAKER_MAX,
+  );
+  const now = Date.now();
+  let state = concurrentExternalEditBreaker.get(slug);
+  if (!state || (now - state.windowStartMs) > windowMs) {
+    state = { windowStartMs: now, count: 0 };
+  }
+  state.count += 1;
+  concurrentExternalEditBreaker.set(slug, state);
+  const tripped = state.count >= max;
+  if (tripped) {
+    concurrentExternalEditBreaker.delete(slug);
+  }
+  return {
+    tripped,
+    count: state.count,
+    windowMs,
+    max,
+    windowStartMs: state.windowStartMs,
+  };
+}
+
+function maybeQuarantineStaleOnStoreReload(
+  slug: string,
+  resolution: Extract<StoreConflictResolution, { action: 'reload' }>,
+  context: { source: 'persistDoc' | 'onStoreDocument'; sourceActor?: string },
+): { quarantined: boolean; reason?: string } {
+  const existingGate = getCollabQuarantineGateStatus(slug);
+  if (existingGate.active) {
+    return {
+      quarantined: true,
+      reason: existingGate.reason ?? 'COLLAB_AUTO_QUARANTINED',
+    };
+  }
+  const dbMissingLimit = parsePositiveInt(
+    process.env.COLLAB_STALE_ONSTORE_DB_MISSING_QUARANTINE_BYTES,
+    DEFAULT_STALE_ONSTORE_DB_MISSING_QUARANTINE_BYTES,
+  );
+  const localUnsavedLimit = parsePositiveInt(
+    process.env.COLLAB_STALE_ONSTORE_LOCAL_UNSAVED_QUARANTINE_BYTES,
+    DEFAULT_STALE_ONSTORE_LOCAL_UNSAVED_QUARANTINE_BYTES,
+  );
+  let quarantineReason: string | null = null;
+  let details: Record<string, unknown> | undefined;
+
+  if (resolution.dbMissingBytes >= dbMissingLimit) {
+    quarantineReason = 'stale_onstore_db_missing_oversized';
+    details = {
+      source: context.source,
+      reason: resolution.reason,
+      dbMissingBytes: resolution.dbMissingBytes,
+      localUnsavedBytes: resolution.localUnsavedBytes,
+      limitBytes: dbMissingLimit,
+      sourceActor: context.sourceActor ?? null,
+    };
+  } else if (resolution.localUnsavedBytes >= localUnsavedLimit) {
+    quarantineReason = 'stale_onstore_local_unsaved_oversized';
+    details = {
+      source: context.source,
+      reason: resolution.reason,
+      dbMissingBytes: resolution.dbMissingBytes,
+      localUnsavedBytes: resolution.localUnsavedBytes,
+      limitBytes: localUnsavedLimit,
+      sourceActor: context.sourceActor ?? null,
+    };
+  } else if (resolution.reason === 'concurrent_external_edit') {
+    const breaker = noteConcurrentExternalEditReload(slug);
+    if (breaker.tripped) {
+      quarantineReason = 'stale_onstore_concurrent_external_breaker';
+      details = {
+        source: context.source,
+        reason: resolution.reason,
+        dbMissingBytes: resolution.dbMissingBytes,
+        localUnsavedBytes: resolution.localUnsavedBytes,
+        count: breaker.count,
+        windowMs: breaker.windowMs,
+        max: breaker.max,
+        windowStartMs: breaker.windowStartMs,
+        sourceActor: context.sourceActor ?? null,
+      };
+    }
+  }
+
+  if (quarantineReason) {
+    registerAutoCollabQuarantine(slug, quarantineReason, details);
+    if (
+      quarantineReason === 'stale_onstore_db_missing_oversized'
+      || quarantineReason === 'stale_onstore_local_unsaved_oversized'
+    ) {
+      recordCollabPathologyQuarantine(quarantineReason, context.source);
+    }
+  }
+  if (shouldCountTowardGlobalCollabAdmissionGuard(resolution, quarantineReason)) {
+    noteGlobalCollabAdmissionPathology(slug, resolution, context);
+  }
+  if (quarantineReason) {
+    return { quarantined: true, reason: quarantineReason };
+  }
+  return { quarantined: false };
+}
+
 function resolveOnStoreConflict(slug: string, inMemoryDoc: Y.Doc): StoreConflictResolution {
   const loadedMeta = loadedDocDbMeta.get(slug);
   if (!loadedMeta) {
     // Missing metadata can happen after local eviction/reload races while a live room
     // is still active. Never blindly persist in-memory state over DB in this case.
     const persistedState = readPersistedDocState(slug);
-    const dbMissingInMemory = Y.encodeStateAsUpdate(
+    const authoritativeInMemoryDoc = buildComparableAuthoritativeDoc(
+      persistedState.authoritativeSnapshot,
+      inMemoryDoc,
+    );
+    const authoritativePersistedDoc = buildComparableAuthoritativeDoc(
+      persistedState.authoritativeSnapshot,
       persistedState.ydoc,
-      Y.encodeStateVector(inMemoryDoc),
+    );
+    const dbMissingInMemory = Y.encodeStateAsUpdate(
+      authoritativePersistedDoc,
+      Y.encodeStateVector(authoritativeInMemoryDoc),
     );
     if (dbMissingInMemory.byteLength > 0) {
-      const inMemoryMissingDb = Y.encodeStateAsUpdate(inMemoryDoc, persistedState.stateVector);
+      const inMemoryMissingDb = Y.encodeStateAsUpdate(
+        authoritativeInMemoryDoc,
+        Y.encodeStateVector(authoritativePersistedDoc),
+      );
       const hasLocalOnlyDelta = inMemoryMissingDb.byteLength > 0;
       return {
         action: 'reload',
@@ -2739,9 +6003,32 @@ function resolveOnStoreConflict(slug: string, inMemoryDoc: Y.Doc): StoreConflict
   if (!versionChanged && !projectionDrift) return { action: 'persist' };
 
   const persistedState = readPersistedDocState(slug);
-  const dbMissingInMemory = Y.encodeStateAsUpdate(
+  const persistedMarks = encodeMarksMap(persistedState.ydoc.getMap('marks'));
+  const canonicalMarksAhead = projectionDrift
+    && stableStringify(rowMarks) !== stableStringify(persistedMarks)
+    && Object.keys(rowMarks).length > 0;
+  if (canonicalMarksAhead) {
+    return {
+      action: 'canonical-reconcile',
+      markdown: rowMarkdown,
+      marks: rowMarks,
+      reason: 'canonical_marks_ahead',
+    };
+  }
+  if (!versionChanged) {
+    return { action: 'persist' };
+  }
+  const authoritativeInMemoryDoc = buildComparableAuthoritativeDoc(
+    loadedMeta.baselineSnapshot,
+    inMemoryDoc,
+  );
+  const authoritativePersistedDoc = buildComparableAuthoritativeDoc(
+    loadedMeta.baselineSnapshot,
     persistedState.ydoc,
-    Y.encodeStateVector(inMemoryDoc),
+  );
+  const dbMissingInMemory = Y.encodeStateAsUpdate(
+    authoritativePersistedDoc,
+    Y.encodeStateVector(authoritativeInMemoryDoc),
   );
   if (dbMissingInMemory.byteLength === 0) {
     return { action: 'persist' };
@@ -2750,6 +6037,12 @@ function resolveOnStoreConflict(slug: string, inMemoryDoc: Y.Doc): StoreConflict
   const localDeltaSinceBaseline = Y.encodeStateAsUpdate(inMemoryDoc, loadedMeta.baselineStateVector);
   if (localDeltaSinceBaseline.byteLength === 0) {
     let logSuppressed = false;
+    if (!projectionDrift && versionChanged) {
+      // No local delta and no projection drift: the in-memory content matches
+      // canonical, the DB just has newer Y state from an external edit. This
+      // reload is clean and doesn't need a stale-reload warning.
+      logSuppressed = true;
+    }
     if (projectionDrift) {
       const reason = 'projection_drift_onstore_skip';
       const suppressionExtras = {
@@ -2787,6 +6080,15 @@ function resolveOnStoreConflict(slug: string, inMemoryDoc: Y.Doc): StoreConflict
   }
 
   let logSuppressed = false;
+  if (!projectionDrift && versionChanged) {
+    // When canonical markdown matches in-memory (no projection drift) but the DB
+    // Y state version moved ahead from an external edit, the in-memory doc's
+    // content is already consistent with canonical state. The local Y delta is
+    // just noise (e.g. text refresh ops) — no meaningful local-only content to
+    // lose. Suppress the warning since this reload is a clean "external edit
+    // wins" resolution, not a pathological event.
+    logSuppressed = true;
+  }
   if (projectionDrift) {
     // When canonical markdown/marks and in-memory projection have drifted, merging
     // stale local deltas can duplicate large sections of text. Prefer canonical DB.
@@ -2800,8 +6102,26 @@ function resolveOnStoreConflict(slug: string, inMemoryDoc: Y.Doc): StoreConflict
     };
     const pathology = registerStaleOnStoreDriftSuppression(slug, reason, suppressionExtras);
     if (!pathology.suppressed) {
-      recordProjectionDrift(reason, 'persist');
-      queueProjectionRepair(slug, reason);
+      // Suppress the warning when the persisted Y state is strictly better than
+      // the in-memory state. Two signals:
+      // 1. The in-memory doc has structural duplication the DB/persisted state doesn't
+      //    (stale local mutation introduced heading repetition → DB wins cleanly).
+      // 2. The persisted markdown already contains all the in-memory content
+      //    (DB is strictly ahead from external edits → reload is clean).
+      const persistedMarkdown = persistedState.ydoc.getText('markdown').toString();
+      const inMemTrimmed = inMemoryMarkdown.trim();
+      const dbSubsumesLocal = inMemTrimmed.length > 0
+        && persistedMarkdown.includes(inMemTrimmed);
+      const inMemIntegrity = summarizeDocumentIntegrity(inMemoryMarkdown);
+      const persistedIntegrity = summarizeDocumentIntegrity(persistedMarkdown);
+      const localDuplicationOnly = inMemIntegrity.repeatedHeadings.length > 0
+        && persistedIntegrity.repeatedHeadings.length === 0;
+      if (dbSubsumesLocal || localDuplicationOnly) {
+        logSuppressed = true;
+      } else {
+        recordProjectionDrift(reason, 'persist');
+        queueProjectionRepair(slug, reason);
+      }
     } else {
       recordCollabLogSuppressed('stale_onstore_drift', reason);
       maybeLogStaleOnStoreSuppressionSummary(slug, reason, pathology.suppressedCount);
@@ -2845,6 +6165,17 @@ async function persistOnStoreDocument(slug: string, inMemoryDoc: Y.Doc): Promise
     });
   }
   const resolution = resolveOnStoreConflict(slug, inMemoryDoc);
+  if (resolution.action === 'canonical-reconcile') {
+    const applied = await applyCanonicalDocumentToCollab(slug, {
+      markdown: resolution.markdown,
+      marks: resolution.marks,
+      source: 'onstore-canonical-reconcile',
+    });
+    if (!applied) {
+      scheduleStaleOnStoreReload(slug);
+    }
+    return;
+  }
   if (resolution.action === 'reload') {
     if (resolution.accessEpochChanged) {
       logStaleEpochWrite(slug, 'onStoreDocument', {
@@ -2854,6 +6185,33 @@ async function persistOnStoreDocument(slug: string, inMemoryDoc: Y.Doc): Promise
       });
     }
     applyPersistedStateToLoadedDoc(slug, resolution.persistedState);
+    // Reconcile canonical row state from persisted Yjs so the authoritative row
+    // reflects external edits that may only have landed in Y updates / projections.
+    // This must also handle clears-to-empty and marks-only external edits.
+    try {
+      const currentRow = getDocumentBySlug(slug);
+      if (currentRow) {
+        const reconciled = canonicalRowDiffersFromPersistedState(currentRow, resolution.persistedState);
+        if (reconciled.markdownChanged || reconciled.marksChanged) {
+          // Only reconcile if the persisted Y state is safe (not pathologically bloated).
+          // Without this guard, pathological Y state could overwrite a healthy canonical row.
+          const safety = evaluateProjectionSafety(
+            currentRow.markdown ?? '',
+            reconciled.markdown,
+            resolution.persistedState.ydoc,
+          );
+          if (safety.safe) {
+            updateDocument(slug, reconciled.markdown, reconciled.marks, resolution.persistedState.yStateVersion);
+          }
+        }
+      }
+    } catch (reconcileError) {
+      console.warn('[collab] failed to reconcile canonical markdown from persisted Y state during onStoreDocument reload', {
+        slug,
+        error: reconcileError instanceof Error ? reconcileError.message : String(reconcileError),
+      });
+    }
+    const quarantine = maybeQuarantineStaleOnStoreReload(slug, resolution, { source: 'onStoreDocument' });
     if (!resolution.logSuppressed) {
       if (resolution.projectionDrift) {
         console.warn('[collab] Stale onStoreDocument merge skipped due projection drift', {
@@ -2876,6 +6234,8 @@ async function persistOnStoreDocument(slug: string, inMemoryDoc: Y.Doc): Promise
         currentYStateVersion: resolution.currentYStateVersion,
         dbMissingBytes: resolution.dbMissingBytes,
         localUnsavedBytes: resolution.localUnsavedBytes,
+        autoQuarantined: quarantine.quarantined,
+        autoQuarantineReason: quarantine.reason ?? null,
       });
     }
     scheduleStaleOnStoreReload(slug);
@@ -3014,9 +6374,52 @@ type CollabExternalApplyOptions = {
   markdown?: string;
   marks?: Record<string, unknown>;
   source?: string;
+  preserveLoadedDoc?: boolean;
 };
 
 const externalApplyQueues = new Map<string, Promise<boolean>>();
+
+function shouldBlockLegacyLiveApplySource(source: string): boolean {
+  if (!source) return false;
+  return source === 'rest-put'
+    || source === 'engine'
+    || source === 'engine-suggestion-accept'
+    || source === 'library'
+    || source.startsWith('agent')
+    || source.startsWith('rewrite:');
+}
+
+function markProjectionStaleForLegacyReverseFlowBlock(
+  slug: string,
+  source: string,
+  liveState: 'live_doc' | 'loaded_doc',
+  options: {
+    hasHocuspocusEntry: boolean;
+    hadLoadedDoc: boolean;
+  },
+): boolean {
+  const alreadyQuarantined = getDocumentProjectionBySlug(slug)?.health === 'quarantined';
+  const projectionMarkedStale = !alreadyQuarantined && setDocumentProjectionHealth(slug, 'projection_stale');
+  if (projectionMarkedStale) {
+    recordProjectionMarkedStale('legacy_reverse_flow_blocked', 'persist');
+  }
+  traceServerIncident({
+    slug,
+    subsystem: 'collab',
+    level: 'warn',
+    eventType: 'legacy_reverse_flow_apply.blocked',
+    message: 'Blocked legacy reverse-flow apply on live shared doc',
+    data: {
+      source,
+      liveState,
+      alreadyQuarantined,
+      hasHocuspocusEntry: options.hasHocuspocusEntry,
+      hadLoadedDoc: options.hadLoadedDoc,
+      projectionMarkedStale,
+    },
+  });
+  return projectionMarkedStale;
+}
 
 function getLiveHocuspocusDoc(slug: string): Y.Doc | null {
   if (!slug) return null;
@@ -3121,6 +6524,24 @@ async function getOrLoadHocuspocusDoc(
   return { doc: null };
 }
 
+async function waitForLiveHocuspocusDocRegistration(slug: string): Promise<Y.Doc | null> {
+  const timeoutMs = parsePositiveInt(
+    process.env.COLLAB_LIVE_DOC_REGISTRATION_GRACE_MS,
+    1500,
+  );
+  const pollMs = parsePositiveInt(
+    process.env.COLLAB_LIVE_DOC_REGISTRATION_POLL_MS,
+    100,
+  );
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const liveDoc = getLiveHocuspocusDoc(slug);
+    if (liveDoc) return liveDoc;
+    await new Promise((resolve) => setTimeout(resolve, pollMs));
+  }
+  return getLiveHocuspocusDoc(slug);
+}
+
 async function applyCanonicalDocumentToCollabInner(
   slug: string,
   options: CollabExternalApplyOptions,
@@ -3158,6 +6579,24 @@ async function applyCanonicalDocumentToCollabInner(
   const { markdown, marks, source } = options;
   const origin = source ?? 'external-write';
   const debugConvergence = (process.env.COLLAB_DEBUG_FRAGMENT_CONVERGENCE || '').trim() === '1';
+
+  if (hadLiveDoc && shouldBlockLegacyLiveApplySource(origin)) {
+    const liveState = hasHocuspocusEntry ? 'live_doc' : 'loaded_doc';
+    recordLegacyReverseFlowBlocked(origin, liveState);
+    const projectionMarkedStale = markProjectionStaleForLegacyReverseFlowBlock(slug, origin, liveState, {
+      hasHocuspocusEntry,
+      hadLoadedDoc,
+    });
+    console.error('[collab] blocked legacy reverse-flow apply on live shared doc', {
+      slug,
+      source: origin,
+      liveState,
+      hasHocuspocusEntry,
+      hadLoadedDoc,
+      projectionMarkedStale,
+    });
+    return false;
+  }
 
   const sanitizedMarkdown = typeof markdown === 'string'
     ? stripEphemeralCollabSpans(markdown)
@@ -3224,14 +6663,14 @@ async function applyCanonicalDocumentToCollabInner(
         // Authoritative external writes should replace fragment state to avoid stale merge duplication.
         replaceYXmlFragment(fragment, pmDoc);
       }
-      if (sanitizedMarkdown !== undefined) {
-        applyYTextDiff(ydoc!.getText('markdown'), sanitizedMarkdown);
-      }
       if (marks) {
         applyMarksMapDiff(ydoc!.getMap('marks'), marks);
       }
     }, origin);
 
+    if (pmDoc) {
+      ensureFragmentEditTracking(ydoc).dirty = true;
+    }
     touchDoc(slug);
 
     // Persist immediately so DB projection and Yjs persistence stay consistent.
@@ -3241,6 +6680,7 @@ async function applyCanonicalDocumentToCollabInner(
       persistTimers.delete(slug);
     }
     rememberLoadedDoc(slug, ydoc);
+    const baselineBeforeWrite = getAuthoritativeBaseline(slug) ?? EMPTY_AUTHORITATIVE_BASELINE;
     const currentRow = getDocumentBySlug(slug);
     refreshLoadedDocDbMeta(
       slug,
@@ -3248,12 +6688,12 @@ async function applyCanonicalDocumentToCollabInner(
       currentRow?.updated_at ?? null,
       getLatestYStateVersion(slug),
       typeof currentRow?.access_epoch === 'number' ? currentRow.access_epoch : null,
+      baselineBeforeWrite,
     );
     markSkipNextOnStorePersist(slug, ydoc);
-    // When applying canonical external writes, always persist the full Yjs state (not a
-    // delta from the prior vector).  The Yjs WAL may have been cleared by a preceding
-    // invalidation barrier, so a delta-only update would be unreadable without its base.
-    lastPersistedStateVectors.delete(slug);
+    // Preserve the last persisted authoritative baseline so persistDoc can encode
+    // a lineage-compatible delta. Invalidation paths already clear the baseline
+    // when the WAL has actually been torn down.
     await persistDoc(slug, ydoc, origin);
 
     if (debugConvergence) {
@@ -3279,9 +6719,9 @@ async function applyCanonicalDocumentToCollabInner(
 
     // If we created the doc just for persistence (no connected clients), don't keep it
     // in memory. Future connects will hydrate from DB/Yjs updates.
-    if (!hadLiveDoc) {
+    if (!hadLiveDoc && !options.preserveLoadedDoc) {
       loadedDocs.delete(slug);
-      lastPersistedStateVectors.delete(slug);
+      clearAuthoritativeBaseline(slug);
       updatesSinceCompaction.delete(slug);
       loadedDocDbMeta.delete(slug);
       docLastAccessedAt.delete(slug);
@@ -3312,27 +6752,18 @@ export async function getLoadedCollabMarkdownForVerification(
 ): Promise<{ markdown: string | null; source: 'ytext' | 'fragment' | 'none' }> {
   const ydoc = getLiveHocuspocusDoc(slug) ?? loadedDocs.get(slug);
   if (!ydoc) return { markdown: null, source: 'none' };
-  try {
-    const fragmentState = ensureFragmentEditTracking(ydoc);
-    const ytext = ydoc.getText('markdown').toString();
-    const sanitizedYtext = stripEphemeralCollabSpans(ytext);
-    const shouldPreferFragment = fragmentState.dirty || sanitizedYtext !== ytext;
-    if (shouldPreferFragment) {
-      const derived = await deriveMarkdownProjectionFromFragment(ydoc);
-      if (derived !== null) {
-        return { markdown: derived, source: 'fragment' };
-      }
-    }
-    return { markdown: ytext, source: 'ytext' };
-  } catch {
-    return { markdown: null, source: 'none' };
-  }
+  return sampleYDocMarkdownForVerification(slug, ydoc);
 }
 
 export async function getLoadedCollabMarkdownFromFragment(slug: string): Promise<string | null> {
   const ydoc = getLiveHocuspocusDoc(slug) ?? loadedDocs.get(slug);
   if (!ydoc) return null;
-  return deriveMarkdownProjectionFromFragment(ydoc);
+  const resolved = await resolveLoadedDocFragmentMarkdown(slug, ydoc, {
+    allowRecovery: true,
+    refreshCache: false,
+    sourceActor: 'server-read-fragment',
+  });
+  return resolved.markdown;
 }
 
 export function getLoadedCollabLastChangedAt(slug: string): number | null {
@@ -3404,7 +6835,6 @@ export function applyAgentPresenceToLoadedCollab(
   }, 'agent-presence');
 
   touchDoc(slug);
-  schedulePersistDoc(slug, ydoc);
 
   // Expire presence after inactivity.
   const expiryAt = typeof incoming.at === 'string' && incoming.at.trim().length > 0
@@ -3463,7 +6893,6 @@ export function removeAgentPresenceFromLoadedCollab(
 
   if (!removed) return false;
   touchDoc(slug);
-  schedulePersistDoc(slug, ydoc);
   return true;
 }
 
@@ -3631,7 +7060,7 @@ export async function applyCanonicalDocumentToCollabWithVerification(
 
   yStateVersion = getLatestYStateVersion(slug);
   const reason = (() => {
-    const hasLiveDoc = getLoadedCollabMarkdown(slug) !== null;
+    const hasLiveDoc = hasLoadedCollabDoc(slug) || getLiveHocuspocusDoc(slug) !== null;
     if (!hasLiveDoc && liveFragmentTextHash === null) return 'no_live_doc';
     if (!markdownConfirmed && !fragmentConfirmed) return 'markdown_fragment_mismatch';
     if (!markdownConfirmed) return 'markdown_mismatch';
@@ -3641,7 +7070,7 @@ export async function applyCanonicalDocumentToCollabWithVerification(
   if (reason === 'no_live_doc') {
     return {
       applied: true,
-      confirmed: true,
+      confirmed: false,
       reason,
       yStateVersion,
       markdownConfirmed,
@@ -3742,7 +7171,7 @@ export async function verifyCanonicalDocumentInLoadedCollab(
   }
 
   const reason = (() => {
-    const hasLiveDoc = getLoadedCollabMarkdown(slug) !== null;
+    const hasLiveDoc = hasLoadedCollabDoc(slug) || getLiveHocuspocusDoc(slug) !== null;
     if (!hasLiveDoc && liveFragmentTextHash === null) return 'no_live_doc';
     if (!markdownConfirmed && !fragmentConfirmed) return 'markdown_fragment_mismatch';
     if (!markdownConfirmed) return 'markdown_mismatch';
@@ -3752,7 +7181,7 @@ export async function verifyCanonicalDocumentInLoadedCollab(
   if (reason === 'no_live_doc') {
     return {
       applied: false,
-      confirmed: true,
+      confirmed: false,
       reason,
       yStateVersion: getLatestYStateVersion(slug),
       markdownConfirmed,
@@ -3789,14 +7218,15 @@ function parseCanonicalMarks(raw: string): Record<string, unknown> {
 
 function evictLocalDocState(slug: string): void {
   loadedDocs.delete(slug);
-  lastPersistedStateVectors.delete(slug);
+  persistedDocCache.delete(slug);
+  clearAuthoritativeBaseline(slug);
   updatesSinceCompaction.delete(slug);
   loadedDocDbMeta.delete(slug);
   docLastAccessedAt.delete(slug);
   docLastChangedAt.delete(slug);
   warnedReadOnlyPersistSlugs.delete(slug);
   lastProjectionLengths.delete(slug);
-  clearAllSlugPathologyCooldowns(slug);
+  clearProjectionPathologyCooldownsForSlug(slug);
 }
 
 function dropHocuspocusDocumentReference(slug: string): void {
@@ -3972,6 +7402,9 @@ async function scanAndQueueSuspiciousProjectionRepairs(
   let queuedCount = 0;
   for (const candidate of candidates) {
     if (expectedGeneration !== projectionRepairWorkerGeneration) return;
+    if (isCollabQuarantined(candidate.slug)) {
+      continue;
+    }
     const reasons: string[] = [];
     let markdownChars = candidate.markdown_chars;
     if (candidate.latest_y_state_version > candidate.y_state_version) {
@@ -4003,7 +7436,10 @@ async function scanAndQueueSuspiciousProjectionRepairs(
       const sameFingerprint = seen?.fingerprint === fingerprint;
       const withinCooldown = seen ? (now - seen.queuedAt) < oversizedCooldownMs : false;
       const oversizedCooldownActive = sameFingerprint && withinCooldown;
-      if (oversizedCooldownActive) continue;
+      if (oversizedCooldownActive) {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        continue;
+      }
       reasons.push('oversized_projection');
       projectionRepairWorkerOversizedSeen.set(candidate.slug, {
         fingerprint,
@@ -4109,7 +7545,10 @@ export async function reconcileCanonicalDocumentToYjs(
     applyMarksMapDiff(ydoc.getMap('marks'), marks);
   }, source);
   rememberLoadedDoc(slug, ydoc);
-  lastPersistedStateVectors.set(slug, persisted.stateVector);
+  setAuthoritativeBaseline(slug, {
+    snapshot: persisted.authoritativeSnapshot,
+    stateVector: persisted.stateVector,
+  });
   updatesSinceCompaction.set(slug, 0);
   touchDoc(slug);
   void persistDoc(slug, ydoc, source);
@@ -4121,20 +7560,26 @@ function evictIdleDocs(): void {
   const maxLoadedDocs = parsePositiveInt(process.env.COLLAB_MAX_LOADED_DOCS, DEFAULT_MAX_LOADED_DOCS);
   const idleTimeoutMs = parsePositiveInt(process.env.COLLAB_DOC_IDLE_TIMEOUT_MS, DEFAULT_DOC_IDLE_TIMEOUT_MS);
   const now = Date.now();
+  let trackedDocCount = new Set<string>([
+    ...loadedDocs.keys(),
+    ...persistedDocCache.keys(),
+  ]).size;
 
   const evictionCandidates = [...docLastAccessedAt.entries()]
     .sort((a, b) => a[1] - b[1]);
 
   for (const [slug, lastAccessedAt] of evictionCandidates) {
-    if (!loadedDocs.has(slug)) {
-      docLastAccessedAt.delete(slug);
+    const hasLoadedDoc = loadedDocs.has(slug);
+    const hasPersistedDoc = persistedDocCache.has(slug);
+    if (!hasLoadedDoc && !hasPersistedDoc) {
+      evictLocalDocState(slug);
       continue;
     }
     const shouldEvictForIdle = (now - lastAccessedAt) > idleTimeoutMs;
-    const shouldEvictForCapacity = loadedDocs.size > maxLoadedDocs;
+    const shouldEvictForCapacity = trackedDocCount > maxLoadedDocs;
     if (!shouldEvictForIdle && !shouldEvictForCapacity) continue;
 
-    const ydoc = loadedDocs.get(slug);
+    const ydoc = hasLoadedDoc ? loadedDocs.get(slug) : undefined;
     if (ydoc) {
       void persistOnStoreDocument(slug, ydoc).catch((error) => {
         console.error('[collab] Failed to persist evicted document:', { slug, error });
@@ -4146,11 +7591,8 @@ function evictIdleDocs(): void {
       clearTimeout(timer);
       persistTimers.delete(slug);
     }
-    loadedDocs.delete(slug);
-    lastPersistedStateVectors.delete(slug);
-    updatesSinceCompaction.delete(slug);
-    loadedDocDbMeta.delete(slug);
-    docLastAccessedAt.delete(slug);
+    evictLocalDocState(slug);
+    trackedDocCount = Math.max(0, trackedDocCount - 1);
   }
 }
 
@@ -4174,28 +7616,66 @@ export function buildCollabSession(
     wsUrlBase?: string | null;
   },
 ): CollabSessionInfo | null {
+  const startedAtMs = Date.now();
   const doc = getDocumentAuthStateBySlug(slug);
-  if (!doc || !doc.doc_id || typeof doc.access_epoch !== 'number') return null;
+  if (!doc || !doc.doc_id || typeof doc.access_epoch !== 'number') {
+    const durationMs = Math.max(0, Date.now() - startedAtMs);
+    recordCollabSessionBuildLatency('missing_auth_state', role, durationMs);
+    traceServerIncident({
+      slug,
+      subsystem: 'collab',
+      level: 'warn',
+      eventType: 'collab.build_session',
+      message: 'Unable to build collab session because auth state is missing',
+      data: {
+        role,
+        durationMs,
+        result: 'missing_auth_state',
+      },
+    });
+    return null;
+  }
+  const liveCollabBlock = getLiveCollabBlockStatus(slug);
+  if (liveCollabBlock.active) {
+    const durationMs = Math.max(0, Date.now() - startedAtMs);
+    const blockCode = liveCollabBlock.code ?? 'COLLAB_AUTO_QUARANTINED';
+    const result = blockCode === 'COLLAB_ADMISSION_GUARDED'
+      ? 'admission_guarded'
+      : (blockCode === 'HOT_SLUG_QUARANTINED' ? 'hot_slug_quarantined' : 'quarantined');
+    recordCollabSessionBuildLatency(result, role, durationMs);
+    if (blockCode === 'COLLAB_ADMISSION_GUARDED') {
+      recordCollabAdmissionGuard('block', liveCollabBlock.reason ?? 'unknown', 'build_session');
+    }
+    traceServerIncident({
+      slug,
+      subsystem: 'collab',
+      level: 'warn',
+      eventType: 'collab.build_session',
+      message: 'Refusing to build collab session while unhealthy-doc live collab blocking is active',
+      data: {
+        role,
+        durationMs,
+        result,
+        blockCode,
+        blockReason: liveCollabBlock.reason,
+        blockUntilMs: liveCollabBlock.untilMs,
+      },
+    });
+    return null;
+  }
   evictStaleLocalStateForAccessEpoch(slug, doc.access_epoch);
-  evictStaleLocalStateForPersistedVersion(slug, doc.updated_at ?? null, getLatestYStateVersion(slug));
+  evictStaleLocalStateForPersistedVersion(slug, getDocumentBySlug(slug)?.updated_at ?? null, getLatestYStateVersion(slug));
 
   const ttlSeconds = parsePositiveInt(process.env.COLLAB_SESSION_TTL_SECONDS, DEFAULT_COLLAB_SESSION_TTL_SECONDS);
   const expiresAtEpoch = Math.floor(Date.now() / 1000) + ttlSeconds;
   noteRecentCollabSessionLease(slug, doc.access_epoch, ttlSeconds * 1000);
   noteDocumentLiveCollabLease(slug, doc.access_epoch);
-  console.warn('[collab] buildCollabSession lease noted', {
+  console.log('[collab] buildCollabSession lease noted', {
     slug,
     role,
     accessEpoch: doc.access_epoch,
     tokenId: options?.tokenId ?? null,
     ttlSeconds,
-  });
-  upsertActiveCollabConnection({
-    connectionId: buildCollabSessionLeaseConnectionId(slug, doc.access_epoch, role, options?.tokenId ?? null),
-    slug,
-    role,
-    accessEpoch: doc.access_epoch,
-    instanceId: `${ACTIVE_COLLAB_INSTANCE_ID}:session-lease`,
   });
   const token = signCollabClaims({
     slug,
@@ -4206,8 +7686,29 @@ export function buildCollabSession(
     jti: randomUUID(),
   });
   const snapshot = getLatestYSnapshot(slug);
+  const persistedStateVersion = Math.max(
+    snapshot?.version ?? 0,
+    getDocumentBySlug(slug)?.y_state_version ?? 0,
+  );
   const wsUrlBase = (options?.wsUrlBase || runtime.wsUrlBase || '').replace(/\/+$/, '');
-  if (!wsUrlBase) return null;
+  if (!wsUrlBase) {
+    const durationMs = Math.max(0, Date.now() - startedAtMs);
+    recordCollabSessionBuildLatency('missing_ws_url', role, durationMs);
+    traceServerIncident({
+      slug,
+      subsystem: 'collab',
+      level: 'warn',
+      eventType: 'collab.build_session',
+      message: 'Unable to build collab session because WS base URL is missing',
+      data: {
+        role,
+        accessEpoch: doc.access_epoch,
+        durationMs,
+        result: 'missing_ws_url',
+      },
+    });
+    return null;
+  }
   let collabWsUrl = wsUrlBase;
   try {
     const url = new URL(wsUrlBase);
@@ -4223,7 +7724,7 @@ export function buildCollabSession(
   } catch {
     collabWsUrl = `${wsUrlBase}?slug=${encodeURIComponent(slug)}`;
   }
-  return {
+  const session: CollabSessionInfo = {
     docId: doc.doc_id,
     slug,
     role,
@@ -4232,9 +7733,29 @@ export function buildCollabSession(
     syncProtocol: 'pm-yjs-v1',
     collabWsUrl,
     token,
-    snapshotVersion: snapshot?.version ?? 0,
+    snapshotVersion: persistedStateVersion,
     expiresAt: new Date(expiresAtEpoch * 1000).toISOString(),
   };
+  const durationMs = Math.max(0, Date.now() - startedAtMs);
+  recordCollabSessionBuildLatency('success', role, durationMs);
+  if (durationMs >= 250) {
+    traceServerIncident({
+      slug,
+      subsystem: 'collab',
+      level: 'info',
+      eventType: 'collab.build_session',
+      message: 'Built collab session',
+      data: {
+        role,
+        accessEpoch: doc.access_epoch,
+        snapshotVersion: session.snapshotVersion,
+        tokenId: options?.tokenId ?? null,
+        durationMs,
+        result: 'success',
+      },
+    });
+  }
+  return session;
 }
 
 export function handleCollabWebSocketConnection(socket: unknown, request: unknown): void {
@@ -4378,7 +7899,7 @@ export async function startCollabRuntime(mainHttpPort: number): Promise<CollabRu
             persistTimers.delete(data.documentName);
           }
           loadedDocs.delete(data.documentName);
-          lastPersistedStateVectors.delete(data.documentName);
+          clearAuthoritativeBaseline(data.documentName);
           updatesSinceCompaction.delete(data.documentName);
           loadedDocDbMeta.delete(data.documentName);
           docLastAccessedAt.delete(data.documentName);
@@ -4543,7 +8064,7 @@ export async function startCollabRuntimeEmbedded(mainHttpPort: number): Promise<
             persistTimers.delete(data.documentName);
           }
           loadedDocs.delete(data.documentName);
-          lastPersistedStateVectors.delete(data.documentName);
+          clearAuthoritativeBaseline(data.documentName);
           updatesSinceCompaction.delete(data.documentName);
           loadedDocDbMeta.delete(data.documentName);
           docLastAccessedAt.delete(data.documentName);
@@ -4646,54 +8167,42 @@ export async function startCollabRuntimeAttached(mainHttpServer: HttpServer, mai
       }) {
         const token = data.requestParameters.get('token')
           || extractCollabTokenFromHeaders((data as unknown as { requestHeaders?: unknown }).requestHeaders);
-        const claims = verifyCollabToken(token);
-        if (!claims || claims.slug !== data.documentName) {
-          if (debugOnConnect) {
-            const keys = Array.from(new Set(Array.from(data.requestParameters.keys()))).slice(0, 20);
-            const headerKeys = Object.keys(((data as any)?.requestHeaders ?? {}) as Record<string, unknown>).slice(0, 20);
-            console.warn('[collab][onConnect] permission-denied', {
-              dataKeys: Object.keys(data as unknown as Record<string, unknown>),
-              documentName: data.documentName,
-              tokenLen: token.length,
-              tokenDots: token.split('.').length - 1,
-              paramKeys: keys,
-              paramName: data.requestParameters.get('name') || null,
-              paramDoc: data.requestParameters.get('document') || null,
-              paramDocumentName: data.requestParameters.get('documentName') || null,
-              headerKeys,
+        try {
+          const auth = authenticateCollabSession(data.documentName, token);
+          data.connection.readOnly = !auth.canWrite;
+          return attachAuthenticatedCollabPresence(data.socketId, auth);
+        } catch (error) {
+          // Only invalid or wrong-document tokens get extra incident logging here.
+          // session-stale / paused / revoked are expected reason-specific denials.
+          if ((error as Error)?.message === 'permission-denied') {
+            traceServerIncident({
+              slug: data.documentName,
+              subsystem: 'collab',
+              level: 'warn',
+              eventType: 'auth.permission_denied',
+              message: 'Collab connection rejected because the token was invalid or for the wrong document',
+              data: {
+                tokenPresent: token.length > 0,
+              },
             });
+            if (debugOnConnect) {
+              const keys = Array.from(new Set(Array.from(data.requestParameters.keys()))).slice(0, 20);
+              const headerKeys = Object.keys(((data as any)?.requestHeaders ?? {}) as Record<string, unknown>).slice(0, 20);
+              console.warn('[collab][onConnect] permission-denied', {
+                dataKeys: Object.keys(data as unknown as Record<string, unknown>),
+                documentName: data.documentName,
+                tokenLen: token.length,
+                tokenDots: token.split('.').length - 1,
+                paramKeys: keys,
+                paramName: data.requestParameters.get('name') || null,
+                paramDoc: data.requestParameters.get('document') || null,
+                paramDocumentName: data.requestParameters.get('documentName') || null,
+                headerKeys,
+              });
+            }
           }
-          throw new Error('permission-denied');
+          throw error;
         }
-
-        const doc = getDocumentAuthStateBySlug(data.documentName);
-        if (!doc || doc.share_state === 'DELETED') {
-          throw new Error('document-not-found');
-        }
-        if (typeof doc.access_epoch === 'number' && claims.accessEpoch !== doc.access_epoch) {
-          throw new Error('session-stale');
-        }
-        if (doc.share_state === 'REVOKED' && claims.role !== 'owner_bot') {
-          throw new Error('document-revoked');
-        }
-        if (doc.share_state === 'PAUSED' && claims.role !== 'owner_bot') {
-          throw new Error('document-paused');
-        }
-
-        const canWrite = (
-          (claims.role === 'owner_bot'
-            && (doc.share_state === 'ACTIVE' || doc.share_state === 'PAUSED'))
-          || (claims.role === 'editor' && doc.share_state === 'ACTIVE')
-        );
-        data.connection.readOnly = !canWrite;
-
-        return attachAuthenticatedCollabPresence(data.socketId, {
-          slug: claims.slug,
-          role: claims.role,
-          shareState: doc.share_state,
-          canWrite,
-          accessEpoch: typeof doc.access_epoch === 'number' ? doc.access_epoch : null,
-        });
       },
       async onDisconnect(data: { context?: unknown }) {
         detachAuthenticatedCollabPresence(data.context);
@@ -4727,7 +8236,7 @@ export async function startCollabRuntimeAttached(mainHttpServer: HttpServer, mai
             persistTimers.delete(data.documentName);
           }
           loadedDocs.delete(data.documentName);
-          lastPersistedStateVectors.delete(data.documentName);
+          clearAuthoritativeBaseline(data.documentName);
           updatesSinceCompaction.delete(data.documentName);
           loadedDocDbMeta.delete(data.documentName);
           docLastAccessedAt.delete(data.documentName);
@@ -4883,6 +8392,8 @@ export async function stopCollabRuntime(): Promise<void> {
     }
   }
   loadedDocs.clear();
+  persistedDocCache.clear();
+  lastPersistedAuthoritativeSnapshots.clear();
   lastPersistedStateVectors.clear();
   updatesSinceCompaction.clear();
   persistGeneration.clear();
@@ -4897,9 +8408,18 @@ export async function stopCollabRuntime(): Promise<void> {
   projectionRepairRunning.clear();
   projectionRepairRetryIndex.clear();
   projectionRepairReasons.clear();
+  projectionRepairCycleIds.clear();
   projectionPathologyCooldowns.clear();
   staleOnStoreDriftCooldowns.clear();
   collabWsOversizeCooldowns.clear();
+  collabRepairGuardEscalationBreaker.clear();
+  collabRepairGuardLogCooldowns.clear();
+  nextProjectionRepairCycleId = 1;
+  autoCollabQuarantines.clear();
+  globalCollabAdmissionEvents.length = 0;
+  globalCollabAdmissionGuard = null;
+  concurrentExternalEditBreaker.clear();
+  collabRepairLoopBreaker.clear();
   projectionRepairWorkerOversizedSeen.clear();
   if (projectionRepairWorkerTimer) {
     clearTimeout(projectionRepairWorkerTimer);
@@ -4918,7 +8438,7 @@ export async function stopCollabRuntime(): Promise<void> {
   }
   collabInvalidationReleaseTimers.clear();
   collabInvalidations.clear();
-  skipOnStoreStateVectors.clear();
+  skipOnStoreFingerprints.clear();
   if (current && typeof current.destroy === 'function') {
     await Promise.resolve(current.destroy());
   }
@@ -4931,6 +8451,245 @@ export function __unsafeGetHocuspocusInstanceForTests(): unknown {
 
 export function __unsafeGetLoadedDocForTests(slug: string): Y.Doc | null {
   return loadedDocs.get(slug) ?? null;
+}
+
+export function __unsafeHasPersistedDocCacheForTests(slug: string): boolean {
+  return persistedDocCache.has(slug);
+}
+
+export function __unsafeRunDocEvictionForTests(): void {
+  evictIdleDocs();
+}
+
+export function __unsafeGetProjectionRepairStateForTests(slug?: string): {
+  hasTimer: boolean;
+  hasInFlight: boolean;
+  retryIndex: number | null;
+  cycleId: number | null;
+  reasons: string[];
+  timers: number;
+  inFlight: number;
+  epoch: number;
+} {
+  return {
+    hasTimer: typeof slug === 'string' ? projectionRepairScheduled.has(slug) : false,
+    hasInFlight: typeof slug === 'string' ? projectionRepairRunning.has(slug) : false,
+    retryIndex: typeof slug === 'string' ? (projectionRepairRetryIndex.get(slug) ?? null) : null,
+    cycleId: typeof slug === 'string' ? (projectionRepairCycleIds.get(slug) ?? null) : null,
+    reasons: typeof slug === 'string' ? [...(projectionRepairReasons.get(slug) ?? new Set<string>())] : [],
+    timers: projectionRepairScheduled.size,
+    inFlight: projectionRepairRunning.size,
+    epoch: projectionRepairWorkerGeneration,
+  };
+}
+
+export function __unsafeMaybeQuarantineStaleOnStoreReloadForTests(
+  slug: string,
+  options: {
+    reason?: 'access_epoch_mismatch' | 'projection_drift_onstore_reload' | 'concurrent_external_edit';
+    dbMissingBytes?: number;
+    localUnsavedBytes?: number;
+    source?: 'persistDoc' | 'onStoreDocument';
+    sourceActor?: string;
+  } = {},
+): { quarantined: boolean; reason?: string } {
+  const ydoc = new Y.Doc();
+  const authoritativeBaseline = buildAuthoritativeBaseline(ydoc);
+  return maybeQuarantineStaleOnStoreReload(slug, {
+    action: 'reload',
+    persistedState: {
+      ydoc,
+      updatedAt: null,
+      yStateVersion: 0,
+      accessEpoch: null,
+      authoritativeSnapshot: authoritativeBaseline.snapshot,
+      stateVector: authoritativeBaseline.stateVector,
+    },
+    reason: options.reason ?? 'concurrent_external_edit',
+    accessEpochChanged: options.reason === 'access_epoch_mismatch',
+    projectionDrift: options.reason === 'projection_drift_onstore_reload',
+    loadedUpdatedAt: null,
+    currentUpdatedAt: null,
+    loadedYStateVersion: 0,
+    currentYStateVersion: 1,
+    dbMissingBytes: options.dbMissingBytes ?? 0,
+    localUnsavedBytes: options.localUnsavedBytes ?? 0,
+  }, {
+    source: options.source ?? 'onStoreDocument',
+    sourceActor: options.sourceActor,
+  });
+}
+
+export function __unsafeAuthenticateCollabSessionForTests(documentName: string, token: string): CollabAuthContext {
+  return authenticateCollabSession(documentName, token);
+}
+
+export async function __unsafeReadPersistedDocStateAsyncForTests(slug: string): Promise<PersistedDocState> {
+  return readPersistedDocStateAsync(slug);
+}
+
+export function __unsafeMaybeQuarantineCollabRepairLoopForTests(
+  slug: string,
+  options: {
+    pathology?: 'empty_fragment_repair' | 'empty_fragment_projection' | 'projection_guard_block';
+    details?: Record<string, unknown>;
+  } = {},
+): { quarantined: boolean; reason?: string } {
+  return maybeQuarantineCollabRepairLoop(
+    slug,
+    options.pathology ?? 'projection_guard_block',
+    options.details,
+  );
+}
+
+export function __unsafeMaybeQuarantineRepeatedRepairGuardBlockForTests(
+  slug: string,
+  options: {
+    source?: ProjectionOperationSource;
+    guardReason?: string;
+    details?: Record<string, unknown>;
+    extras?: Record<string, unknown>;
+  } = {},
+): { quarantined: boolean; reason?: string; suppressed: boolean } {
+  return maybeQuarantineRepeatedRepairGuardBlock(slug, {
+    source: options.source ?? 'persist',
+    guardReason: options.guardReason ?? 'growth_multiplier_exceeded',
+    details: options.details,
+    extras: options.extras,
+  });
+}
+
+export function __unsafeMaybeQuarantineRepeatedFragmentDriftForTests(
+  slug: string,
+  options: {
+    source?: 'persist' | 'repair' | 'materialize';
+    event?: 'persist_block' | 'repair_success' | 'projection_wipe';
+    details?: Record<string, unknown>;
+  } = {},
+): { quarantined: boolean; reason?: string; suppressed: boolean } {
+  return maybeQuarantineRepeatedFragmentDrift(slug, {
+    source: options.source ?? 'persist',
+    event: options.event ?? 'persist_block',
+    details: options.details,
+  });
+}
+
+export function __unsafeMaybeQuarantineRepeatedLargeDocPathologyForTests(
+  slug: string,
+  options: {
+    kind?: 'legacy_reseed' | 'pending_delta_clear';
+    source?: string;
+    details?: Record<string, unknown>;
+  } = {},
+): { quarantined: boolean; reason?: string; suppressed: boolean } {
+  return maybeQuarantineRepeatedLargeDocPathology(slug, options.kind ?? 'pending_delta_clear', {
+    source: options.source ?? 'test',
+    details: options.details,
+  });
+}
+
+export function __unsafeNoteDocumentIntegrityWarningForTests(
+  slug: string,
+  options: {
+    actor?: string;
+    revision?: number;
+    integrity?: Partial<DocumentIntegrityWarning>;
+    source?: string;
+  } = {},
+): { severe: boolean; quarantined: boolean; reason: string | null; suppressed: boolean } {
+  return noteDocumentIntegrityWarning(slug, {
+    actor: options.actor ?? 'test',
+    revision: options.revision ?? 1,
+    integrity: {
+      topLevelBlockCount: options.integrity?.topLevelBlockCount ?? 0,
+      headingSequenceHash: options.integrity?.headingSequenceHash ?? 'test-hash',
+      repeatedHeadings: options.integrity?.repeatedHeadings ?? [],
+    },
+    source: options.source ?? 'test',
+  });
+}
+
+export function __unsafeAdvanceProjectionRepairCycleForTests(slug: string): number | null {
+  if (!slug) return null;
+  clearProjectionRepairCycleId(slug);
+  return getOrStartProjectionRepairCycleId(slug);
+}
+
+export function __unsafeSetLastProjectionLengthForTests(slug: string, length: number | null): void {
+  if (!slug) return;
+  if (typeof length !== 'number' || !Number.isFinite(length) || length < 0) {
+    lastProjectionLengths.delete(slug);
+    return;
+  }
+  lastProjectionLengths.set(slug, Math.floor(length));
+}
+
+export function __unsafeSetAutoCollabQuarantineForTests(
+  slug: string,
+  options: { reason?: string; durationMs?: number } = {},
+): void {
+  const now = Date.now();
+  autoCollabQuarantines.set(slug, {
+    reason: options.reason ?? 'test_auto_quarantine',
+    untilMs: now + Math.max(1, options.durationMs ?? 60_000),
+    triggeredAt: now,
+    lastTriggeredAt: now,
+    count: 1,
+  });
+}
+
+export function __unsafeClearAutoCollabQuarantineForTests(slug?: string): void {
+  if (typeof slug === 'string') {
+    autoCollabQuarantines.delete(slug);
+    clearRepairGuardEscalationState(slug);
+    clearProjectionRepairCycleId(slug);
+    repeatedLegacyReseedAttempts.delete(slug);
+    repeatedPendingDeltaClearAttempts.delete(slug);
+    repeatedFragmentDriftCycles.delete(slug);
+    fragmentDriftCycleCooldowns.delete(slug);
+    integrityWarningCooldowns.delete(slug);
+    lastProjectionLengths.delete(slug);
+    slugYjsWriteWindows.delete(slug);
+    for (const key of largeDocPathologyCooldowns.keys()) {
+      if (key === slug || key.startsWith(`${slug}:`)) {
+        largeDocPathologyCooldowns.delete(key);
+      }
+    }
+    return;
+  }
+  autoCollabQuarantines.clear();
+  collabRepairGuardEscalationBreaker.clear();
+  collabRepairGuardLogCooldowns.clear();
+  projectionRepairCycleIds.clear();
+  repeatedLegacyReseedAttempts.clear();
+  repeatedPendingDeltaClearAttempts.clear();
+  repeatedFragmentDriftCycles.clear();
+  fragmentDriftCycleCooldowns.clear();
+  integrityWarningCooldowns.clear();
+  lastProjectionLengths.clear();
+  slugYjsWriteWindows.clear();
+  largeDocPathologyCooldowns.clear();
+  nextProjectionRepairCycleId = 1;
+}
+
+export function __unsafeSetGlobalCollabAdmissionGuardForTests(
+  options: { reason?: string; durationMs?: number } = {},
+): void {
+  const now = Date.now();
+  globalCollabAdmissionGuard = {
+    reason: options.reason ?? 'test_collab_admission_guard',
+    untilMs: now + Math.max(1, options.durationMs ?? 60_000),
+    triggeredAt: now,
+    lastTriggeredAt: now,
+    count: 1,
+  };
+  upsertPersistedGlobalCollabAdmissionGuard(globalCollabAdmissionGuard);
+}
+
+export function __unsafeClearGlobalCollabAdmissionGuardForTests(): void {
+  globalCollabAdmissionEvents.length = 0;
+  globalCollabAdmissionGuard = null;
+  clearPersistedGlobalCollabAdmissionGuard();
 }
 
 // Test-only helper for exercising stale onStoreDocument conflict handling paths.
@@ -5015,8 +8774,23 @@ async function evictHocuspocusDocument(slug: string): Promise<void> {
 
 function logPendingYjsDeltaBeforeClear(slug: string, reason: string): void {
   try {
+    const gate = getCollabQuarantineGateStatus(slug);
+    if (gate.active) {
+      recordSuspiciousDocBlocked('pending_delta_clear', gate.reason ?? 'COLLAB_AUTO_QUARANTINED');
+    }
     const latest = getLatestYUpdate(slug);
     if (!latest) return;
+    const details = {
+      reason,
+      seq: latest.seq,
+      bytes: latest.update.byteLength,
+      sourceActor: latest.source_actor,
+      createdAt: latest.created_at,
+    };
+    const quarantine = maybeQuarantineRepeatedLargeDocPathology(slug, 'pending_delta_clear', {
+      source: 'invalidate',
+      details,
+    });
     // Only log content snippets when explicitly enabled (contains user PII).
     const includeSnippet = (process.env.COLLAB_DEBUG_FORENSIC || '').trim() === '1';
     const snippet = includeSnippet
@@ -5027,14 +8801,12 @@ function logPendingYjsDeltaBeforeClear(slug: string, reason: string): void {
             : base64;
         })()
       : undefined;
+    if (quarantine.suppressed) return;
     console.warn('[collab] Pending Yjs delta before clear (forensic only)', {
       slug,
-      reason,
-      seq: latest.seq,
-      bytes: latest.update.byteLength,
+      ...details,
       ...(snippet !== undefined ? { base64Snippet: snippet } : {}),
-      sourceActor: latest.source_actor,
-      createdAt: latest.created_at,
+      autoQuarantined: quarantine.quarantined,
     });
   } catch (error) {
     console.error('[collab] Failed to log pending Yjs delta before clear:', { slug, reason, error });
@@ -5051,7 +8823,8 @@ async function invalidateCollabDocumentInner(
 ): Promise<void> {
   if (!slug) return;
   const clearPersistedState = options?.clearPersistedState !== false;
-  skipOnStoreStateVectors.delete(slug);
+  clearProjectionRepairState(slug);
+  skipOnStoreFingerprints.delete(slug);
   const nextPersistGeneration = cancelPendingPersistWork(slug, { advanceGeneration: true });
   const releaseTimer = collabInvalidationReleaseTimers.get(slug);
   if (releaseTimer) {

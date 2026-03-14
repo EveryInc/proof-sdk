@@ -19,19 +19,30 @@ assert(
 );
 
 assert(
-  editorSource.includes("event.type === 'agent.edit.v2'")
+  editorSource.includes("return event.type.startsWith('comment.')")
+    && editorSource.includes("|| event.type.startsWith('suggestion.');")
+    && editorSource.includes('this.scheduleShareMarksRefresh();')
+    && editorSource.includes('this.pendingShareMarksRefresh = true;')
+    && editorSource.includes('clearTimeout(this.shareMarksRefreshTimer);')
+    && editorSource.includes('void shareClient.fetchOpenContext()')
+    && editorSource.includes('this.applyAuthoritativeShareMarks(serverMarks);')
+    && editorSource.includes("event.type === 'agent.edit.v2'")
     && editorSource.includes('private shouldSkipForcedCollabRefreshFromPendingEvent(): boolean')
     && editorSource.includes("this.collabConnectionStatus === 'connected'")
     && editorSource.includes('this.collabIsSynced')
     && editorSource.includes('if (this.shouldSkipForcedCollabRefreshFromPendingEvent()) return;')
     && editorSource.includes('this.scheduleShareDocumentUpdatedRefresh(true);'),
-  'Expected pending event handler to skip forced collab refresh when the live room is already healthy',
+  'Expected pending comment/suggestion events to refresh authoritative marks and to skip forced collab refresh when the live room is already healthy',
 );
 
 assert(
   editorSource.includes('private stopShareEventPoll(): void')
+    && editorSource.includes('private scheduleShareMarksRefresh(): void')
+    && editorSource.includes('private shareMarksRefreshTimer: ReturnType<typeof setTimeout> | null = null;')
+    && editorSource.includes('private pendingShareMarksRefresh: boolean = false;')
+    && editorSource.includes('if (this.shareMarksRefreshTimer) {')
     && editorSource.includes('this.stopShareEventPoll();'),
-  'Expected share event poller to be cleaned up during share/editor teardown',
+  'Expected share event poller and marks refresh timer to be cleaned up during share/editor teardown',
 );
 
 console.log('✓ share event poll fallback wiring checks');
