@@ -1633,6 +1633,26 @@ class ProofEditorImpl implements ProofEditor {
     return 'Anonymous';
   }
 
+  private async renameShareViewer(): Promise<void> {
+    const initialValue = this.shareViewerName ?? getViewerName() ?? this.deriveDefaultShareViewerName();
+    try {
+      const name = await promptForName({ force: true, initialValue });
+      const resolvedName = typeof name === 'string' && name.trim().length > 0
+        ? name.trim()
+        : this.deriveDefaultShareViewerName();
+      this.shareViewerName = resolvedName;
+      setCurrentActorValue(`human:${resolvedName}`);
+      shareClient.setViewerName(resolvedName);
+      collabClient.setLocalUser(
+        { name: resolvedName },
+        shareClient.getSlug() ?? undefined,
+      );
+      this.updateShareBannerPresenceDisplay();
+    } catch (error) {
+      console.warn('[share] rename display name failed', error);
+    }
+  }
+
   activateShareRuntime(options?: ShareRuntimeActivationOptions): boolean {
     if (this.shareRuntimeActivationInFlight) return false;
     const hasShareConfig = shareClient.refreshRuntimeConfig();
@@ -4097,6 +4117,9 @@ class ProofEditorImpl implements ProofEditor {
 
       addItem('Copy link', async () => this.copyLinkWithFallback(this.getCanonicalShareUrl()));
       addDivider();
+      addActionItem('Change display name', () => {
+        void this.renameShareViewer();
+      });
       addActionItem('View activity', () => this.openShareActivityModal());
 
       container.appendChild(menu);

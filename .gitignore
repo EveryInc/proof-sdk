@@ -44,6 +44,9 @@ npm-debug.log*
 # Scratch
 .tmp/
 .worktrees/
+
+# Wrangler (Cloudflare dev artifacts)
+.wrangler/
 build-release/
 build-release-dist/
 

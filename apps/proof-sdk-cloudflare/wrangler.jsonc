@@ -1,0 +1,42 @@
+{
+  "name": "proof-sdk-cloudflare",
+  "main": "src/index.ts",
+  "compatibility_date": "2024-12-01",
+  "compatibility_flags": ["nodejs_compat"],
+
+  // Durable Objects
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "DOCUMENT_SESSION",
+        "class_name": "DocumentSession"
+      }
+    ]
+  },
+
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["DocumentSession"]
+    }
+  ],
+
+  // D1 database for document catalog
+  "d1_databases": [
+    {
+      "binding": "CATALOG_DB",
+      "database_name": "proof-catalog",
+      "database_id": "846224ed-030d-4013-b09c-d23ba85555f0",
+      "migrations_dir": "d1/migrations"
+    }
+  ],
+
+  // Serve the built editor from dist/
+  "assets": {
+    "directory": "../../dist/",
+    "binding": "ASSETS",
+    "not_found_handling": "none",
+    // Run worker first for: root (doc creation), doc pages, API routes, WebSocket
+    "run_worker_first": ["/", "/d/*", "/api/*", "/documents/*", "/ws", "/ws/*", "/health"]
+  }
+}
