@@ -1622,25 +1622,31 @@ export function replaceDocumentProjection(
   markdown: string,
   marks: Record<string, unknown>,
   yStateVersion?: number,
+  expectedRevision?: number,
 ): boolean {
   assertWritesAllowed('replaceDocumentProjection');
+  const revisionClause = expectedRevision !== undefined ? ' AND revision = ?' : '';
   if (yStateVersion !== undefined) {
+    const params: unknown[] = [markdown, JSON.stringify(marks), yStateVersion, slug];
+    if (expectedRevision !== undefined) params.push(expectedRevision);
     const result = getDb().prepare(`
       UPDATE documents
       SET markdown = ?, marks = ?, y_state_version = ?
-      WHERE slug = ? AND share_state IN ('ACTIVE', 'PAUSED')
-    `).run(markdown, JSON.stringify(marks), yStateVersion, slug);
+      WHERE slug = ? AND share_state IN ('ACTIVE', 'PAUSED')${revisionClause}
+    `).run(...params);
     if (result.changes > 0) {
       const updated = getDocumentBySlug(slug);
       if (updated) upsertDocumentProjectionRow(slug, updated.markdown, updated.marks, updated.revision, updated.y_state_version, updated.updated_at);
     }
     return result.changes > 0;
   }
+  const params: unknown[] = [markdown, JSON.stringify(marks), slug];
+  if (expectedRevision !== undefined) params.push(expectedRevision);
   const result = getDb().prepare(`
     UPDATE documents
     SET markdown = ?, marks = ?
-    WHERE slug = ? AND share_state IN ('ACTIVE', 'PAUSED')
-  `).run(markdown, JSON.stringify(marks), slug);
+    WHERE slug = ? AND share_state IN ('ACTIVE', 'PAUSED')${revisionClause}
+  `).run(...params);
   if (result.changes > 0) {
     const updated = getDocumentBySlug(slug);
     if (updated) upsertDocumentProjectionRow(slug, updated.markdown, updated.marks, updated.revision, updated.y_state_version, updated.updated_at);
