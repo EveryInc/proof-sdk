@@ -2,7 +2,7 @@
 
 This workspace is the extraction target for the public `Proof SDK` demo app.
 
-The current private repo still runs the hosted product, but shared editor, server, and bridge code now lives behind the workspace packages in [packages/doc-core](/Users/danshipper/CascadeProjects/every-proof/.worktrees/proof-sdk-split/packages/doc-core), [packages/doc-editor](/Users/danshipper/CascadeProjects/every-proof/.worktrees/proof-sdk-split/packages/doc-editor), [packages/doc-server](/Users/danshipper/CascadeProjects/every-proof/.worktrees/proof-sdk-split/packages/doc-server), [packages/doc-store-sqlite](/Users/danshipper/CascadeProjects/every-proof/.worktrees/proof-sdk-split/packages/doc-store-sqlite), and [packages/agent-bridge](/Users/danshipper/CascadeProjects/every-proof/.worktrees/proof-sdk-split/packages/agent-bridge).
+Shared editor, server, and bridge code lives behind the workspace packages in `packages/doc-core`, `packages/doc-editor`, `packages/doc-server`, `packages/doc-store-sqlite`, and `packages/agent-bridge`.
 
 When the public repo is extracted, this app should become the neutral self-host example for:
 
