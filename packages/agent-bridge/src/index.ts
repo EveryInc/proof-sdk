@@ -203,10 +203,15 @@ export function createAgentBridgeClient(config: AgentBridgeClientConfig) {
       });
     },
     editV2<T = unknown>(slug: string, input: EditV2Input, options: AgentBridgeRequestOptions = {}): Promise<T> {
+      const { idempotencyKey, ...body } = input;
+      const headers: Record<string, string> = { ...(options.headers ?? {}) };
+      if (idempotencyKey) {
+        headers['Idempotency-Key'] = idempotencyKey;
+      }
       return requestJson<T>(config, `${documentBasePath(slug)}/edit/v2`, {
         method: 'POST',
-        body: JSON.stringify(input),
-        ...options,
+        body: JSON.stringify(body),
+        headers,
       });
     },
     rewrite<T = unknown>(slug: string, input: Record<string, unknown>, options: AgentBridgeRequestOptions = {}): Promise<T> {
