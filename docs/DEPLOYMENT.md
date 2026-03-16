@@ -155,7 +155,7 @@ A GitHub Actions workflow is included at `.github/workflows/deploy-cloudflare.ym
    gh workflow run deploy-cloudflare.yml
    ```
 
-The workflow runs `npm ci`, `npm run build` (frontend bundle), then `wrangler deploy` from `apps/proof-cloudflare/`. D1 and Durable Object migrations are applied automatically by Wrangler on each deploy.
+The workflow runs `npm install`, `npm run build` (frontend bundle), then `wrangler deploy` from `apps/proof-cloudflare/`. D1 and Durable Object migrations are applied automatically by Wrangler on each deploy.
 
 **Upgrading to auto-deploy:**
 

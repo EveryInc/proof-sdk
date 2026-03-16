@@ -750,6 +750,16 @@ export class DocumentSession extends DurableObject<Env> {
       .bind(slug)
       .run();
 
+    // Persist the lifecycle state in DO SQLite so it survives reconnects
+    const sql = this.ctx.storage.sql;
+    sql.exec(
+      `CREATE TABLE IF NOT EXISTS document_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
+    );
+    sql.exec(
+      `INSERT OR REPLACE INTO document_meta (key, value) VALUES ('share_state', ?)`,
+      newState,
+    );
+
     // For revoke/delete, close all WebSocket connections
     if (newState === "REVOKED" || newState === "DELETED") {
       for (const ws of this.getWebSockets()) {
@@ -837,28 +847,36 @@ export class DocumentSession extends DurableObject<Env> {
       ? body.payload as Record<string, unknown>
       : body;
 
+    // Build a new request with the extracted payload so downstream handlers
+    // can call request.json() without hitting an already-consumed body.
+    const forwardRequest = new Request(request.url, {
+      method: request.method,
+      headers: request.headers,
+      body: JSON.stringify(payload),
+    });
+
     // Route to appropriate handler based on op type
     switch (opType) {
       case "comment.add":
-        return this.handleMarksRoute(request, slug, "comment");
+        return this.handleMarksRoute(forwardRequest, slug, "comment");
       case "suggest.replace":
-        return this.handleMarksRoute(request, slug, "suggest-replace");
+        return this.handleMarksRoute(forwardRequest, slug, "suggest-replace");
       case "suggest.insert":
-        return this.handleMarksRoute(request, slug, "suggest-insert");
+        return this.handleMarksRoute(forwardRequest, slug, "suggest-insert");
       case "suggest.delete":
-        return this.handleMarksRoute(request, slug, "suggest-delete");
+        return this.handleMarksRoute(forwardRequest, slug, "suggest-delete");
       case "suggest.accept":
-        return this.handleMarksRoute(request, slug, "accept");
+        return this.handleMarksRoute(forwardRequest, slug, "accept");
       case "suggest.reject":
-        return this.handleMarksRoute(request, slug, "reject");
+        return this.handleMarksRoute(forwardRequest, slug, "reject");
       case "comment.reply":
-        return this.handleMarksRoute(request, slug, "reply");
+        return this.handleMarksRoute(forwardRequest, slug, "reply");
       case "comment.resolve":
-        return this.handleMarksRoute(request, slug, "resolve");
+        return this.handleMarksRoute(forwardRequest, slug, "resolve");
       case "comment.unresolve":
-        return this.handleMarksRoute(request, slug, "unresolve");
+        return this.handleMarksRoute(forwardRequest, slug, "unresolve");
       case "rewrite":
-        return this.handleAgentRewrite(request, slug);
+        return this.handleAgentRewrite(forwardRequest, slug);
       default:
         return Response.json(
           { success: false, error: `Unknown operation type: ${opType}` },

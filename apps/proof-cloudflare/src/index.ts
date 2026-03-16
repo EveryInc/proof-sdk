@@ -122,16 +122,49 @@ export default {
 
     // POST /documents — API document creation
     if (path === "/documents" && request.method === "POST") {
+      const contentType = request.headers.get("content-type") ?? "";
+      let markdown = "";
+      let title = "";
+
+      if (contentType.includes("application/json")) {
+        const body = await request.json().catch(() => ({})) as Record<string, unknown>;
+        markdown = typeof body.markdown === "string" ? body.markdown : "";
+        title = typeof body.title === "string" ? body.title : "";
+      } else if (contentType.includes("text/")) {
+        markdown = await request.text();
+      }
+
+      if (!title) {
+        const headingMatch = markdown.match(/^#\s+(.+)$/m);
+        title = headingMatch ? headingMatch[1].trim() : "";
+      }
+
       const slug = generateSlug();
       const doId = env.DOCUMENT_SESSION.idFromName(slug).toString();
       await env.CATALOG_DB.prepare(
         "INSERT INTO documents (id, slug, title, do_id) VALUES (?, ?, ?, ?)",
       )
-        .bind(doId, slug, "", doId)
+        .bind(doId, slug, title, doId)
         .run();
-      return new Response(
-        JSON.stringify({ success: true, slug, url: `/d/${slug}` }),
-        { status: 201, headers: { "content-type": "application/json" } },
+
+      // Write markdown content to the DO if provided
+      if (markdown) {
+        const id = env.DOCUMENT_SESSION.idFromName(slug);
+        const stub = env.DOCUMENT_SESSION.get(id);
+        await stub.fetch(new Request(
+          new URL(`/api/agent/${slug}/rewrite`, url.origin),
+          {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ content: markdown, force: true }),
+          },
+        ));
+      }
+
+      const shareUrl = `${url.origin}/d/${slug}`;
+      return Response.json(
+        { success: true, slug, url: `/d/${slug}`, shareUrl, title },
+        { status: 201 },
       );
     }
 
