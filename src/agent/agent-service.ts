@@ -289,7 +289,6 @@ export class AgentService {
           system: systemPrompt,
           messages,
           tools: anthropicTools,
-          signal: this.abortController?.signal,
         };
         if (runtimeConfig.thinkingBudgetTokens > 0) {
           request.thinking = {
@@ -297,7 +296,9 @@ export class AgentService {
             budget_tokens: runtimeConfig.thinkingBudgetTokens,
           };
         }
-        result = await this.client!.messages.create(request);
+        result = await this.client!.messages.create(request, {
+          signal: this.abortController?.signal ?? undefined,
+        });
 
         if (this.abortController?.signal.aborted) {
           throw new Error('Agent cancelled by user');
