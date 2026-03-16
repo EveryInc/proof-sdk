@@ -26,13 +26,17 @@ export function setViewerName(name: string): void {
   localStorage.setItem(STORAGE_KEY, name);
 }
 
+export function clearViewerName(): void {
+  localStorage.removeItem(STORAGE_KEY);
+}
+
 /**
  * Show name prompt modal if no name is stored.
  * Returns the viewer's name (from storage or newly entered).
  */
-export function promptForName(): Promise<string> {
+export function promptForName(options?: { force?: boolean; initialValue?: string }): Promise<string> {
   const existing = getViewerName();
-  if (existing) return Promise.resolve(existing);
+  if (existing && !options?.force) return Promise.resolve(existing);
 
   return new Promise((resolve) => {
     if (!document.body) {
@@ -78,6 +82,7 @@ export function promptForName(): Promise<string> {
     input.autocomplete = 'name';
     input.autocapitalize = 'words';
     input.enterKeyHint = 'done';
+    input.value = options?.initialValue ?? existing ?? '';
     input.style.cssText = `
       width: 100%; padding: 10px 14px; border: 1px solid #e0e0e0;
       border-radius: 10px; font-size: 16px; outline: none;

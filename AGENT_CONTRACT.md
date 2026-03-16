@@ -1,6 +1,6 @@
 # Agent Contract: Direct Markdown Sharing
 
-This contract defines the public Proof SDK flow for creating and operating on shared documents over HTTP.
+This contract defines the public Proof SDK flow for creating and operating on shared documents over HTTP. The routes and semantics apply to all deployment targets (Express server, Cloudflare Workers, etc.) — replace `localhost:4000` with your deployment URL.
 
 ## Endpoints
 
@@ -152,3 +152,5 @@ curl -X POST http://localhost:4000/documents \
   -H "Content-Type: application/json" \
   -d '{"markdown":"# Plan\n\nShip the rewrite.","title":"Rewrite Plan","role":"commenter"}'
 ```
+
+See `docs/DEPLOYMENT.md` for deployment options and configuration.
