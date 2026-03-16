@@ -38,6 +38,21 @@ export interface AgentBridgeCommentInput {
   selector?: Record<string, unknown>;
 }
 
+export type EditV2BlockOp =
+  | { op: 'replace_block'; ref: string; block: { markdown: string } }
+  | { op: 'insert_after'; ref: string; blocks: Array<{ markdown: string }> }
+  | { op: 'insert_before'; ref: string; blocks: Array<{ markdown: string }> }
+  | { op: 'delete_block'; ref: string }
+  | { op: 'replace_range'; fromRef: string; toRef: string; blocks: Array<{ markdown: string }> }
+  | { op: 'find_replace_in_block'; ref: string; find: string; replace: string; occurrence?: 'first' | 'all' };
+
+export interface EditV2Input {
+  by: string;
+  baseRevision: number;
+  operations: EditV2BlockOp[];
+  idempotencyKey?: string;
+}
+
 export interface AgentBridgePresenceInput {
   status: string;
   agentId?: string;
@@ -182,6 +197,13 @@ export function createAgentBridgeClient(config: AgentBridgeClientConfig) {
     },
     addSuggestion<T = unknown>(slug: string, input: AgentBridgeSuggestionInput, options: AgentBridgeRequestOptions = {}): Promise<T> {
       return requestJson<T>(config, buildBridgePath(slug, '/suggestions'), {
+        method: 'POST',
+        body: JSON.stringify(input),
+        ...options,
+      });
+    },
+    editV2<T = unknown>(slug: string, input: EditV2Input, options: AgentBridgeRequestOptions = {}): Promise<T> {
+      return requestJson<T>(config, `${documentBasePath(slug)}/edit/v2`, {
         method: 'POST',
         body: JSON.stringify(input),
         ...options,
