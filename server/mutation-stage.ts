@@ -1,5 +1,6 @@
 import type { DocumentRow } from './db.js';
 import type { DocumentOpType } from './document-ops.js';
+import { isValidMutationBaseToken } from './collab.js';
 
 export type MutationContractStage = 'A' | 'B' | 'C';
 
@@ -17,23 +18,83 @@ export function isRevisionOnlyPrecondition(stage: MutationContractStage): boolea
   return stage === 'C';
 }
 
-type BasePrecondition = {
+export type BasePrecondition = {
+  baseToken: string | null;
   baseRevision: number | null;
   baseUpdatedAt: string | null;
 };
 
-function readBasePrecondition(value: unknown): BasePrecondition {
+export function readBasePrecondition(value: unknown): BasePrecondition {
   const payload = value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
     : {};
+  const baseToken = typeof payload.baseToken === 'string' && payload.baseToken.trim()
+    ? payload.baseToken.trim()
+    : null;
   const baseRevision = Number.isInteger(payload.baseRevision) ? Number(payload.baseRevision) : null;
   const baseUpdatedAt = typeof payload.baseUpdatedAt === 'string' && payload.baseUpdatedAt.trim()
     ? payload.baseUpdatedAt.trim()
     : null;
   return {
+    baseToken,
     baseRevision: baseRevision !== null && baseRevision > 0 ? baseRevision : null,
     baseUpdatedAt,
   };
+}
+
+type ValidatedPrecondition =
+  | {
+      ok: true;
+      mode: 'none' | 'token' | 'revision' | 'updatedAt';
+      baseToken?: string;
+      baseRevision?: number;
+      baseUpdatedAt?: string;
+    }
+  | {
+      ok: false;
+      status: number;
+      code: string;
+      error: string;
+    };
+
+function validateTokenPrecondition(
+  precondition: BasePrecondition,
+  currentBaseToken: string | null | undefined,
+): ValidatedPrecondition | null {
+  if (precondition.baseToken === null) return null;
+  if (precondition.baseRevision !== null || precondition.baseUpdatedAt !== null) {
+    return {
+      ok: false,
+      status: 409,
+      code: 'CONFLICTING_BASE',
+      error: 'baseToken cannot be combined with baseRevision or baseUpdatedAt',
+    };
+  }
+  if (!isValidMutationBaseToken(precondition.baseToken)) {
+    return {
+      ok: false,
+      status: 400,
+      code: 'INVALID_BASE_TOKEN',
+      error: 'baseToken must be an mt1 token',
+    };
+  }
+  if (!currentBaseToken) {
+    return {
+      ok: false,
+      status: 409,
+      code: 'AUTHORITATIVE_BASE_UNAVAILABLE',
+      error: 'Authoritative mutation base is unavailable; retry with latest state',
+    };
+  }
+  if (precondition.baseToken !== currentBaseToken) {
+    return {
+      ok: false,
+      status: 409,
+      code: 'STALE_BASE',
+      error: 'Document changed since baseToken',
+    };
+  }
+  return { ok: true, mode: 'token', baseToken: precondition.baseToken };
 }
 
 function isPreconditionRequiredForOps(stage: MutationContractStage, opType: DocumentOpType): boolean {
@@ -48,13 +109,23 @@ export function validateOpPrecondition(
   opType: DocumentOpType,
   doc: Pick<DocumentRow, 'revision' | 'updated_at'>,
   payload: unknown,
-): { ok: true } | { ok: false; code: string; error: string } {
-  if (!isPreconditionRequiredForOps(stage, opType)) return { ok: true };
+  currentBaseToken?: string | null,
+): ValidatedPrecondition {
   const precondition = readBasePrecondition(payload);
+  const tokenResult = validateTokenPrecondition(precondition, currentBaseToken);
+  if (tokenResult) return tokenResult;
+  if (!isPreconditionRequiredForOps(stage, opType)) {
+    return precondition.baseRevision !== null
+      ? { ok: true, mode: 'revision', baseRevision: precondition.baseRevision }
+      : precondition.baseUpdatedAt !== null
+        ? { ok: true, mode: 'updatedAt', baseUpdatedAt: precondition.baseUpdatedAt }
+        : { ok: true, mode: 'none' };
+  }
   if (isRevisionOnlyPrecondition(stage)) {
     if (precondition.baseRevision === null) {
       return {
         ok: false,
+        status: 409,
         code: 'BASE_REVISION_REQUIRED',
         error: 'baseRevision is required for this mutation',
       };
@@ -62,54 +133,7 @@ export function validateOpPrecondition(
     if (precondition.baseRevision !== doc.revision) {
       return {
         ok: false,
-        code: 'STALE_BASE',
-        error: 'Document changed since baseRevision',
-      };
-    }
-    return { ok: true };
-  }
-
-  if (precondition.baseRevision === null && precondition.baseUpdatedAt === null) {
-    return {
-      ok: false,
-      code: 'MISSING_BASE',
-      error: 'baseRevision or baseUpdatedAt is required for this mutation',
-    };
-  }
-  if (precondition.baseRevision !== null && precondition.baseRevision !== doc.revision) {
-    return {
-      ok: false,
-      code: 'STALE_BASE',
-      error: 'Document changed since baseRevision',
-    };
-  }
-  if (precondition.baseUpdatedAt !== null && precondition.baseUpdatedAt !== doc.updated_at) {
-    return {
-      ok: false,
-      code: 'STALE_BASE',
-      error: 'Document changed since baseUpdatedAt',
-    };
-  }
-  return { ok: true };
-}
-
-export function validateEditPrecondition(
-  stage: MutationContractStage,
-  doc: Pick<DocumentRow, 'revision' | 'updated_at'>,
-  payload: unknown,
-): { ok: true; mode: 'revision' | 'updatedAt'; baseRevision?: number; baseUpdatedAt?: string } | { ok: false; code: string; error: string } {
-  const precondition = readBasePrecondition(payload);
-  if (isRevisionOnlyPrecondition(stage)) {
-    if (precondition.baseRevision === null) {
-      return {
-        ok: false,
-        code: 'BASE_REVISION_REQUIRED',
-        error: 'baseRevision is required for edits',
-      };
-    }
-    if (precondition.baseRevision !== doc.revision) {
-      return {
-        ok: false,
+        status: 409,
         code: 'STALE_BASE',
         error: 'Document changed since baseRevision',
       };
@@ -120,6 +144,65 @@ export function validateEditPrecondition(
   if (precondition.baseRevision === null && precondition.baseUpdatedAt === null) {
     return {
       ok: false,
+      status: 409,
+      code: 'MISSING_BASE',
+      error: 'baseRevision or baseUpdatedAt is required for this mutation',
+    };
+  }
+  if (precondition.baseRevision !== null && precondition.baseRevision !== doc.revision) {
+    return {
+      ok: false,
+      status: 409,
+      code: 'STALE_BASE',
+      error: 'Document changed since baseRevision',
+    };
+  }
+  if (precondition.baseUpdatedAt !== null && precondition.baseUpdatedAt !== doc.updated_at) {
+    return {
+      ok: false,
+      status: 409,
+      code: 'STALE_BASE',
+      error: 'Document changed since baseUpdatedAt',
+    };
+  }
+  return precondition.baseRevision !== null
+    ? { ok: true, mode: 'revision', baseRevision: precondition.baseRevision }
+    : { ok: true, mode: 'updatedAt', baseUpdatedAt: precondition.baseUpdatedAt as string };
+}
+
+export function validateEditPrecondition(
+  stage: MutationContractStage,
+  doc: Pick<DocumentRow, 'revision' | 'updated_at'>,
+  payload: unknown,
+  currentBaseToken?: string | null,
+): ValidatedPrecondition {
+  const precondition = readBasePrecondition(payload);
+  const tokenResult = validateTokenPrecondition(precondition, currentBaseToken);
+  if (tokenResult) return tokenResult;
+  if (isRevisionOnlyPrecondition(stage)) {
+    if (precondition.baseRevision === null) {
+      return {
+        ok: false,
+        status: 409,
+        code: 'BASE_REVISION_REQUIRED',
+        error: 'baseRevision is required for edits',
+      };
+    }
+    if (precondition.baseRevision !== doc.revision) {
+      return {
+        ok: false,
+        status: 409,
+        code: 'STALE_BASE',
+        error: 'Document changed since baseRevision',
+      };
+    }
+    return { ok: true, mode: 'revision', baseRevision: precondition.baseRevision };
+  }
+
+  if (precondition.baseRevision === null && precondition.baseUpdatedAt === null) {
+    return {
+      ok: false,
+      status: 409,
       code: 'MISSING_BASE',
       error: 'baseRevision or baseUpdatedAt is required for edits',
     };
@@ -129,6 +212,7 @@ export function validateEditPrecondition(
     if (precondition.baseRevision !== doc.revision) {
       return {
         ok: false,
+        status: 409,
         code: 'STALE_BASE',
         error: 'Document changed since baseRevision',
       };
@@ -139,6 +223,7 @@ export function validateEditPrecondition(
   if (precondition.baseUpdatedAt !== null && precondition.baseUpdatedAt !== doc.updated_at) {
     return {
       ok: false,
+      status: 409,
       code: 'STALE_BASE',
       error: 'Document changed since baseUpdatedAt',
     };

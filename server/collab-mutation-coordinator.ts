@@ -104,6 +104,7 @@ export type SingleWriterMutationFailureCode =
   | 'missing_document'
   | 'stale_base'
   | 'live_doc_unavailable'
+  | 'persisted_yjs_corrupt'
   | 'persisted_yjs_diverged'
   | 'sync_pending'
   | 'apply_failed';
@@ -296,6 +297,14 @@ export async function applySingleWriterMutation(
           ...common,
         } satisfies SingleWriterMutationFailure;
       }
+      if (mutation.code === 'PERSISTED_YJS_CORRUPT') {
+        return {
+          ok: false,
+          code: 'persisted_yjs_corrupt',
+          reason: mutation.code,
+          ...common,
+        } satisfies SingleWriterMutationFailure;
+      }
       if (mutation.code === 'PERSISTED_YJS_DIVERGED') {
         return {
           ok: false,
@@ -322,9 +331,8 @@ export async function applySingleWriterMutation(
     let markdownConfirmed = verification.markdownConfirmed;
     let fragmentConfirmed = verification.fragmentConfirmed;
     let liveFragmentTextHash = verification.liveFragmentTextHash;
-    const authoritative = await verifyAuthoritativeMutationBaseStable(slug, markdown, marks, {
+    let authoritative = await verifyAuthoritativeMutationBaseStable(slug, markdown, marks, {
       liveRequired: activeCollabClients > 0,
-      preferProjection: false,
       stabilityMs,
       sampleMs: stabilitySampleMs,
     });

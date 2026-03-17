@@ -171,6 +171,11 @@ import { normalizeQuote, extractMarks, embedMarks, getThread, migrateProvenanceT
 import { proofMarkHandler } from '../formats/remark-proof-marks';
 import { remarkProofMarksPlugin } from './schema/remark-proof-marks-plugin';
 import { getCurrentActor, setCurrentActor as setCurrentActorValue, normalizeActor } from './actor';
+import {
+  shouldKeepalivePersistShareContent,
+  shouldKeepalivePersistShareMarks,
+  shouldUseLocalKeepaliveBaseToken,
+} from './share-refresh-persist';
 import { keybindingsPlugin, setShowAgentInputCallback, type AgentInputContext } from './plugins/keybindings';
 import { tableKeyboardPlugin } from './plugins/table-keyboard';
 import { showAgentInputDialog } from '../ui/agent-input-dialog';
@@ -1284,7 +1289,8 @@ class ProofEditorImpl implements ProofEditor {
 
     window.addEventListener('beforeunload', () => {
       if (this.isShareMode) {
-        this.flushShareMarks({ keepalive: true });
+        this.flushShareMarks({ keepalive: true, persistContent: true });
+        collabClient.flushPendingLocalStateForUnload();
       }
       this.clearPendingCommentDraftRestore();
       if (this.collabRefreshTimer) {
@@ -1304,9 +1310,17 @@ class ProofEditorImpl implements ProofEditor {
       this.cleanupNavigation?.();
     });
 
+    window.addEventListener('pagehide', () => {
+      if (this.isShareMode) {
+        this.flushShareMarks({ keepalive: true, persistContent: true });
+        collabClient.flushPendingLocalStateForUnload();
+      }
+    });
+
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState === 'hidden' && this.isShareMode) {
-        this.flushShareMarks({ keepalive: true });
+        this.flushShareMarks({ keepalive: true, persistContent: true });
+        collabClient.flushPendingLocalStateForUnload();
       }
     });
   }
@@ -4750,7 +4764,7 @@ class ProofEditorImpl implements ProofEditor {
     });
   }
 
-  private flushShareMarks(_options?: { keepalive?: boolean }): void {
+  private flushShareMarks(_options?: { keepalive?: boolean; persistContent?: boolean }): void {
     if (!this.isShareMode || !this.editor || this.suppressMarksSync) return;
     if (!this.initialMarksSynced) return;
     this.editor.action((ctx) => {
@@ -4762,9 +4776,50 @@ class ProofEditorImpl implements ProofEditor {
         this.initialMarksSynced = true;
         const serializer = ctx.get(serializerCtx);
         const markdown = this.normalizeMarkdownForRuntime(serializer(view.state.doc));
+        const shouldPersistContent = shouldKeepalivePersistShareContent({
+          keepalive: Boolean(_options?.keepalive),
+          persistContent: _options?.persistContent,
+          collabEnabled: this.collabEnabled,
+          collabCanEdit: this.collabCanEdit,
+          hasCompletedInitialCollabHydration: this.hasCompletedInitialCollabHydration,
+          hasLocalContentEditSinceHydration: this.hasLocalContentEditSinceHydration,
+          collabConnectionStatus: this.collabConnectionStatus,
+          collabIsSynced: this.collabIsSynced,
+          collabUnsyncedChanges: this.collabUnsyncedChanges,
+          collabPendingLocalUpdates: this.collabPendingLocalUpdates,
+          markdown,
+        });
+        const shouldPersistMarks = shouldKeepalivePersistShareMarks({
+          keepalive: Boolean(_options?.keepalive),
+          collabEnabled: this.collabEnabled,
+          collabCanEdit: this.collabCanEdit,
+          hasCompletedInitialCollabHydration: this.hasCompletedInitialCollabHydration,
+          hasLocalContentEditSinceHydration: this.hasLocalContentEditSinceHydration,
+          collabUnsyncedChanges: this.collabUnsyncedChanges,
+          collabPendingLocalUpdates: this.collabPendingLocalUpdates,
+        });
         if (this.collabEnabled && this.collabCanEdit) {
           this.publishProjectionMarkdown(view, markdown, 'marks-flush');
           collabClient.setMarksMetadata(metadata);
+        }
+        if (shouldPersistContent) {
+          const allowLocalKeepaliveBaseToken = shouldUseLocalKeepaliveBaseToken({
+            keepalive: Boolean(_options?.keepalive),
+            collabEnabled: this.collabEnabled,
+            collabCanEdit: this.collabCanEdit,
+            hasCompletedInitialCollabHydration: this.hasCompletedInitialCollabHydration,
+            collabIsSynced: this.collabIsSynced,
+            collabUnsyncedChanges: this.collabUnsyncedChanges,
+            collabPendingLocalUpdates: this.collabPendingLocalUpdates,
+          });
+          void shareClient.pushUpdate(markdown, metadata, getCurrentActor(), {
+            keepalive: Boolean(_options?.keepalive),
+            allowLocalKeepaliveBaseToken,
+          });
+          return;
+        }
+        if (!shouldPersistMarks) {
+          return;
         }
         if (!this.collabEnabled || !this.collabCanEdit || LEGACY_REST_FALLBACK) {
           void shareClient.pushMarks(metadata, getCurrentActor(), { keepalive: Boolean(_options?.keepalive) });

@@ -15,8 +15,6 @@ import {
   applyAgentPresenceToLoadedCollab,
   type AuthoritativeMutationBase,
   applyAgentCursorHintToLoadedCollab,
-  applyCanonicalDocumentToCollab,
-  applyCanonicalDocumentToCollabWithVerification,
   verifyCanonicalDocumentInLoadedCollab,
   getCollabRuntime,
   getCanonicalReadableDocument,
@@ -31,7 +29,10 @@ import {
   invalidateLoadedCollabDocumentAndWait,
   acquireRewriteLock,
   releaseRewriteLock,
+  releaseRewriteLockImmediately,
   resolveAuthoritativeMutationBase,
+  syncCanonicalDocumentStateToCollab,
+  traceDegradedCollabRead,
   stripEphemeralCollabSpans,
   verifyAuthoritativeMutationBaseStable,
 } from './collab.js';
@@ -110,6 +111,7 @@ import {
   resolveExplicitAgentIdentity,
 } from '../src/shared/agent-identity.js';
 import { getBuildInfo } from './build-info.js';
+import { getAgentMutationRouteLabelFromPath } from './agent-mutation-route.js';
 import {
   appendGitHubBugReportFollowUp,
   buildBugReportEvidence,
@@ -346,9 +348,28 @@ async function resolveRouteMutationBase(slug: string): Promise<AuthoritativeMuta
   const activeCollabClients = getActiveCollabClientCount(slug);
   const resolved = await resolveAuthoritativeMutationBase(slug, {
     liveRequired: activeCollabClients > 0,
-    preferProjection: false,
   });
   return resolved.ok ? resolved.base : null;
+}
+
+function sameRouteMutationBaseContent(
+  left: AuthoritativeMutationBase | null,
+  right: AuthoritativeMutationBase | null,
+): boolean {
+  if (!left || !right) return false;
+  return left.markdown === right.markdown && JSON.stringify(left.marks) === JSON.stringify(right.marks);
+}
+
+class RewriteBarrierPreconditionError extends Error {
+  readonly status: number;
+  readonly code: string;
+
+  constructor(result: { status: number; code: string; error: string }) {
+    super(result.error);
+    this.name = 'RewriteBarrierPreconditionError';
+    this.status = result.status;
+    this.code = result.code;
+  }
 }
 
 function buildMutationContextDocument(
@@ -525,9 +546,7 @@ function routeRequiresMutation(method: string, path: string): boolean {
 }
 
 function getMutationRouteLabel(req: Request): string {
-  const parts = req.path.split('/').filter(Boolean);
-  if (parts.length <= 1) return '/';
-  return `/${parts.slice(1).join('/')}`;
+  return getAgentMutationRouteLabelFromPath(req.path || '/');
 }
 
 function normalizeAgentId(raw: string): string {
@@ -750,7 +769,12 @@ async function resolveEditOperationBaseMarkdown(
   return { markdown: canonicalMarkdown, source: 'db', activeCollabClients };
 }
 
-async function prepareRewriteCollabBarrier(slug: string): Promise<void> {
+async function prepareRewriteCollabBarrier(
+  slug: string,
+  options?: {
+    validateWhileLocked?: () => Promise<void>;
+  },
+): Promise<void> {
   const collabRuntime = getCollabRuntime();
   if (!collabRuntime.enabled) return;
   // Acquire a rewrite lock BEFORE disconnecting clients.  This prevents any
@@ -758,6 +782,9 @@ async function prepareRewriteCollabBarrier(slug: string): Promise<void> {
   // during the window between disconnect and rewrite completion.
   acquireRewriteLock(slug);
   try {
+    if (options?.validateWhileLocked) {
+      await options.validateWhileLocked();
+    }
     if ((process.env.PROOF_REWRITE_BARRIER_FORCE_FAIL || '').trim() === '1') {
       throw new Error('forced rewrite barrier failure');
     }
@@ -776,6 +803,10 @@ async function prepareRewriteCollabBarrier(slug: string): Promise<void> {
       if (timeoutId) clearTimeout(timeoutId);
     }
   } catch (error) {
+    if (error instanceof RewriteBarrierPreconditionError) {
+      releaseRewriteLockImmediately(slug);
+      throw error;
+    }
     console.error('[agent-routes] Failed to prepare rewrite collab barrier:', { slug, error });
     traceServerIncident({
       slug,
@@ -944,6 +975,7 @@ async function enforceMutationPrecondition(
   return {
     doc: buildMutationContextDocument(canonicalDoc, mutationBase),
     mutationBase,
+    enforceProjectionReadiness: requiresProjectedMarkState(opType) && projectionStale,
     precondition: opPrecondition.mode === 'token'
       ? { mode: 'token', baseToken: opPrecondition.baseToken }
       : opPrecondition.mode === 'revision'
@@ -1305,7 +1337,6 @@ function notifyCollabMutation(
 
           const authoritative = await verifyAuthoritativeMutationBaseStable(slug, targetMarkdown, targetMarks, {
             liveRequired: activeCollabClients > 0,
-            preferProjection: false,
             stabilityMs: options.stabilityMs,
             sampleMs: EDIT_COLLAB_STABILITY_SAMPLE_MS,
           });
@@ -1354,11 +1385,31 @@ function notifyCollabMutation(
             marks: targetMarks,
             source: options.source ?? 'agent',
           }, REWRITE_COLLAB_TIMEOUT_MS)
-          : await applyCanonicalDocumentToCollabWithVerification(slug, {
-            markdown: targetMarkdown,
-            marks: targetMarks,
-            source: options.source ?? 'agent',
-          }, REWRITE_COLLAB_TIMEOUT_MS);
+          : await (async () => {
+            const syncResult = await syncCanonicalDocumentStateToCollab(slug, {
+              markdown: targetMarkdown,
+              marks: targetMarks,
+              source: options.source ?? 'agent',
+            });
+            if (!syncResult.applied) {
+              return {
+                applied: false,
+                confirmed: false,
+                reason: syncResult.reason ?? 'apply_failed',
+                yStateVersion: 0,
+                markdownConfirmed: false,
+                fragmentConfirmed: false,
+                expectedFragmentTextHash: null,
+                liveFragmentTextHash: null,
+                markdownSource: 'none' as const,
+              };
+            }
+            return verifyCanonicalDocumentInLoadedCollab(slug, {
+              markdown: targetMarkdown,
+              marks: targetMarks,
+              source: options.source ?? 'agent',
+            }, REWRITE_COLLAB_TIMEOUT_MS);
+          })();
 
         let confirmed = verification.confirmed;
         let reason = verification.reason;
@@ -1437,18 +1488,47 @@ function notifyCollabMutation(
               return { confirmed: false, reason: 'canonical_changed_during_fallback' };
             }
 
-            const retry = options?.apply === false
-              ? await verifyCanonicalDocumentInLoadedCollab(slug, {
+            const retry = await (async () => {
+              // Fallback barrier means we deliberately cut over to a repair/reseed lane.
+              // Even callers that normally use verify-only mode need an explicit
+              // canonical -> collab sync here before we can trust the retry verdict.
+              const syncRetryDeadline = Date.now() + REWRITE_COLLAB_TIMEOUT_MS;
+              let syncResult = await syncCanonicalDocumentStateToCollab(slug, {
                 markdown: targetMarkdown,
                 marks: targetMarks,
                 source: `${options.source ?? 'agent'}-fallback`,
-              }, REWRITE_COLLAB_TIMEOUT_MS)
-              : await applyCanonicalDocumentToCollabWithVerification(slug, {
+              });
+              while (
+                !syncResult.applied
+                && syncResult.reason === 'live_doc_unretrievable'
+                && Date.now() < syncRetryDeadline
+              ) {
+                await sleep(50);
+                syncResult = await syncCanonicalDocumentStateToCollab(slug, {
+                  markdown: targetMarkdown,
+                  marks: targetMarks,
+                  source: `${options.source ?? 'agent'}-fallback`,
+                });
+              }
+              if (!syncResult.applied) {
+                return {
+                  applied: false,
+                  confirmed: false,
+                  reason: syncResult.reason ?? 'apply_failed',
+                  yStateVersion: 0,
+                  markdownConfirmed: false,
+                  fragmentConfirmed: false,
+                  expectedFragmentTextHash: null,
+                  liveFragmentTextHash: null,
+                  markdownSource: 'none' as const,
+                };
+              }
+              return verifyCanonicalDocumentInLoadedCollab(slug, {
                 markdown: targetMarkdown,
                 marks: targetMarks,
                 source: `${options.source ?? 'agent'}-fallback`,
-                preserveLoadedDoc: true,
               }, REWRITE_COLLAB_TIMEOUT_MS);
+            })();
             confirmed = retry.confirmed;
             reason = retry.reason;
             markdownConfirmed = retry.markdownConfirmed;
@@ -1473,6 +1553,18 @@ function notifyCollabMutation(
             canonicalObservedHash = retryEvaluated.canonicalObservedHash ?? canonicalObservedHash;
             expectedFragmentTextHash = retryEvaluated.expectedFragmentTextHash ?? expectedFragmentTextHash;
             liveFragmentTextHash = retryEvaluated.liveFragmentTextHash ?? liveFragmentTextHash;
+            if (
+              !confirmed
+              && canonicalConfirmed
+              && activeCollabClients === 0
+              // Only explicit cold-room proof can upgrade the fallback retry to confirmed.
+              && retry.reason === 'no_live_doc'
+            ) {
+              confirmed = true;
+              reason = undefined;
+              markdownConfirmed = true;
+              fragmentConfirmed = true;
+            }
             if (debugConvergence) {
               console.info('[agent-routes] collab verification retry diagnostics', {
                 slug,
@@ -1538,11 +1630,20 @@ function notifyCollabMutation(
           cursorApplied: false,
         };
       } else if (options?.apply !== false) {
-        await applyCanonicalDocumentToCollab(slug, {
+        const syncResult = await syncCanonicalDocumentStateToCollab(slug, {
           markdown: targetMarkdown,
           marks: targetMarks,
           source: options?.source ?? 'agent',
         });
+        if (!syncResult.applied) {
+          invalidateLoadedCollabDocument(slug);
+          return {
+            confirmed: false,
+            reason: syncResult.reason ?? 'apply_failed',
+            presenceApplied: false,
+            cursorApplied: false,
+          };
+        }
       }
       let presenceApplied = false;
       if (participation?.presenceEntry) {
@@ -1780,7 +1881,7 @@ agentRoutes.post('/bug-reports/:issueNumber/follow-up', async (req: Request, res
         validation.followUp.context ?? 'Bug follow-up',
         evidence,
         issueNumber,
-        `https://github.com/${process.env.PROOF_GITHUB_ISSUES_OWNER?.trim() || 'EveryInc'}/${process.env.PROOF_GITHUB_ISSUES_REPO?.trim() || 'proof-sdk'}/issues/${issueNumber}`,
+        `https://github.com/${process.env.PROOF_GITHUB_ISSUES_OWNER?.trim() || 'EveryInc'}/${process.env.PROOF_GITHUB_ISSUES_REPO?.trim() || 'proof'}/issues/${issueNumber}`,
       ),
       evidenceSummary: evidence.summary,
       requestId,
@@ -1949,8 +2050,9 @@ agentRoutes.get('/:slug/state', async (req: Request, res: Response) => {
     what: 'Proof is a collaborative document editor. This is a shared doc.',
     docs: AGENT_DOCS_PATH,
     createApi: CANONICAL_CREATE_API_PATH,
-    stateApi: `/api/agent/${slug}/state`,
-    commentReadApi: `/api/agent/${slug}/state`,
+    stateApi: `/documents/${slug}/state`,
+    agentStateApi: `/api/agent/${slug}/state`,
+    commentReadApi: `/documents/${slug}/state`,
     commentReadPath: 'marks',
     presenceApi: `/api/agent/${slug}/presence`,
     eventsApi: `/api/agent/${slug}/events/pending`,
@@ -2009,6 +2111,33 @@ agentRoutes.get('/:slug/state', async (req: Request, res: Response) => {
   }
   if (typeof body.content === 'string') {
     body.content = stripAllProofSpanTags(body.content);
+  }
+
+  if (
+    (typeof body.readSource === 'string' && body.readSource !== 'projection')
+    || body.repairPending === true
+    || body.mutationReady === false
+  ) {
+    traceDegradedCollabRead({
+      requestId: readRequestId(req),
+      slug,
+      surface: 'state',
+      route: '/api/agent/:slug/state',
+      role,
+      shareState: doc?.share_state ?? null,
+      readSource: typeof body.readSource === 'string' ? body.readSource : null,
+      projectionFresh: typeof body.projectionFresh === 'boolean' ? body.projectionFresh : null,
+      repairPending: body.repairPending === true,
+      mutationReady,
+      fallbackReason: isRecord(body.warning) && typeof body.warning.fallbackReason === 'string'
+        ? body.warning.fallbackReason
+        : null,
+      yjsSource: isRecord(body.warning) && (body.warning.yjsSource === 'live' || body.warning.yjsSource === 'persisted')
+        ? body.warning.yjsSource
+        : null,
+      canWrite: authoritativeMutations || mutationReady,
+      sessionDowngraded: false,
+    });
   }
 
   res.status(result.status).json(body);
@@ -2241,6 +2370,7 @@ agentRoutes.post('/:slug/edit/v2', async (req: Request, res: Response) => {
               : {}),
           },
         };
+        broadcastToRoom(slug, { type: 'document.updated', source: 'agent-edit-v2', timestamp: new Date().toISOString() });
       } else {
         const collabStatus = await notifyCollabMutation(
           slug,
@@ -2335,25 +2465,6 @@ agentRoutes.post('/:slug/edit', async (req: Request, res: Response) => {
     return;
   }
   const mutationBase = await resolveRouteMutationBase(slug);
-  const stage = getMutationContractStage();
-  const precondition = validateEditPrecondition(stage, doc, body, mutationBase?.token ?? null);
-  if (!precondition.ok) {
-    failEdit(
-      precondition.status,
-      {
-        success: false,
-        code: precondition.code,
-        error: precondition.error,
-        latestUpdatedAt: doc.updated_at,
-        latestRevision: doc.revision,
-        retryWithState: `/api/agent/${slug}/state`,
-      },
-      precondition.code,
-      `/api/agent/${slug}/state`,
-    );
-    return;
-  }
-
   const collabRuntime = getCollabRuntime();
   const singleWriterEditEnabled = isSingleWriterEditEnabled() && collabRuntime.enabled;
   const collabClientBreakdown = collabRuntime.enabled
@@ -2400,6 +2511,24 @@ agentRoutes.post('/:slug/edit', async (req: Request, res: Response) => {
       documentLeaseAnyEpochCount: collabClientBreakdown?.documentLeaseAnyEpochCount ?? 0,
       recentLeaseCount: collabClientBreakdown?.recentLeaseCount ?? 0,
     });
+  }
+  const stage = getMutationContractStage();
+  const precondition = validateEditPrecondition(stage, doc, body, mutationBase?.token ?? null);
+  if (!precondition.ok) {
+    failEdit(
+      precondition.status,
+      {
+        success: false,
+        code: precondition.code,
+        error: precondition.error,
+        latestUpdatedAt: doc.updated_at,
+        latestRevision: doc.revision,
+        retryWithState: `/api/agent/${slug}/state`,
+      },
+      precondition.code,
+      `/api/agent/${slug}/state`,
+    );
+    return;
   }
 
   const baseMarkdown = doc.markdown ?? '';
@@ -2658,6 +2787,22 @@ agentRoutes.post('/:slug/edit', async (req: Request, res: Response) => {
       );
       return;
     }
+    if (!mutationResult.ok && mutationResult.code === 'persisted_yjs_corrupt') {
+      failEdit(
+        409,
+        {
+          success: false,
+          code: 'PERSISTED_YJS_CORRUPT',
+          error: 'Persisted collaborative state is corrupt; document is quarantined until repair',
+          latestUpdatedAt: mutationResult.latestUpdatedAt ?? null,
+          latestRevision: mutationResult.latestRevision ?? null,
+          retryWithState: `/api/agent/${slug}/state`,
+        },
+        'PERSISTED_YJS_CORRUPT',
+        `/api/agent/${slug}/state`,
+      );
+      return;
+    }
     if (!mutationResult.ok && mutationResult.code === 'persisted_yjs_diverged') {
       failEdit(
         409,
@@ -2837,7 +2982,8 @@ agentRoutes.post('/:slug/edit', async (req: Request, res: Response) => {
       what: 'Proof is a collaborative document editor. This is a shared doc.',
       docs: AGENT_DOCS_PATH,
       createApi: CANONICAL_CREATE_API_PATH,
-      stateApi: `/api/agent/${slug}/state`,
+      stateApi: `/documents/${slug}/state`,
+      agentStateApi: `/api/agent/${slug}/state`,
       opsApi: `/api/agent/${slug}/ops`,
       editApi: `/api/agent/${slug}/edit`,
       presenceApi: `/api/agent/${slug}/presence`,
@@ -2923,7 +3069,8 @@ agentRoutes.post('/:slug/presence', (req: Request, res: Response) => {
       what: 'Proof is a collaborative document editor. This is a shared doc.',
       docs: AGENT_DOCS_PATH,
       createApi: CANONICAL_CREATE_API_PATH,
-      stateApi: `/api/agent/${slug}/state`,
+      stateApi: `/documents/${slug}/state`,
+      agentStateApi: `/api/agent/${slug}/state`,
       opsApi: `/api/agent/${slug}/ops`,
       editApi: `/api/agent/${slug}/edit`,
       presenceApi: `/api/agent/${slug}/presence`,
@@ -3073,6 +3220,14 @@ agentRoutes.post('/:slug/ops', async (req: Request, res: Response) => {
   }
 
   let rewriteGate: ReturnType<typeof evaluateRewriteLiveClientGate> | null = null;
+  const preBarrierMutationBase = (
+    op === 'rewrite.apply'
+    && mutationContext.precondition?.mode === 'token'
+    && mutationContext.mutationBase
+  )
+    ? mutationContext.mutationBase
+    : null;
+  let promotedBarrierBaseToken: string | null = null;
   if (op === 'rewrite.apply') {
     const rewriteValidationError = validateRewriteApplyPayload(payload);
     if (rewriteValidationError) {
@@ -3132,9 +3287,55 @@ agentRoutes.post('/:slug/ops', async (req: Request, res: Response) => {
     });
     const barrierStartedAt = Date.now();
     try {
-      await prepareRewriteCollabBarrier(slug);
+      await prepareRewriteCollabBarrier(slug, {
+        validateWhileLocked: async () => {
+          const lockedDoc = getDocumentBySlug(slug) ?? mutationContext.doc;
+          const currentMutationBase = mutationContext.precondition?.mode === 'token'
+            ? await resolveRouteMutationBase(slug)
+            : null;
+          const lockedPrecondition = validateOpPrecondition(
+            getMutationContractStage(),
+            op,
+            lockedDoc,
+            payload,
+            currentMutationBase?.token ?? null,
+          );
+          if (!lockedPrecondition.ok) {
+            throw new RewriteBarrierPreconditionError(lockedPrecondition);
+          }
+        },
+      });
+      if (mutationContext.precondition?.mode === 'token' && preBarrierMutationBase) {
+        const postBarrierMutationBase = await resolveRouteMutationBase(slug);
+        const barrierOnlyTokenDrift = (
+          postBarrierMutationBase
+          && mutationContext.precondition.baseToken === preBarrierMutationBase.token
+          && postBarrierMutationBase.token !== preBarrierMutationBase.token
+          && sameRouteMutationBaseContent(postBarrierMutationBase, preBarrierMutationBase)
+        );
+        if (barrierOnlyTokenDrift) {
+          promotedBarrierBaseToken = postBarrierMutationBase.token;
+        }
+      }
       recordRewriteBarrierLatency(mutationRoute, Date.now() - barrierStartedAt);
     } catch (error) {
+      if (error instanceof RewriteBarrierPreconditionError) {
+        const latestDoc = getDocumentBySlug(slug) ?? mutationContext.doc;
+        failOps(
+          error.status,
+          {
+            success: false,
+            code: error.code,
+            error: error.message,
+            latestUpdatedAt: latestDoc.updated_at,
+            latestRevision: latestDoc.revision,
+            retryWithState: `/api/agent/${slug}/state`,
+          },
+          error.code,
+          `/api/agent/${slug}/state`,
+        );
+        return;
+      }
       const reason = classifyRewriteBarrierFailureReason(error);
       recordRewriteBarrierFailure(mutationRoute, reason);
       recordRewriteBarrierLatency(mutationRoute, Date.now() - barrierStartedAt);
@@ -3156,10 +3357,16 @@ agentRoutes.post('/:slug/ops', async (req: Request, res: Response) => {
   }
 
   const result = op === 'rewrite.apply'
-    ? await executeCanonicalRewrite(slug, opRoute.body, {
+    ? await executeCanonicalRewrite(
+      slug,
+      promotedBarrierBaseToken !== null
+        ? { ...opRoute.body, baseToken: promotedBarrierBaseToken }
+        : opRoute.body,
+      {
       idempotencyKey: replay.idempotencyKey ?? undefined,
       idempotencyRoute: replay.reservation?.route ?? undefined,
-    })
+    },
+    )
     : await executeDocumentOperationAsync(slug, opRoute.method, opRoute.path, opRoute.body, mutationContext);
   if (opRoute.path === '/marks/accept' || opRoute.path === '/marks/reject') {
     maybeLogMarkHydrationMismatch(mutationRoute, slug, opRoute.body, mutationContext, result);
@@ -3440,9 +3647,10 @@ agentRoutes.post('/:slug/rewrite', async (req: Request, res: Response) => {
     sendMutationResponse(res, 404, { success: false, error: 'Document not found' }, { route: mutationRoute, slug });
     return;
   }
+  const payload = asPayload(req.body);
   const mutationBase = await resolveRouteMutationBase(slug);
   const stage = getMutationContractStage();
-  const opPrecondition = validateOpPrecondition(stage, 'rewrite.apply', doc, asPayload(req.body), mutationBase?.token ?? null);
+  const opPrecondition = validateOpPrecondition(stage, 'rewrite.apply', doc, payload, mutationBase?.token ?? null);
   if (!opPrecondition.ok) {
     sendMutationResponse(res, opPrecondition.status, {
       success: false,
@@ -3471,12 +3679,12 @@ agentRoutes.post('/:slug/rewrite', async (req: Request, res: Response) => {
       { route: mutationRoute, slug, ...(retryWithState ? { retryWithState } : {}) },
     );
   };
-  const rewriteValidationError = validateRewriteApplyPayload(asPayload(req.body));
+  const rewriteValidationError = validateRewriteApplyPayload(payload);
   if (rewriteValidationError) {
     failRewrite(400, { success: false, error: rewriteValidationError }, 'invalid_rewrite_payload');
     return;
   }
-  const rewriteGate = evaluateRewriteLiveClientGate(slug, asPayload(req.body));
+  const rewriteGate = evaluateRewriteLiveClientGate(slug, payload);
   res.setHeader('X-Proof-Agent-Routes', '1');
   res.setHeader('X-Proof-Rewrite-Hosted', rewriteGate.hostedRuntime ? '1' : '0');
   res.setHeader('X-Proof-Rewrite-Blocked', rewriteGate.blocked ? '1' : '0');
@@ -3532,10 +3740,58 @@ agentRoutes.post('/:slug/rewrite', async (req: Request, res: Response) => {
     runtimeEnvironment: rewriteGate.runtimeEnvironment,
   });
   const barrierStartedAt = Date.now();
+  const preBarrierMutationBase = opPrecondition.mode === 'token' ? mutationBase : null;
+  let promotedBarrierBaseToken: string | null = null;
   try {
-    await prepareRewriteCollabBarrier(slug);
+    await prepareRewriteCollabBarrier(slug, {
+      validateWhileLocked: async () => {
+        const lockedDoc = getDocumentBySlug(slug) ?? doc;
+        const currentMutationBase = opPrecondition.mode === 'token'
+          ? await resolveRouteMutationBase(slug)
+          : null;
+        const lockedPrecondition = validateOpPrecondition(
+          stage,
+          'rewrite.apply',
+          lockedDoc,
+          payload,
+          currentMutationBase?.token ?? null,
+        );
+        if (!lockedPrecondition.ok) {
+          throw new RewriteBarrierPreconditionError(lockedPrecondition);
+        }
+      },
+    });
+    if (opPrecondition.mode === 'token' && preBarrierMutationBase) {
+      const postBarrierMutationBase = await resolveRouteMutationBase(slug);
+      const barrierOnlyTokenDrift = (
+        postBarrierMutationBase
+        && opPrecondition.baseToken === preBarrierMutationBase.token
+        && postBarrierMutationBase.token !== preBarrierMutationBase.token
+        && sameRouteMutationBaseContent(postBarrierMutationBase, preBarrierMutationBase)
+      );
+      if (barrierOnlyTokenDrift) {
+        promotedBarrierBaseToken = postBarrierMutationBase.token;
+      }
+    }
     recordRewriteBarrierLatency(mutationRoute, Date.now() - barrierStartedAt);
   } catch (error) {
+    if (error instanceof RewriteBarrierPreconditionError) {
+      const latestDoc = getDocumentBySlug(slug) ?? doc;
+      failRewrite(
+        error.status,
+        {
+          success: false,
+          code: error.code,
+          error: error.message,
+          latestUpdatedAt: latestDoc.updated_at,
+          latestRevision: latestDoc.revision,
+          retryWithState: `/api/agent/${slug}/state`,
+        },
+        error.code,
+        `/api/agent/${slug}/state`,
+      );
+      return;
+    }
     const reason = classifyRewriteBarrierFailureReason(error);
     recordRewriteBarrierFailure(mutationRoute, reason);
     recordRewriteBarrierLatency(mutationRoute, Date.now() - barrierStartedAt);
@@ -3554,7 +3810,10 @@ agentRoutes.post('/:slug/rewrite', async (req: Request, res: Response) => {
     failRewrite(503, rewriteBarrierFailedResponseBody(slug, reason), `rewrite_barrier_failed:${reason}`, `/api/agent/${slug}/state`);
     return;
   }
-  const result = await executeCanonicalRewrite(slug, asPayload(req.body), {
+  const rewritePayload = promotedBarrierBaseToken !== null
+    ? { ...payload, baseToken: promotedBarrierBaseToken }
+    : payload;
+  const result = await executeCanonicalRewrite(slug, rewritePayload, {
     idempotencyKey: replay.idempotencyKey ?? undefined,
     idempotencyRoute: replay.reservation?.route ?? undefined,
   });

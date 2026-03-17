@@ -2,16 +2,15 @@ import { Router, type Request, type RequestHandler, type Response } from 'expres
 import {
   bumpDocumentAccessEpoch,
   getDocument,
-  getDocumentBySlug,
   resolveDocumentAccessRole,
 } from './db.js';
 import { executeDocumentOperationAsync } from './document-engine.js';
 import { executeCanonicalRewrite } from './canonical-document.js';
 import {
-  applyCanonicalDocumentToCollab,
   getCollabRuntime,
   invalidateCollabDocument,
   invalidateCollabDocumentAndWait,
+  resolveAuthoritativeMutationBase,
 } from './collab.js';
 import { broadcastToRoom, sendBridgeRequest, type BridgeError } from './ws.js';
 import { findBridgeRoutePolicy, getBridgeRoutePolicies, type BridgeRoutePolicy } from './bridge-auth-policy.js';
@@ -29,7 +28,8 @@ import {
   rewriteBarrierFailedResponseBody,
   rewriteBlockedResponseBody,
 } from './rewrite-policy.js';
-import { canonicalizeStoredMarks, type StoredMark } from '../src/formats/marks.js';
+import { traceServerIncident, toErrorTraceData } from './incident-tracing.js';
+import { getMutationContractStage, validateOpPrecondition } from './mutation-stage.js';
 
 export const bridgeRouter = Router({ mergeParams: true });
 export function createBridgeMountRouter(middleware?: RequestHandler): Router {
@@ -56,6 +56,22 @@ function parsePositiveIntEnv(name: string, fallback: number): number {
   const raw = process.env[name];
   const parsed = raw ? Number.parseInt(raw, 10) : Number.NaN;
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+async function resolveBridgeMutationBase(slug: string) {
+  const resolved = await resolveAuthoritativeMutationBase(slug, {
+    liveRequired: false,
+    preferProjection: false,
+  });
+  return resolved.ok ? resolved.base : null;
+}
+
+function sameBridgeMutationBaseContent(
+  left: Awaited<ReturnType<typeof resolveBridgeMutationBase>> | null,
+  right: Awaited<ReturnType<typeof resolveBridgeMutationBase>> | null,
+): boolean {
+  if (!left || !right) return false;
+  return left.markdown === right.markdown && JSON.stringify(left.marks) === JSON.stringify(right.marks);
 }
 
 function trustProxyHeaders(): boolean {
@@ -104,17 +120,6 @@ function getSlugParam(req: Request): string | null {
   const raw = req.params.slug;
   if (typeof raw === 'string' && raw.trim()) return raw;
   if (Array.isArray(raw) && typeof raw[0] === 'string' && raw[0].trim()) return raw[0];
-  const urlCandidates = [req.originalUrl, `${req.baseUrl || ''}${req.path || ''}`];
-  for (const candidate of urlCandidates) {
-    const match = candidate.match(/\/(?:documents|d)\/([^/]+)\/bridge(?:\/|$)/);
-    if (match?.[1]) {
-      try {
-        return decodeURIComponent(match[1]);
-      } catch {
-        return match[1];
-      }
-    }
-  }
   return null;
 }
 
@@ -174,6 +179,24 @@ function getErrorExtras(error: unknown): Record<string, unknown> {
   return extras;
 }
 
+function normalizeBridgeMutationPath(
+  method: string,
+  bridgePath: string,
+  body: Record<string, unknown>,
+): string {
+  if (method !== 'POST') return bridgePath;
+  if (bridgePath === '/comments') return '/marks/comment';
+  if (bridgePath === '/comments/reply') return '/marks/reply';
+  if (bridgePath === '/comments/resolve') return '/marks/resolve';
+  if (bridgePath !== '/suggestions') return bridgePath;
+
+  const kind = typeof body.kind === 'string' ? body.kind.trim().toLowerCase() : '';
+  if (kind === 'insert') return '/marks/suggest-insert';
+  if (kind === 'delete') return '/marks/suggest-delete';
+  if (kind === 'replace') return '/marks/suggest-replace';
+  return bridgePath;
+}
+
 function buildUnknownRouteResponse(method: string, bridgePath: string): Record<string, unknown> {
   const supportedRoutes = getBridgeRoutePolicies().map((policy) => `${policy.method} ${policy.path}`);
   const methodMatch = getBridgeRoutePolicies().find((policy) => policy.path === bridgePath);
@@ -220,7 +243,7 @@ function buildValidationError(
     return payload;
   }
 
-  if (bridgePath === '/marks/comment' || bridgePath === '/comments') {
+  if (bridgePath === '/marks/comment') {
     payload.hint = 'Provide "quote" text or a structured "selector" object to anchor the comment.';
     payload.nextSteps = [
       'Fetch /state or /marks to locate the target text.',
@@ -326,30 +349,12 @@ function checkRateLimit(
   return { allowed: true };
 }
 
-function normalizeBridgeMutationPath(
-  method: string,
-  bridgePath: string,
-  body: Record<string, unknown>,
-): string {
-  if (method !== 'POST') return bridgePath;
-  if (bridgePath === '/comments') return '/marks/comment';
-  if (bridgePath === '/comments/reply') return '/marks/reply';
-  if (bridgePath === '/comments/resolve') return '/marks/resolve';
-  if (bridgePath !== '/suggestions') return bridgePath;
-
-  const kind = typeof body.kind === 'string' ? body.kind.trim().toLowerCase() : '';
-  if (kind === 'insert') return '/marks/suggest-insert';
-  if (kind === 'delete') return '/marks/suggest-delete';
-  if (kind === 'replace') return '/marks/suggest-replace';
-  return bridgePath;
-}
-
 function validateRoutePayload(
   method: string,
   bridgePath: string,
   body: Record<string, unknown>
 ): Record<string, unknown> | null {
-  if (method === 'POST' && (bridgePath === '/marks/comment' || bridgePath === '/comments')) {
+  if (method === 'POST' && bridgePath === '/marks/comment') {
     const hasQuote = typeof body.quote === 'string' && body.quote.trim().length > 0;
     const hasSelector = isRecord(body.selector) && Object.keys(body.selector).length > 0;
     if (!hasQuote && !hasSelector) {
@@ -392,18 +397,6 @@ function validateRoutePayload(
   return null;
 }
 
-function parseCanonicalMarks(raw: string): Record<string, unknown> {
-  try {
-    const parsed = JSON.parse(raw);
-    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-      return canonicalizeStoredMarks(parsed as Record<string, StoredMark>);
-    }
-  } catch {
-    // ignore malformed marks payload
-  }
-  return {};
-}
-
 async function prepareRewriteCollabBarrier(slug: string): Promise<void> {
   const collabRuntime = getCollabRuntime();
   if (!collabRuntime.enabled) return;
@@ -427,6 +420,14 @@ async function prepareRewriteCollabBarrier(slug: string): Promise<void> {
     }
   } catch (error) {
     console.error('[bridge] Failed to prepare rewrite collab barrier:', { slug, error });
+    traceServerIncident({
+      slug,
+      subsystem: 'bridge',
+      level: 'error',
+      eventType: 'rewrite.barrier_prepare_failed',
+      message: 'Bridge rewrite collab barrier failed before rewrite execution',
+      data: toErrorTraceData(error),
+    });
     invalidateCollabDocument(slug);
     throw error;
   }
@@ -490,6 +491,32 @@ bridgeRouter.use(async (req: Request, res: Response) => {
       res.status(400).json(buildValidationError(method, bridgePath, rewriteValidationError));
       return;
     }
+    const rewriteDoc = getDocument(slug);
+    if (!rewriteDoc) {
+      res.status(404).json({ error: 'Document not found' });
+      return;
+    }
+    const rewriteStage = getMutationContractStage();
+    const preBarrierMutationBase = await resolveBridgeMutationBase(slug);
+    const rewritePrecondition = validateOpPrecondition(
+      rewriteStage,
+      'rewrite.apply',
+      rewriteDoc,
+      requestBody,
+      preBarrierMutationBase?.token ?? null,
+    );
+    if (!rewritePrecondition.ok) {
+      res.status(rewritePrecondition.status).json({
+        success: false,
+        code: rewritePrecondition.code,
+        error: rewritePrecondition.error,
+        latestUpdatedAt: rewriteDoc.updated_at,
+        latestRevision: rewriteDoc.revision,
+        retryWithState: `/api/agent/${slug}/state`,
+        execution: 'server',
+      });
+      return;
+    }
     const rewriteGate = evaluateRewriteLiveClientGate(slug, requestBody);
     if (rewriteGate.blocked) {
       recordRewriteLiveClientBlock(
@@ -510,6 +537,21 @@ bridgeRouter.use(async (req: Request, res: Response) => {
         forceIgnored: rewriteGate.forceIgnored,
         runtimeEnvironment: rewriteGate.runtimeEnvironment,
       });
+      traceServerIncident({
+        slug,
+        subsystem: 'bridge',
+        level: 'warn',
+        eventType: 'rewrite.blocked_live_clients',
+        message: 'Bridge rewrite was blocked because live clients were connected',
+        data: {
+          route: 'POST /d/:slug/bridge/rewrite',
+          connectedClients: rewriteGate.connectedClients,
+          forceRequested: rewriteGate.forceRequested,
+          forceHonored: rewriteGate.forceHonored,
+          forceIgnored: rewriteGate.forceIgnored,
+          runtimeEnvironment: rewriteGate.runtimeEnvironment,
+        },
+      });
       res.status(409).json({
         ...rewriteBlockedResponseBody(rewriteGate, slug),
         execution: 'server',
@@ -519,11 +561,35 @@ bridgeRouter.use(async (req: Request, res: Response) => {
     const barrierStartedAt = Date.now();
     try {
       await prepareRewriteCollabBarrier(slug);
+      if (rewritePrecondition.mode === 'token' && preBarrierMutationBase) {
+        const postBarrierMutationBase = await resolveBridgeMutationBase(slug);
+        const barrierOnlyTokenDrift = (
+          postBarrierMutationBase
+          && rewritePrecondition.baseToken === preBarrierMutationBase.token
+          && postBarrierMutationBase.token !== preBarrierMutationBase.token
+          && sameBridgeMutationBaseContent(postBarrierMutationBase, preBarrierMutationBase)
+        );
+        if (barrierOnlyTokenDrift) {
+          requestBody.baseToken = postBarrierMutationBase.token;
+        }
+      }
       recordRewriteBarrierLatency('POST /d/:slug/bridge/rewrite', Date.now() - barrierStartedAt);
     } catch (error) {
       const reason = classifyRewriteBarrierFailureReason(error);
       recordRewriteBarrierFailure('POST /d/:slug/bridge/rewrite', reason);
       recordRewriteBarrierLatency('POST /d/:slug/bridge/rewrite', Date.now() - barrierStartedAt);
+      traceServerIncident({
+        slug,
+        subsystem: 'bridge',
+        level: 'error',
+        eventType: 'rewrite.barrier_failed',
+        message: 'Bridge rewrite failed because the collab barrier could not complete',
+        data: {
+          route: 'POST /d/:slug/bridge/rewrite',
+          reason,
+          ...toErrorTraceData(error),
+        },
+      });
       res.status(503).json({
         ...rewriteBarrierFailedResponseBody(slug, reason),
         execution: 'server',
@@ -542,6 +608,18 @@ bridgeRouter.use(async (req: Request, res: Response) => {
     const token = getBridgeToken(req);
     const role = token ? resolveDocumentAccessRole(slug, token) : null;
     if (role !== 'owner_bot') {
+      traceServerIncident({
+        slug,
+        subsystem: 'bridge',
+        level: 'warn',
+        eventType: 'auth.unauthorized',
+        message: 'Bridge request rejected due to missing or invalid owner token',
+        data: {
+          method,
+          path: bridgePath,
+          tokenPresent: Boolean(token),
+        },
+      });
       res.status(401).json(buildUnauthorizedResponse(req, slug));
       return;
     }
@@ -552,7 +630,7 @@ bridgeRouter.use(async (req: Request, res: Response) => {
     requestBody.__agentId = agentId.trim();
   }
 
-  const serverResult = method === 'POST' && canonicalBridgePath === '/rewrite'
+  const serverResult = method === 'POST' && bridgePath === '/rewrite'
     ? await executeCanonicalRewrite(slug, requestBody)
     : await executeDocumentOperationAsync(slug, method, canonicalBridgePath, requestBody);
   if (method === 'POST' && canonicalBridgePath === '/rewrite' && serverResult.status >= 200 && serverResult.status < 300) {
@@ -561,29 +639,6 @@ bridgeRouter.use(async (req: Request, res: Response) => {
   }
   if (serverResult.status !== 404) {
     if (serverResult.status >= 200 && serverResult.status < 300 && method === 'POST') {
-      if (canonicalBridgePath !== '/rewrite') {
-        try {
-          const collabRuntime = getCollabRuntime();
-          if (collabRuntime.enabled) {
-            const updatedDoc = getDocumentBySlug(slug);
-            if (updatedDoc) {
-              const applyOptions = {
-                markdown: typeof updatedDoc.markdown === 'string' ? updatedDoc.markdown : undefined,
-                marks: parseCanonicalMarks(updatedDoc.marks),
-                source: 'bridge',
-              };
-              await applyCanonicalDocumentToCollab(slug, applyOptions);
-            } else {
-              invalidateCollabDocument(slug);
-            }
-          } else {
-            invalidateCollabDocument(slug);
-          }
-        } catch (error) {
-          console.error('[bridge] Failed to apply server bridge mutation into collab runtime:', { slug, error });
-          invalidateCollabDocument(slug);
-        }
-      }
       broadcastToRoom(slug, {
         type: 'document.updated',
         source: 'bridge',
@@ -602,7 +657,7 @@ bridgeRouter.use(async (req: Request, res: Response) => {
     const result = await sendBridgeRequest(
       slug,
       method,
-      bridgePath,
+      canonicalBridgePath,
       requestBody,
     );
     res.setHeader('x-proof-bridge-execution', 'viewer');
@@ -611,6 +666,19 @@ bridgeRouter.use(async (req: Request, res: Response) => {
     const bridgeError = error as BridgeError;
     const code = getErrorCode(bridgeError);
     if (code === 'NO_VIEWERS' || code === 'VIEWER_DISCONNECTED' || code === 'NO_BRIDGE_CAPABLE_VIEWER') {
+      traceServerIncident({
+        slug,
+        subsystem: 'bridge',
+        level: 'warn',
+        eventType: 'viewer.unavailable',
+        message: 'Bridge request could not find a healthy viewer to service the request',
+        data: {
+          method,
+          path: bridgePath,
+          code,
+          ...getErrorExtras(bridgeError),
+        },
+      });
       res.status(503).json(buildNoViewerResponse(req, slug, code));
       return;
     }
@@ -618,6 +686,18 @@ bridgeRouter.use(async (req: Request, res: Response) => {
       const timeoutMs = isRecord(bridgeError) && typeof bridgeError.timeoutMs === 'number'
         ? bridgeError.timeoutMs
         : undefined;
+      traceServerIncident({
+        slug,
+        subsystem: 'bridge',
+        level: 'warn',
+        eventType: 'viewer.timeout',
+        message: 'Bridge request timed out waiting for a viewer response',
+        data: {
+          method,
+          path: bridgePath,
+          timeoutMs,
+        },
+      });
       res.status(504).json(buildTimeoutResponse(req, slug, timeoutMs));
       return;
     }
@@ -625,6 +705,20 @@ bridgeRouter.use(async (req: Request, res: Response) => {
     const extras = getErrorExtras(bridgeError);
     const status = getErrorStatus(bridgeError);
     if (typeof status === 'number' && status >= 400 && status <= 499) {
+      traceServerIncident({
+        slug,
+        subsystem: 'bridge',
+        level: 'warn',
+        eventType: 'viewer.error',
+        message: 'Viewer returned a client error for bridge execution',
+        data: {
+          method,
+          path: bridgePath,
+          status,
+          code: code ?? 'BRIDGE_ERROR',
+          ...extras,
+        },
+      });
       res.status(status).json({
         error: getErrorMessage(bridgeError, 'Bridge request failed'),
         code: code ?? 'BRIDGE_ERROR',
@@ -633,6 +727,20 @@ bridgeRouter.use(async (req: Request, res: Response) => {
       return;
     }
 
+    traceServerIncident({
+      slug,
+      subsystem: 'bridge',
+      level: 'error',
+      eventType: 'viewer.error',
+      message: 'Viewer returned an unexpected bridge execution error',
+      data: {
+        method,
+        path: bridgePath,
+        status,
+        code: code ?? 'BRIDGE_ERROR',
+        ...extras,
+      },
+    });
     res.status(500).json({
       error: getErrorMessage(bridgeError, 'Bridge request failed'),
       code: code ?? 'BRIDGE_ERROR',

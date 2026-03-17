@@ -20,6 +20,7 @@ const DEFAULT_EVENT_PAGE_SIZE = 100;
 const DB_METADATA_TABLE = 'system_metadata';
 const DB_ENV_METADATA_KEY = 'db_environment';
 const GLOBAL_COLLAB_ADMISSION_GUARD_METADATA_KEY = 'collab.global_admission_guard';
+const GLOBAL_COLLAB_ADMISSION_EPOCH_METADATA_KEY = 'collab.global_admission_epoch';
 const MUTATION_IDEMPOTENCY_TABLE = 'mutation_idempotency';
 const MUTATION_OUTBOX_TABLE = 'mutation_outbox';
 const MARK_TOMBSTONES_TABLE = 'mark_tombstones';
@@ -228,6 +229,7 @@ export interface DocumentRow {
   y_state_version: number;
   share_state: ShareState;
   access_epoch: number;
+  collab_bootstrap_epoch: number;
   live_collab_seen_at: string | null;
   live_collab_access_epoch: number | null;
   active: number;
@@ -267,6 +269,7 @@ export interface DocumentAuthStateRow {
   doc_id: string | null;
   share_state: ShareState;
   access_epoch: number;
+  owner_id: string | null;
   owner_secret: string | null;
   owner_secret_hash: string | null;
 }
@@ -300,6 +303,21 @@ export interface PersistedGlobalCollabAdmissionGuardEntry {
   lastTriggeredAt: number;
   count: number;
   details?: Record<string, unknown>;
+}
+
+export function getGlobalCollabAdmissionEpoch(): number {
+  const d = getDb();
+  createMetadataTableIfNeeded(d);
+  return readMetadataNumber(d, GLOBAL_COLLAB_ADMISSION_EPOCH_METADATA_KEY, 0);
+}
+
+export function bumpGlobalCollabAdmissionEpoch(): number {
+  assertWritesAllowed('bumpGlobalCollabAdmissionEpoch');
+  const d = getDb();
+  createMetadataTableIfNeeded(d);
+  const nextEpoch = readMetadataNumber(d, GLOBAL_COLLAB_ADMISSION_EPOCH_METADATA_KEY, 0) + 1;
+  writeMetadataNumber(d, GLOBAL_COLLAB_ADMISSION_EPOCH_METADATA_KEY, nextEpoch);
+  return nextEpoch;
 }
 
 function parsePersistedGlobalCollabAdmissionGuard(
@@ -342,10 +360,48 @@ export interface DocumentEventRow {
   event_data: string;
   actor: string;
   idempotency_key: string | null;
+  mutation_route: string | null;
   tombstone_revision: number | null;
   created_at: string;
   acked_by: string | null;
   acked_at: string | null;
+}
+
+export interface ServerIncidentEventRow {
+  id: number;
+  request_id: string | null;
+  slug: string | null;
+  subsystem: string;
+  level: 'info' | 'warn' | 'error';
+  event_type: string;
+  message: string;
+  data_json: string;
+  created_at: string;
+}
+
+export type MutationIdempotencyState = 'pending' | 'completed';
+
+export type MutationIdempotencyRecord = {
+  state: MutationIdempotencyState;
+  response: Record<string, unknown> | null;
+  requestHash: string | null;
+  statusCode: number | null;
+  tombstoneRevision: number | null;
+  createdAt: string;
+  completedAt: string | null;
+  leaseExpiresAt: string | null;
+  lastSeenAt: string | null;
+};
+
+export interface ServerIncidentEventInput {
+  timestamp?: string;
+  requestId?: string | null;
+  slug?: string | null;
+  subsystem: string;
+  level: 'info' | 'warn' | 'error';
+  eventType: string;
+  message: string;
+  data?: Record<string, unknown> | null;
 }
 
 export interface MutationOutboxRow {
@@ -357,6 +413,7 @@ export interface MutationOutboxRow {
   event_data: string;
   actor: string;
   idempotency_key: string | null;
+  mutation_route: string | null;
   tombstone_revision: number | null;
   created_at: string;
   delivered_at: string | null;
@@ -618,6 +675,9 @@ function addMissingDocumentColumns(): void {
   if (!names.has('access_epoch')) {
     d.exec('ALTER TABLE documents ADD COLUMN access_epoch INTEGER NOT NULL DEFAULT 0');
   }
+  if (!names.has('collab_bootstrap_epoch')) {
+    d.exec('ALTER TABLE documents ADD COLUMN collab_bootstrap_epoch INTEGER NOT NULL DEFAULT 0');
+  }
   if (!names.has('live_collab_seen_at')) {
     d.exec('ALTER TABLE documents ADD COLUMN live_collab_seen_at TEXT');
   }
@@ -635,6 +695,9 @@ function addMissingDocumentColumns(): void {
   }
   if (!names.has('y_state_version')) {
     d.exec('ALTER TABLE documents ADD COLUMN y_state_version INTEGER NOT NULL DEFAULT 0');
+  }
+  if (!names.has('y_state_blob')) {
+    d.exec('ALTER TABLE documents ADD COLUMN y_state_blob BLOB');
   }
 }
 
@@ -660,6 +723,9 @@ function addMissingDocumentEventColumns(): void {
   if (!names.has('tombstone_revision')) {
     d.exec('ALTER TABLE document_events ADD COLUMN tombstone_revision INTEGER');
   }
+  if (!names.has('mutation_route')) {
+    d.exec('ALTER TABLE document_events ADD COLUMN mutation_route TEXT');
+  }
   documentEventsTableInitialized = true;
 }
 
@@ -677,6 +743,36 @@ function addMissingMutationIdempotencyColumns(): void {
   if (!names.has('tombstone_revision')) {
     d.exec(`ALTER TABLE ${MUTATION_IDEMPOTENCY_TABLE} ADD COLUMN tombstone_revision INTEGER`);
   }
+  if (!names.has('state')) {
+    d.exec(`ALTER TABLE ${MUTATION_IDEMPOTENCY_TABLE} ADD COLUMN state TEXT NOT NULL DEFAULT 'completed'`);
+  }
+  if (!names.has('completed_at')) {
+    d.exec(`ALTER TABLE ${MUTATION_IDEMPOTENCY_TABLE} ADD COLUMN completed_at TEXT`);
+  }
+  if (!names.has('lease_expires_at')) {
+    d.exec(`ALTER TABLE ${MUTATION_IDEMPOTENCY_TABLE} ADD COLUMN lease_expires_at TEXT`);
+  }
+  if (!names.has('last_seen_at')) {
+    d.exec(`ALTER TABLE ${MUTATION_IDEMPOTENCY_TABLE} ADD COLUMN last_seen_at TEXT`);
+  }
+  if (!names.has('reservation_token')) {
+    d.exec(`ALTER TABLE ${MUTATION_IDEMPOTENCY_TABLE} ADD COLUMN reservation_token TEXT`);
+  }
+  d.prepare(`
+    UPDATE ${MUTATION_IDEMPOTENCY_TABLE}
+    SET state = 'completed'
+    WHERE state IS NULL OR TRIM(state) = ''
+  `).run();
+  d.prepare(`
+    UPDATE ${MUTATION_IDEMPOTENCY_TABLE}
+    SET completed_at = created_at
+    WHERE state = 'completed' AND completed_at IS NULL
+  `).run();
+  d.prepare(`
+    UPDATE ${MUTATION_IDEMPOTENCY_TABLE}
+    SET last_seen_at = COALESCE(last_seen_at, completed_at, created_at)
+    WHERE last_seen_at IS NULL
+  `).run();
   mutationIdempotencyTableInitialized = true;
 }
 
@@ -700,7 +796,130 @@ function addMissingMutationOutboxColumns(): void {
   if (!names.has('delivered_at')) {
     d.exec(`ALTER TABLE ${MUTATION_OUTBOX_TABLE} ADD COLUMN delivered_at TEXT`);
   }
+  if (!names.has('mutation_route')) {
+    d.exec(`ALTER TABLE ${MUTATION_OUTBOX_TABLE} ADD COLUMN mutation_route TEXT`);
+  }
+  d.prepare(`
+    UPDATE ${MUTATION_OUTBOX_TABLE}
+    SET mutation_route = (
+      SELECT document_events.mutation_route
+      FROM document_events
+      WHERE document_events.id = ${MUTATION_OUTBOX_TABLE}.event_id
+      LIMIT 1
+    )
+    WHERE mutation_route IS NULL AND event_id IS NOT NULL
+  `).run();
   mutationOutboxTableInitialized = true;
+}
+
+function backfillLegacyMutationRouteMetadata(filters?: {
+  documentSlug?: string;
+  idempotencyKey?: string;
+}): void {
+  const d = getDb();
+  const clauses = ['mutation_route IS NULL', 'idempotency_key IS NOT NULL'];
+  const params: Array<string> = [];
+  if (typeof filters?.documentSlug === 'string' && filters.documentSlug.trim()) {
+    clauses.push('document_slug = ?');
+    params.push(filters.documentSlug);
+  }
+  if (typeof filters?.idempotencyKey === 'string' && filters.idempotencyKey.trim()) {
+    clauses.push('idempotency_key = ?');
+    params.push(filters.idempotencyKey);
+  }
+  const whereClause = clauses.join(' AND ');
+
+  d.prepare(`
+    UPDATE document_events
+    SET mutation_route = (
+      SELECT CASE WHEN COUNT(DISTINCT route) = 1 THEN MIN(route) ELSE NULL END
+      FROM (
+        SELECT route
+        FROM ${MUTATION_IDEMPOTENCY_TABLE}
+        WHERE document_slug = document_events.document_slug
+          AND idempotency_key = document_events.idempotency_key
+          AND route IS NOT NULL
+        UNION ALL
+        SELECT route
+        FROM idempotency_keys
+        WHERE document_slug = document_events.document_slug
+          AND idempotency_key = document_events.idempotency_key
+          AND route IS NOT NULL
+      ) inferred_routes
+    )
+    WHERE ${whereClause}
+      AND (
+        SELECT COUNT(DISTINCT route)
+        FROM (
+          SELECT route
+          FROM ${MUTATION_IDEMPOTENCY_TABLE}
+          WHERE document_slug = document_events.document_slug
+            AND idempotency_key = document_events.idempotency_key
+            AND route IS NOT NULL
+          UNION ALL
+          SELECT route
+          FROM idempotency_keys
+          WHERE document_slug = document_events.document_slug
+            AND idempotency_key = document_events.idempotency_key
+            AND route IS NOT NULL
+        ) inferred_routes
+      ) = 1
+  `).run(...params);
+
+  d.prepare(`
+    UPDATE ${MUTATION_OUTBOX_TABLE}
+    SET mutation_route = COALESCE(
+      (
+        SELECT document_events.mutation_route
+        FROM document_events
+        WHERE document_events.id = ${MUTATION_OUTBOX_TABLE}.event_id
+          AND document_events.mutation_route IS NOT NULL
+        LIMIT 1
+      ),
+      (
+        SELECT CASE WHEN COUNT(DISTINCT route) = 1 THEN MIN(route) ELSE NULL END
+        FROM (
+          SELECT route
+          FROM ${MUTATION_IDEMPOTENCY_TABLE}
+          WHERE document_slug = ${MUTATION_OUTBOX_TABLE}.document_slug
+            AND idempotency_key = ${MUTATION_OUTBOX_TABLE}.idempotency_key
+            AND route IS NOT NULL
+          UNION ALL
+          SELECT route
+          FROM idempotency_keys
+          WHERE document_slug = ${MUTATION_OUTBOX_TABLE}.document_slug
+            AND idempotency_key = ${MUTATION_OUTBOX_TABLE}.idempotency_key
+            AND route IS NOT NULL
+        ) inferred_routes
+      )
+    )
+    WHERE ${whereClause}
+      AND COALESCE(
+        (
+          SELECT document_events.mutation_route
+          FROM document_events
+          WHERE document_events.id = ${MUTATION_OUTBOX_TABLE}.event_id
+            AND document_events.mutation_route IS NOT NULL
+          LIMIT 1
+        ),
+        (
+          SELECT CASE WHEN COUNT(DISTINCT route) = 1 THEN MIN(route) ELSE NULL END
+          FROM (
+            SELECT route
+            FROM ${MUTATION_IDEMPOTENCY_TABLE}
+            WHERE document_slug = ${MUTATION_OUTBOX_TABLE}.document_slug
+              AND idempotency_key = ${MUTATION_OUTBOX_TABLE}.idempotency_key
+              AND route IS NOT NULL
+            UNION ALL
+            SELECT route
+            FROM idempotency_keys
+            WHERE document_slug = ${MUTATION_OUTBOX_TABLE}.document_slug
+              AND idempotency_key = ${MUTATION_OUTBOX_TABLE}.idempotency_key
+              AND route IS NOT NULL
+          ) inferred_routes
+        )
+      ) IS NOT NULL
+  `).run(...params);
 }
 
 function addMissingMarkTombstoneColumns(): void {
@@ -789,6 +1008,7 @@ function initDatabase(): void {
       y_state_version INTEGER NOT NULL DEFAULT 0,
       share_state TEXT NOT NULL DEFAULT 'ACTIVE',
       access_epoch INTEGER NOT NULL DEFAULT 0,
+      collab_bootstrap_epoch INTEGER NOT NULL DEFAULT 0,
       live_collab_seen_at TEXT,
       live_collab_access_epoch INTEGER,
       active INTEGER NOT NULL DEFAULT 1,
@@ -866,6 +1086,7 @@ function initDatabase(): void {
       event_data TEXT NOT NULL,
       actor TEXT NOT NULL,
       idempotency_key TEXT,
+      mutation_route TEXT,
       tombstone_revision INTEGER,
       created_at TEXT NOT NULL,
       acked_by TEXT,
@@ -877,6 +1098,23 @@ function initDatabase(): void {
   d.exec('CREATE INDEX IF NOT EXISTS idx_document_events_slug_id ON document_events(document_slug, id)');
   d.exec('CREATE INDEX IF NOT EXISTS idx_document_events_slug_tombstone ON document_events(document_slug, tombstone_revision, id)');
   d.exec('CREATE INDEX IF NOT EXISTS idx_document_events_slug_revision ON document_events(document_slug, document_revision, id)');
+  d.exec('CREATE INDEX IF NOT EXISTS idx_document_events_slug_idempotency_route ON document_events(document_slug, idempotency_key, mutation_route, id)');
+  d.exec(`
+    CREATE TABLE IF NOT EXISTS server_incident_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      request_id TEXT,
+      slug TEXT,
+      subsystem TEXT NOT NULL,
+      level TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      message TEXT NOT NULL,
+      data_json TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    )
+  `);
+  d.exec('CREATE INDEX IF NOT EXISTS idx_server_incident_events_request_id_created_at ON server_incident_events(request_id, created_at, id)');
+  d.exec('CREATE INDEX IF NOT EXISTS idx_server_incident_events_slug_created_at ON server_incident_events(slug, created_at, id)');
+  d.exec('CREATE INDEX IF NOT EXISTS idx_server_incident_events_subsystem_created_at ON server_incident_events(subsystem, created_at, id)');
 
   d.exec(`
     CREATE TABLE IF NOT EXISTS idempotency_keys (
@@ -900,6 +1138,11 @@ function initDatabase(): void {
       request_hash TEXT,
       status_code INTEGER NOT NULL DEFAULT 200,
       tombstone_revision INTEGER,
+      state TEXT NOT NULL DEFAULT 'completed',
+      completed_at TEXT,
+      lease_expires_at TEXT,
+      last_seen_at TEXT,
+      reservation_token TEXT,
       created_at TEXT NOT NULL,
       PRIMARY KEY (idempotency_key, document_slug, route)
     )
@@ -924,6 +1167,7 @@ function initDatabase(): void {
       event_data TEXT NOT NULL,
       actor TEXT NOT NULL,
       idempotency_key TEXT,
+      mutation_route TEXT,
       tombstone_revision INTEGER,
       created_at TEXT NOT NULL,
       delivered_at TEXT
@@ -943,10 +1187,15 @@ function initDatabase(): void {
     ON ${MUTATION_OUTBOX_TABLE}(document_slug, delivered_at, tombstone_revision, id)
   `);
   d.exec(`
+    CREATE INDEX IF NOT EXISTS idx_mutation_outbox_slug_idempotency_route
+    ON ${MUTATION_OUTBOX_TABLE}(document_slug, idempotency_key, mutation_route, id)
+  `);
+  d.exec(`
     CREATE UNIQUE INDEX IF NOT EXISTS idx_mutation_outbox_event_id_unique
     ON ${MUTATION_OUTBOX_TABLE}(event_id)
     WHERE event_id IS NOT NULL
   `);
+  backfillLegacyMutationRouteMetadata();
 
   d.exec(`
     CREATE TABLE IF NOT EXISTS ${MARK_TOMBSTONES_TABLE} (
@@ -1100,20 +1349,23 @@ export function createDocument(
   const now = new Date().toISOString();
   const d = getDb();
   const docId = randomUUID();
+  createMetadataTableIfNeeded(d);
+  const collabBootstrapEpoch = readMetadataNumber(d, GLOBAL_COLLAB_ADMISSION_EPOCH_METADATA_KEY, 0);
   const ownerSecretHash = ownerSecret ? hashSecret(ownerSecret) : null;
 
   d.prepare(`
     INSERT INTO documents (
-      slug, doc_id, title, markdown, marks, revision, y_state_version, share_state, access_epoch, active,
+      slug, doc_id, title, markdown, marks, revision, y_state_version, share_state, access_epoch, collab_bootstrap_epoch, active,
       owner_id, owner_secret, owner_secret_hash, created_at, updated_at, deleted_at
     )
-    VALUES (?, ?, ?, ?, ?, 1, 0, 'ACTIVE', 0, 1, ?, NULL, ?, ?, ?, NULL)
+    VALUES (?, ?, ?, ?, ?, 1, 0, 'ACTIVE', 0, ?, 1, ?, NULL, ?, ?, ?, NULL)
   `).run(
     slug,
     docId,
     title || null,
     markdown,
     JSON.stringify(marks),
+    collabBootstrapEpoch,
     ownerId || null,
     ownerSecretHash,
     now,
@@ -1201,7 +1453,7 @@ export function setDocumentProjectionHealth(
 export function getDocumentAuthStateBySlug(slug: string): DocumentAuthStateRow | undefined {
   return getDb()
     .prepare(`
-      SELECT slug, doc_id, share_state, access_epoch, owner_secret, owner_secret_hash
+      SELECT slug, doc_id, share_state, access_epoch, owner_id, owner_secret, owner_secret_hash
       FROM documents
       WHERE slug = ?
       LIMIT 1
@@ -1321,6 +1573,21 @@ export function countActiveCollabConnections(
   return typeof row?.count === 'number' ? row.count : 0;
 }
 
+export function listActiveCollabConnectionSlugs(
+  observedAt: string = new Date().toISOString(),
+): string[] {
+  ensureActiveCollabConnectionsTable();
+  const cutoffIso = new Date(Date.parse(observedAt) - getActiveCollabConnectionTtlMs()).toISOString();
+  const rows = getDb().prepare(`
+    SELECT DISTINCT document_slug AS slug
+    FROM ${ACTIVE_COLLAB_CONNECTIONS_TABLE}
+    WHERE last_seen_at >= ?
+  `).all(cutoffIso) as Array<{ slug?: string | null }>;
+  return rows
+    .map((row) => (typeof row.slug === 'string' ? row.slug.trim() : ''))
+    .filter((slug) => slug.length > 0);
+}
+
 export function noteDocumentLiveCollabLease(
   slug: string,
   accessEpoch: number,
@@ -1360,6 +1627,22 @@ export function getRecentDocumentLiveCollabLeaseBreakdown(
     exactEpochCount,
     anyEpochCount: 1,
   };
+}
+
+export function listRecentDocumentLiveCollabLeaseSlugs(
+  observedAt: string = new Date().toISOString(),
+): string[] {
+  const cutoffIso = new Date(Date.parse(observedAt) - getDocumentLiveCollabLeaseTtlMs()).toISOString();
+  const rows = getDb().prepare(`
+    SELECT slug
+    FROM documents
+    WHERE share_state IN ('ACTIVE', 'PAUSED')
+      AND live_collab_seen_at IS NOT NULL
+      AND live_collab_seen_at >= ?
+  `).all(cutoffIso) as Array<{ slug?: string | null }>;
+  return rows
+    .map((row) => (typeof row.slug === 'string' ? row.slug.trim() : ''))
+    .filter((slug) => slug.length > 0);
 }
 
 export function listActiveDocuments(): DocumentRow[] {
@@ -1470,105 +1753,6 @@ export function updateDocumentAtomic(
   return result.changes > 0;
 }
 
-export async function rebuildDocumentBlocks(
-  document: DocumentRow,
-  markdown: string,
-  revision: number,
-): Promise<DocumentBlockRow[]> {
-  assertWritesAllowed('rebuildDocumentBlocks');
-  if (!document.doc_id) {
-    throw new Error('Document is missing doc_id; cannot rebuild block index.');
-  }
-
-  const documentId = document.doc_id;
-  const oldBlocks = listLiveDocumentBlocks(documentId);
-  const newBlocks = await buildBlockDescriptors(markdown);
-  const matches = matchBlocks(oldBlocks, newBlocks);
-
-  const nextBlocks = newBlocks.map((block, index) => {
-    const oldIndex = matches.get(index);
-    const existing = oldIndex !== undefined ? oldBlocks[oldIndex] : null;
-    return {
-      document_id: documentId,
-      block_id: existing?.block_id ?? randomUUID(),
-      ordinal: block.ordinal,
-      node_type: block.node_type,
-      attrs_json: block.attrs_json,
-      markdown_hash: block.markdown_hash,
-      text_preview: block.text_preview,
-      created_revision: existing?.created_revision ?? revision,
-      last_seen_revision: revision,
-      retired_revision: null,
-    } satisfies DocumentBlockRow;
-  });
-
-  const oldBlockIds = new Set(oldBlocks.map((block) => block.block_id));
-  const usedOldIds = new Set<string>(nextBlocks.map((block) => block.block_id));
-  const retiredOld = oldBlocks.filter((block) => !usedOldIds.has(block.block_id));
-
-  const db = getDb();
-  const updateTemp = db.prepare(`
-    UPDATE document_blocks
-    SET ordinal = ?, node_type = ?, attrs_json = ?, markdown_hash = ?, text_preview = ?, last_seen_revision = ?, retired_revision = NULL
-    WHERE document_id = ? AND block_id = ?
-  `);
-  const updateOrdinal = db.prepare(`
-    UPDATE document_blocks
-    SET ordinal = ?
-    WHERE document_id = ? AND block_id = ?
-  `);
-  const retire = db.prepare(`
-    UPDATE document_blocks
-    SET retired_revision = ?
-    WHERE document_id = ? AND block_id = ? AND retired_revision IS NULL
-  `);
-  const insert = db.prepare(`
-    INSERT INTO document_blocks (
-      document_id, block_id, ordinal, node_type, attrs_json, markdown_hash, text_preview,
-      created_revision, last_seen_revision, retired_revision
-    )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
-  `);
-
-  const tx = db.transaction(() => {
-    for (const block of retiredOld) {
-      retire.run(revision, documentId, block.block_id);
-    }
-
-    for (let i = 0; i < nextBlocks.length; i += 1) {
-      const block = nextBlocks[i];
-      if (oldBlockIds.has(block.block_id)) {
-        updateTemp.run(-(i + 1), block.node_type, block.attrs_json, block.markdown_hash, block.text_preview, revision, documentId, block.block_id);
-      }
-    }
-
-    for (const block of nextBlocks) {
-      if (!oldBlockIds.has(block.block_id)) {
-        insert.run(
-          block.document_id,
-          block.block_id,
-          block.ordinal,
-          block.node_type,
-          block.attrs_json,
-          block.markdown_hash,
-          block.text_preview,
-          block.created_revision,
-          block.last_seen_revision,
-        );
-      }
-    }
-
-    for (const block of nextBlocks) {
-      if (oldBlockIds.has(block.block_id)) {
-        updateOrdinal.run(block.ordinal, documentId, block.block_id);
-      }
-    }
-  });
-
-  tx();
-  return listLiveDocumentBlocks(documentId);
-}
-
 export function updateDocumentAtomicByRevision(
   slug: string,
   expectedRevision: number,
@@ -1622,30 +1806,43 @@ export function replaceDocumentProjection(
   markdown: string,
   marks: Record<string, unknown>,
   yStateVersion?: number,
+  options?: {
+    health?: DocumentProjectionRow['health'];
+    healthReason?: string | null;
+  },
 ): boolean {
   assertWritesAllowed('replaceDocumentProjection');
+  const current = getDocumentBySlug(slug);
+  if (!current || !['ACTIVE', 'PAUSED'].includes(current.share_state)) return false;
+
+  let nextYStateVersion = typeof current.y_state_version === 'number' ? current.y_state_version : 0;
+  const projectionRow = getDocumentProjectionBySlug(slug);
   if (yStateVersion !== undefined) {
-    const result = getDb().prepare(`
+    const syncResult = getDb().prepare(`
       UPDATE documents
-      SET markdown = ?, marks = ?, y_state_version = ?
+      SET y_state_version = ?
       WHERE slug = ? AND share_state IN ('ACTIVE', 'PAUSED')
-    `).run(markdown, JSON.stringify(marks), yStateVersion, slug);
-    if (result.changes > 0) {
-      const updated = getDocumentBySlug(slug);
-      if (updated) upsertDocumentProjectionRow(slug, updated.markdown, updated.marks, updated.revision, updated.y_state_version, updated.updated_at);
-    }
-    return result.changes > 0;
+    `).run(yStateVersion, slug);
+    if (syncResult.changes === 0) return false;
+    nextYStateVersion = yStateVersion;
   }
-  const result = getDb().prepare(`
-    UPDATE documents
-    SET markdown = ?, marks = ?
-    WHERE slug = ? AND share_state IN ('ACTIVE', 'PAUSED')
-  `).run(markdown, JSON.stringify(marks), slug);
-  if (result.changes > 0) {
-    const updated = getDocumentBySlug(slug);
-    if (updated) upsertDocumentProjectionRow(slug, updated.markdown, updated.marks, updated.revision, updated.y_state_version, updated.updated_at);
-  }
-  return result.changes > 0;
+
+  const nextHealth = options?.health ?? projectionRow?.health ?? 'healthy';
+  const nextHealthReason = nextHealth === 'quarantined'
+    ? options?.healthReason ?? projectionRow?.health_reason ?? null
+    : null;
+
+  upsertDocumentProjectionRow(
+    slug,
+    markdown,
+    JSON.stringify(marks),
+    current.revision,
+    nextYStateVersion,
+    current.updated_at,
+    nextHealth,
+    nextHealthReason,
+  );
+  return true;
 }
 
 type BlockDescriptor = {
@@ -1817,6 +2014,105 @@ export function listDocumentBlocks(documentId: string): DocumentBlockRow[] {
   `).all(documentId) as DocumentBlockRow[];
 }
 
+export async function rebuildDocumentBlocks(
+  document: DocumentRow,
+  markdown: string,
+  revision: number,
+): Promise<DocumentBlockRow[]> {
+  assertWritesAllowed('rebuildDocumentBlocks');
+  if (!document.doc_id) {
+    throw new Error('Document is missing doc_id; cannot rebuild block index.');
+  }
+
+  const documentId = document.doc_id;
+  const oldBlocks = listLiveDocumentBlocks(documentId);
+  const newBlocks = await buildBlockDescriptors(markdown);
+  const matches = matchBlocks(oldBlocks, newBlocks);
+
+  const nextBlocks = newBlocks.map((block, index) => {
+    const oldIndex = matches.get(index);
+    const existing = oldIndex !== undefined ? oldBlocks[oldIndex] : null;
+    return {
+      document_id: documentId,
+      block_id: existing?.block_id ?? randomUUID(),
+      ordinal: block.ordinal,
+      node_type: block.node_type,
+      attrs_json: block.attrs_json,
+      markdown_hash: block.markdown_hash,
+      text_preview: block.text_preview,
+      created_revision: existing?.created_revision ?? revision,
+      last_seen_revision: revision,
+      retired_revision: null,
+    } satisfies DocumentBlockRow;
+  });
+
+  const oldBlockIds = new Set(oldBlocks.map((block) => block.block_id));
+  const usedOldIds = new Set<string>(nextBlocks.map((block) => block.block_id));
+  const retiredOld = oldBlocks.filter((block) => !usedOldIds.has(block.block_id));
+
+  const db = getDb();
+  const updateTemp = db.prepare(`
+    UPDATE document_blocks
+    SET ordinal = ?, node_type = ?, attrs_json = ?, markdown_hash = ?, text_preview = ?, last_seen_revision = ?, retired_revision = NULL
+    WHERE document_id = ? AND block_id = ?
+  `);
+  const updateOrdinal = db.prepare(`
+    UPDATE document_blocks
+    SET ordinal = ?
+    WHERE document_id = ? AND block_id = ?
+  `);
+  const retire = db.prepare(`
+    UPDATE document_blocks
+    SET retired_revision = ?
+    WHERE document_id = ? AND block_id = ? AND retired_revision IS NULL
+  `);
+  const insert = db.prepare(`
+    INSERT INTO document_blocks (
+      document_id, block_id, ordinal, node_type, attrs_json, markdown_hash, text_preview,
+      created_revision, last_seen_revision, retired_revision
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+  `);
+
+  const tx = db.transaction(() => {
+    for (const block of retiredOld) {
+      retire.run(revision, documentId, block.block_id);
+    }
+
+    for (let i = 0; i < nextBlocks.length; i += 1) {
+      const block = nextBlocks[i];
+      if (oldBlockIds.has(block.block_id)) {
+        updateTemp.run(-(i + 1), block.node_type, block.attrs_json, block.markdown_hash, block.text_preview, revision, documentId, block.block_id);
+      }
+    }
+
+    for (const block of nextBlocks) {
+      if (!oldBlockIds.has(block.block_id)) {
+        insert.run(
+          block.document_id,
+          block.block_id,
+          block.ordinal,
+          block.node_type,
+          block.attrs_json,
+          block.markdown_hash,
+          block.text_preview,
+          block.created_revision,
+          block.last_seen_revision,
+        );
+      }
+    }
+
+    for (const block of nextBlocks) {
+      if (oldBlockIds.has(block.block_id)) {
+        updateOrdinal.run(block.ordinal, documentId, block.block_id);
+      }
+    }
+  });
+
+  tx();
+  return listLiveDocumentBlocks(documentId);
+}
+
 function updateShareState(slug: string, state: ShareState): boolean {
   assertWritesAllowed('updateShareState');
   const now = new Date().toISOString();
@@ -1892,6 +2188,7 @@ export function addDocumentEvent(
   eventData: unknown,
   actor: string,
   idempotencyKey?: string,
+  mutationRoute?: string,
 ): number {
   assertWritesAllowed('addDocumentEvent');
   const now = new Date().toISOString();
@@ -1901,17 +2198,17 @@ export function addDocumentEvent(
     const documentRevision = getDocumentRevisionForSlug(d, slug);
     const result = d.prepare(`
       INSERT INTO document_events (
-        document_slug, document_revision, event_type, event_data, actor, idempotency_key, tombstone_revision, created_at
+        document_slug, document_revision, event_type, event_data, actor, idempotency_key, mutation_route, tombstone_revision, created_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, NULL, ?)
-    `).run(slug, documentRevision, eventType, payload, actor, idempotencyKey ?? null, now);
+      VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?)
+    `).run(slug, documentRevision, eventType, payload, actor, idempotencyKey ?? null, mutationRoute ?? null, now);
     const eventId = Number(result.lastInsertRowid);
     d.prepare(`
       INSERT INTO ${MUTATION_OUTBOX_TABLE} (
-        document_slug, document_revision, event_id, event_type, event_data, actor, idempotency_key, tombstone_revision, created_at, delivered_at
+        document_slug, document_revision, event_id, event_type, event_data, actor, idempotency_key, mutation_route, tombstone_revision, created_at, delivered_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL)
-    `).run(slug, documentRevision, eventId, eventType, payload, actor, idempotencyKey ?? null, now);
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL)
+    `).run(slug, documentRevision, eventId, eventType, payload, actor, idempotencyKey ?? null, mutationRoute ?? null, now);
     return eventId;
   });
   return tx();
@@ -2060,45 +2357,82 @@ export function canMutateByOwnerIdentity(
   return false;
 }
 
+function parseStoredResponse(value: string | undefined): Record<string, unknown> | null {
+  if (!value) return null;
+  try {
+    return JSON.parse(value) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+type CoordinatorIdempotencyRow = {
+  response_json?: string;
+  request_hash?: string | null;
+  status_code?: number | null;
+  tombstone_revision?: number | null;
+  state?: string | null;
+  created_at?: string;
+  completed_at?: string | null;
+  lease_expires_at?: string | null;
+  last_seen_at?: string | null;
+};
+
+type LegacyIdempotencyRow = {
+  response_json?: string;
+  request_hash?: string | null;
+};
+
+function readCoordinatorIdempotencyRow(
+  documentSlug: string,
+  route: string,
+  idempotencyKey: string,
+): CoordinatorIdempotencyRow | undefined {
+  return getDb().prepare(`
+    SELECT response_json, request_hash, status_code, tombstone_revision, state, created_at, completed_at, lease_expires_at, last_seen_at
+    FROM ${MUTATION_IDEMPOTENCY_TABLE}
+    WHERE idempotency_key = ? AND document_slug = ? AND route = ?
+    LIMIT 1
+  `).get(idempotencyKey, documentSlug, route) as CoordinatorIdempotencyRow | undefined;
+}
+
+function readLegacyIdempotencyRow(
+  documentSlug: string,
+  route: string,
+  idempotencyKey: string,
+): LegacyIdempotencyRow | undefined {
+  return getDb().prepare(`
+    SELECT response_json, request_hash
+    FROM idempotency_keys
+    WHERE idempotency_key = ? AND document_slug = ? AND route = ?
+    LIMIT 1
+  `).get(idempotencyKey, documentSlug, route) as LegacyIdempotencyRow | undefined;
+}
+
 export function getStoredIdempotencyResult(
   documentSlug: string,
   route: string,
   idempotencyKey: string,
 ): Record<string, unknown> | null {
-  const d = getDb();
-  const coordinatorRow = d.prepare(`
-    SELECT response_json
-    FROM ${MUTATION_IDEMPOTENCY_TABLE}
-    WHERE idempotency_key = ? AND document_slug = ? AND route = ?
-    LIMIT 1
-  `).get(idempotencyKey, documentSlug, route) as { response_json?: string } | undefined;
-  const legacyRow = d.prepare(`
-    SELECT response_json
-    FROM idempotency_keys
-    WHERE idempotency_key = ? AND document_slug = ? AND route = ?
-    LIMIT 1
-  `).get(idempotencyKey, documentSlug, route) as { response_json?: string } | undefined;
+  const coordinatorRow = readCoordinatorIdempotencyRow(documentSlug, route, idempotencyKey);
+  const legacyRow = readLegacyIdempotencyRow(documentSlug, route, idempotencyKey);
+  const completedCoordinator = coordinatorRow?.state === 'completed' ? coordinatorRow : undefined;
 
-  if (coordinatorRow && legacyRow) {
-    if (coordinatorRow.response_json === legacyRow.response_json) {
+  if (completedCoordinator && legacyRow) {
+    if (completedCoordinator.response_json === legacyRow.response_json) {
       recordMutationIdempotencyDualRead('parity_match', route);
     } else {
       recordMutationIdempotencyDualRead('parity_mismatch', route);
       console.warn('[db] idempotency dual-read parity mismatch', { documentSlug, route, idempotencyKey });
     }
-  } else if (coordinatorRow) {
+  } else if (completedCoordinator) {
     recordMutationIdempotencyDualRead('new_only', route);
   } else if (legacyRow) {
     recordMutationIdempotencyDualRead('legacy_fallback', route);
   }
 
-  const row = coordinatorRow ?? legacyRow;
-  if (!row?.response_json) return null;
-  try {
-    return JSON.parse(row.response_json) as Record<string, unknown>;
-  } catch {
-    return null;
-  }
+  const row = completedCoordinator ?? legacyRow;
+  return parseStoredResponse(row?.response_json);
 }
 
 export function getStoredIdempotencyRecord(
@@ -2106,46 +2440,248 @@ export function getStoredIdempotencyRecord(
   route: string,
   idempotencyKey: string,
 ): { response: Record<string, unknown>; requestHash: string | null } | null {
-  const d = getDb();
-  const coordinatorRow = d.prepare(`
-    SELECT response_json, request_hash
-    FROM ${MUTATION_IDEMPOTENCY_TABLE}
-    WHERE idempotency_key = ? AND document_slug = ? AND route = ?
-    LIMIT 1
-  `).get(idempotencyKey, documentSlug, route) as { response_json?: string; request_hash?: string | null } | undefined;
-  const legacyRow = d.prepare(`
-    SELECT response_json, request_hash
-    FROM idempotency_keys
-    WHERE idempotency_key = ? AND document_slug = ? AND route = ?
-    LIMIT 1
-  `).get(idempotencyKey, documentSlug, route) as { response_json?: string; request_hash?: string | null } | undefined;
+  const coordinatorRow = readCoordinatorIdempotencyRow(documentSlug, route, idempotencyKey);
+  const legacyRow = readLegacyIdempotencyRow(documentSlug, route, idempotencyKey);
+  const completedCoordinator = coordinatorRow?.state === 'completed' ? coordinatorRow : undefined;
 
-  if (coordinatorRow && legacyRow) {
-    const responseParity = coordinatorRow.response_json === legacyRow.response_json;
-    const hashParity = (coordinatorRow.request_hash ?? null) === (legacyRow.request_hash ?? null);
+  if (completedCoordinator && legacyRow) {
+    const responseParity = completedCoordinator.response_json === legacyRow.response_json;
+    const hashParity = (completedCoordinator.request_hash ?? null) === (legacyRow.request_hash ?? null);
     if (responseParity && hashParity) {
       recordMutationIdempotencyDualRead('parity_match', route);
     } else {
       recordMutationIdempotencyDualRead('parity_mismatch', route);
       console.warn('[db] idempotency record dual-read parity mismatch', { documentSlug, route, idempotencyKey });
     }
-  } else if (coordinatorRow) {
+  } else if (completedCoordinator) {
     recordMutationIdempotencyDualRead('new_hit', route);
   } else if (legacyRow) {
     recordMutationIdempotencyDualRead('legacy_fallback', route);
   }
 
-  const row = coordinatorRow ?? legacyRow;
-  if (!row?.response_json) return null;
-  try {
-    const response = JSON.parse(row.response_json) as Record<string, unknown>;
+  const row = completedCoordinator ?? legacyRow;
+  const response = parseStoredResponse(row?.response_json);
+  if (!response) return null;
+  return {
+    response,
+    requestHash: typeof row?.request_hash === 'string' ? row.request_hash : null,
+  };
+}
+
+export function getMutationIdempotencyRecord(
+  documentSlug: string,
+  route: string,
+  idempotencyKey: string,
+): MutationIdempotencyRecord | null {
+  const coordinatorRow = readCoordinatorIdempotencyRow(documentSlug, route, idempotencyKey);
+  if (coordinatorRow) {
     return {
-      response,
-      requestHash: typeof row.request_hash === 'string' ? row.request_hash : null,
+      state: coordinatorRow.state === 'pending' ? 'pending' : 'completed',
+      response: coordinatorRow.state === 'completed' ? parseStoredResponse(coordinatorRow.response_json) : null,
+      requestHash: typeof coordinatorRow.request_hash === 'string' ? coordinatorRow.request_hash : null,
+      statusCode: typeof coordinatorRow.status_code === 'number' ? coordinatorRow.status_code : null,
+      tombstoneRevision: typeof coordinatorRow.tombstone_revision === 'number' ? coordinatorRow.tombstone_revision : null,
+      createdAt: coordinatorRow.created_at ?? new Date(0).toISOString(),
+      completedAt: typeof coordinatorRow.completed_at === 'string' ? coordinatorRow.completed_at : null,
+      leaseExpiresAt: typeof coordinatorRow.lease_expires_at === 'string' ? coordinatorRow.lease_expires_at : null,
+      lastSeenAt: typeof coordinatorRow.last_seen_at === 'string' ? coordinatorRow.last_seen_at : null,
     };
-  } catch {
-    return null;
   }
+
+  const legacyRow = readLegacyIdempotencyRow(documentSlug, route, idempotencyKey);
+  if (!legacyRow) return null;
+  return {
+    state: 'completed',
+    response: parseStoredResponse(legacyRow.response_json),
+    requestHash: typeof legacyRow.request_hash === 'string' ? legacyRow.request_hash : null,
+    statusCode: 200,
+    tombstoneRevision: null,
+    createdAt: new Date(0).toISOString(),
+    completedAt: null,
+    leaseExpiresAt: null,
+    lastSeenAt: null,
+  };
+}
+
+export function reservePendingIdempotencyKey(
+  documentSlug: string,
+  route: string,
+  idempotencyKey: string,
+  requestHash: string,
+  leaseExpiresAt: string,
+  reservationToken: string = randomUUID(),
+): boolean {
+  assertWritesAllowed('reservePendingIdempotencyKey');
+  const now = new Date().toISOString();
+  const result = getDb().prepare(`
+    INSERT OR IGNORE INTO ${MUTATION_IDEMPOTENCY_TABLE} (
+      idempotency_key, document_slug, route, response_json, request_hash, status_code, tombstone_revision, state, completed_at, lease_expires_at, last_seen_at, reservation_token, created_at
+    )
+    VALUES (?, ?, ?, ?, ?, 0, NULL, 'pending', NULL, ?, ?, ?, ?)
+  `).run(
+    idempotencyKey,
+    documentSlug,
+    route,
+    '{}',
+    requestHash,
+    leaseExpiresAt,
+    now,
+    reservationToken,
+    now,
+  );
+  return result.changes > 0;
+}
+
+export function touchPendingIdempotencyKey(
+  documentSlug: string,
+  route: string,
+  idempotencyKey: string,
+  leaseExpiresAt: string,
+  reservationToken: string | null,
+): boolean {
+  assertWritesAllowed('touchPendingIdempotencyKey');
+  const now = new Date().toISOString();
+  const result = getDb().prepare(`
+    UPDATE ${MUTATION_IDEMPOTENCY_TABLE}
+    SET lease_expires_at = ?, last_seen_at = ?
+    WHERE idempotency_key = ? AND document_slug = ? AND route = ? AND state = 'pending'
+      AND COALESCE(reservation_token, '') = COALESCE(?, '')
+  `).run(leaseExpiresAt, now, idempotencyKey, documentSlug, route, reservationToken);
+  return result.changes > 0;
+}
+
+export function stealExpiredPendingIdempotencyKey(
+  documentSlug: string,
+  route: string,
+  idempotencyKey: string,
+  requestHash: string,
+  expiredBefore: string,
+  nextLeaseExpiresAt: string,
+  reservationToken: string = randomUUID(),
+): boolean {
+  assertWritesAllowed('stealExpiredPendingIdempotencyKey');
+  const now = new Date().toISOString();
+  const result = getDb().prepare(`
+    UPDATE ${MUTATION_IDEMPOTENCY_TABLE}
+    SET response_json = '{}',
+        request_hash = ?,
+        status_code = 0,
+        tombstone_revision = NULL,
+        state = 'pending',
+        completed_at = NULL,
+        lease_expires_at = ?,
+        last_seen_at = ?,
+        reservation_token = ?,
+        created_at = ?
+    WHERE idempotency_key = ? AND document_slug = ? AND route = ? AND state = 'pending'
+      AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?
+  `).run(
+    requestHash,
+    nextLeaseExpiresAt,
+    now,
+    reservationToken,
+    now,
+    idempotencyKey,
+    documentSlug,
+    route,
+    expiredBefore,
+  );
+  return result.changes > 0;
+}
+
+export function completePendingIdempotencyKey(
+  documentSlug: string,
+  route: string,
+  idempotencyKey: string,
+  response: Record<string, unknown>,
+  requestHash?: string | null,
+  reservationToken?: string | null,
+  options?: { statusCode?: number; tombstoneRevision?: number | null },
+): boolean {
+  assertWritesAllowed('completePendingIdempotencyKey');
+  const now = new Date().toISOString();
+  const statusCode = Number.isInteger(options?.statusCode) ? Number(options?.statusCode) : 200;
+  const tombstoneRevision = options?.tombstoneRevision ?? null;
+  const encoded = JSON.stringify(response);
+  const d = getDb();
+  const tx = d.transaction(() => {
+    const completed = d.prepare(`
+      UPDATE ${MUTATION_IDEMPOTENCY_TABLE}
+      SET response_json = ?,
+          request_hash = COALESCE(request_hash, ?),
+          status_code = ?,
+          tombstone_revision = ?,
+          state = 'completed',
+          completed_at = ?,
+          lease_expires_at = NULL,
+          last_seen_at = ?,
+          reservation_token = NULL
+      WHERE idempotency_key = ? AND document_slug = ? AND route = ? AND state = 'pending'
+        AND COALESCE(reservation_token, '') = COALESCE(?, '')
+    `).run(
+      encoded,
+      requestHash ?? null,
+      statusCode,
+      tombstoneRevision,
+      now,
+      now,
+      idempotencyKey,
+      documentSlug,
+      route,
+      reservationToken ?? null,
+    ).changes;
+    if (completed > 0) {
+      d.prepare(`
+        INSERT OR REPLACE INTO idempotency_keys (idempotency_key, document_slug, route, response_json, request_hash, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run(idempotencyKey, documentSlug, route, encoded, requestHash ?? null, now);
+    }
+    return completed > 0;
+  });
+  return tx();
+}
+
+export function releasePendingIdempotencyKey(
+  documentSlug: string,
+  route: string,
+  idempotencyKey: string,
+  reservationToken?: string | null,
+): boolean {
+  assertWritesAllowed('releasePendingIdempotencyKey');
+  const result = getDb().prepare(`
+    DELETE FROM ${MUTATION_IDEMPOTENCY_TABLE}
+    WHERE idempotency_key = ? AND document_slug = ? AND route = ? AND state = 'pending'
+      AND COALESCE(reservation_token, '') = COALESCE(?, '')
+  `).run(idempotencyKey, documentSlug, route, reservationToken ?? null);
+  return result.changes > 0;
+}
+
+export function hasDurableMutationRecordForIdempotencyKey(
+  documentSlug: string,
+  route: string,
+  idempotencyKey: string,
+): boolean {
+  const d = getDb();
+  const readMatchedDurableEvidence = (): boolean => {
+    const eventRow = d.prepare(`
+    SELECT 1 AS present
+    FROM document_events
+    WHERE document_slug = ? AND idempotency_key = ? AND mutation_route = ?
+    LIMIT 1
+  `).get(documentSlug, idempotencyKey, route) as { present?: number } | undefined;
+    if (eventRow?.present === 1) return true;
+    const outboxRow = d.prepare(`
+    SELECT 1 AS present
+    FROM ${MUTATION_OUTBOX_TABLE}
+    WHERE document_slug = ? AND idempotency_key = ? AND mutation_route = ?
+    LIMIT 1
+  `).get(documentSlug, idempotencyKey, route) as { present?: number } | undefined;
+    return outboxRow?.present === 1;
+  };
+
+  if (readMatchedDurableEvidence()) return true;
+  backfillLegacyMutationRouteMetadata({ documentSlug, idempotencyKey });
+  return readMatchedDurableEvidence();
 }
 
 export function storeIdempotencyResult(
@@ -2169,9 +2705,9 @@ export function storeIdempotencyResult(
     `).run(idempotencyKey, documentSlug, route, encoded, requestHash ?? null, now);
     d.prepare(`
       INSERT OR REPLACE INTO ${MUTATION_IDEMPOTENCY_TABLE} (
-        idempotency_key, document_slug, route, response_json, request_hash, status_code, tombstone_revision, created_at
+        idempotency_key, document_slug, route, response_json, request_hash, status_code, tombstone_revision, state, completed_at, lease_expires_at, last_seen_at, reservation_token, created_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'completed', ?, NULL, ?, NULL, ?)
     `).run(
       idempotencyKey,
       documentSlug,
@@ -2180,6 +2716,8 @@ export function storeIdempotencyResult(
       requestHash ?? null,
       statusCode,
       tombstoneRevision,
+      now,
+      now,
       now,
     );
   });
@@ -2211,6 +2749,28 @@ export function cleanupMutationOutbox(maxAgeMs: number = 30 * 24 * 60 * 60 * 100
     DELETE FROM ${MUTATION_OUTBOX_TABLE}
     WHERE created_at < ?
   `).run(cutoff);
+  return result.changes;
+}
+
+export function cleanupHttpInfoIncidentEvents(
+  maxAgeMs: number = 60 * 60 * 1000,
+  batchSize: number = 100_000,
+): number {
+  assertWritesAllowed('cleanupHttpInfoIncidentEvents');
+  const cutoff = new Date(Date.now() - Math.max(0, maxAgeMs)).toISOString();
+  const safeBatchSize = Number.isFinite(batchSize) ? Math.max(1, Math.trunc(batchSize)) : 100_000;
+  const result = getDb().prepare(`
+    DELETE FROM server_incident_events
+    WHERE id IN (
+      SELECT id
+      FROM server_incident_events
+      WHERE subsystem = 'http'
+        AND level = 'info'
+        AND created_at < ?
+      ORDER BY created_at ASC, id ASC
+      LIMIT ?
+    )
+  `).run(cutoff, safeBatchSize);
   return result.changes;
 }
 
@@ -2353,8 +2913,11 @@ export function backfillMutationIdempotencyBatch(limit: number = 500): {
   let checkpoint = cursor;
   const insertStmt = d.prepare(`
     INSERT OR IGNORE INTO ${MUTATION_IDEMPOTENCY_TABLE}
-      (idempotency_key, document_slug, route, response_json, request_hash, status_code, tombstone_revision, created_at)
-    VALUES (?, ?, ?, ?, ?, 200, NULL, ?)
+      (
+        idempotency_key, document_slug, route, response_json, request_hash, status_code, tombstone_revision,
+        state, completed_at, lease_expires_at, last_seen_at, reservation_token, created_at
+      )
+    VALUES (?, ?, ?, ?, ?, 200, NULL, 'completed', ?, NULL, ?, NULL, ?)
   `);
 
   const tx = d.transaction(() => {
@@ -2366,6 +2929,8 @@ export function backfillMutationIdempotencyBatch(limit: number = 500): {
         row.route,
         row.response_json,
         row.request_hash,
+        row.created_at,
+        row.created_at,
         row.created_at,
       ).changes;
     }
@@ -2404,6 +2969,7 @@ export function backfillMutationOutboxBatch(limit: number = 500): {
 
   const rows = d.prepare(`
     SELECT id, document_slug, document_revision, event_type, event_data, actor, idempotency_key, tombstone_revision, created_at
+         , mutation_route
     FROM document_events
     WHERE id > ?
     ORDER BY id ASC
@@ -2416,6 +2982,7 @@ export function backfillMutationOutboxBatch(limit: number = 500): {
     event_data: string;
     actor: string;
     idempotency_key: string | null;
+    mutation_route: string | null;
     tombstone_revision: number | null;
     created_at: string;
   }>;
@@ -2424,8 +2991,8 @@ export function backfillMutationOutboxBatch(limit: number = 500): {
   let checkpoint = cursor;
   const insertStmt = d.prepare(`
     INSERT OR IGNORE INTO ${MUTATION_OUTBOX_TABLE}
-      (document_slug, document_revision, event_id, event_type, event_data, actor, idempotency_key, tombstone_revision, created_at, delivered_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+      (document_slug, document_revision, event_id, event_type, event_data, actor, idempotency_key, mutation_route, tombstone_revision, created_at, delivered_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
   `);
 
   const tx = d.transaction(() => {
@@ -2439,6 +3006,7 @@ export function backfillMutationOutboxBatch(limit: number = 500): {
         row.event_data,
         row.actor,
         row.idempotency_key ?? null,
+        row.mutation_route ?? null,
         row.tombstone_revision ?? null,
         row.created_at,
       ).changes;
@@ -2466,7 +3034,7 @@ export function backfillMutationOutboxBatch(limit: number = 500): {
 
 export function appendYUpdate(documentSlug: string, update: Uint8Array, sourceActor?: string): number {
   assertWritesAllowed('appendYUpdate');
-  assertYjsUpdateWithinLimit(documentSlug, update, sourceActor);
+  assertYjsUpdateWithinLimit(documentSlug, update, sourceActor ?? null);
   const now = new Date().toISOString();
   const result = getDb().prepare(`
     INSERT INTO document_y_updates (document_slug, update_blob, source_actor, created_at)
@@ -2499,6 +3067,19 @@ export function getYUpdatesAtOrAfter(
     ORDER BY seq ASC
   `).all(documentSlug, fromSeq) as Array<{ seq: number; update_blob: Buffer }>;
   return rows.map((row) => ({ seq: row.seq, update: new Uint8Array(row.update_blob) }));
+}
+
+export function getAccumulatedYUpdateBytesAfter(
+  documentSlug: string,
+  afterSeq: number,
+): number {
+  const row = getDb().prepare(`
+    SELECT COALESCE(SUM(length(update_blob)), 0) AS total_bytes
+    FROM document_y_updates
+    WHERE document_slug = ? AND seq > ?
+  `).get(documentSlug, afterSeq) as { total_bytes?: number } | undefined;
+  const totalBytes = Number(row?.total_bytes ?? 0);
+  return Number.isFinite(totalBytes) && totalBytes > 0 ? totalBytes : 0;
 }
 
 export function getYUpdatesInRange(
@@ -2589,6 +3170,21 @@ export function getLatestYStateVersion(documentSlug: string): number {
   );
 }
 
+export function updateYStateBlob(slug: string, blob: Uint8Array): void {
+  assertWritesAllowed('updateYStateBlob');
+  getDb().prepare(
+    'UPDATE documents SET y_state_blob = ? WHERE slug = ? AND share_state IN (\'ACTIVE\', \'PAUSED\')'
+  ).run(Buffer.from(blob), slug);
+}
+
+export function getYStateBlob(slug: string): Uint8Array | null {
+  const row = getDb().prepare(
+    'SELECT y_state_blob FROM documents WHERE slug = ?'
+  ).get(slug) as { y_state_blob: Buffer | null } | undefined;
+  if (!row?.y_state_blob) return null;
+  return new Uint8Array(row.y_state_blob);
+}
+
 export function saveYSnapshot(documentSlug: string, version: number, snapshot: Uint8Array): void {
   assertWritesAllowed('saveYSnapshot');
   const now = new Date().toISOString();
@@ -2596,6 +3192,40 @@ export function saveYSnapshot(documentSlug: string, version: number, snapshot: U
     INSERT OR REPLACE INTO document_y_snapshots (document_slug, version, snapshot_blob, created_at)
     VALUES (?, ?, ?, ?)
   `).run(documentSlug, version, Buffer.from(snapshot), now);
+}
+
+export function pruneObsoleteYHistory(
+  documentSlug: string,
+  latestSnapshotVersion?: number | null,
+): { deletedUpdates: number; deletedSnapshots: number; snapshotVersion: number } {
+  assertWritesAllowed('pruneObsoleteYHistory');
+  const snapshotVersion = typeof latestSnapshotVersion === 'number' && Number.isFinite(latestSnapshotVersion)
+    ? Math.max(0, Math.trunc(latestSnapshotVersion))
+    : (getLatestYSnapshot(documentSlug)?.version ?? 0);
+
+  if (snapshotVersion <= 0) {
+    return {
+      deletedUpdates: 0,
+      deletedSnapshots: 0,
+      snapshotVersion: 0,
+    };
+  }
+
+  const d = getDb();
+  const deletedUpdates = d.prepare(`
+    DELETE FROM document_y_updates
+    WHERE document_slug = ? AND seq < ?
+  `).run(documentSlug, snapshotVersion).changes;
+  const deletedSnapshots = d.prepare(`
+    DELETE FROM document_y_snapshots
+    WHERE document_slug = ? AND version < ?
+  `).run(documentSlug, snapshotVersion).changes;
+
+  return {
+    deletedUpdates,
+    deletedSnapshots,
+    snapshotVersion,
+  };
 }
 
 export function getLatestYSnapshot(documentSlug: string): { version: number; snapshot: Uint8Array } | null {
@@ -2652,6 +3282,76 @@ export function listDocumentEventsInTimeRange(
     WHERE document_slug = ? AND created_at >= ? AND created_at <= ?
     ORDER BY created_at ASC, id ASC
   `).all(slug, fromIsoInclusive, toIsoInclusive) as DocumentEventRow[];
+}
+
+function stringifyServerIncidentData(data: Record<string, unknown> | null | undefined): string {
+  try {
+    return JSON.stringify(data ?? {});
+  } catch {
+    return JSON.stringify({ serializationError: true });
+  }
+}
+
+export function recordServerIncidentEvent(input: ServerIncidentEventInput): number {
+  assertWritesAllowed('server_incident_events.insert');
+  const createdAt = typeof input.timestamp === 'string' && input.timestamp.trim()
+    ? input.timestamp.trim()
+    : new Date().toISOString();
+  const result = getDb().prepare(`
+    INSERT INTO server_incident_events (
+      request_id,
+      slug,
+      subsystem,
+      level,
+      event_type,
+      message,
+      data_json,
+      created_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    input.requestId?.trim() || null,
+    input.slug?.trim() || null,
+    input.subsystem,
+    input.level,
+    input.eventType,
+    input.message,
+    stringifyServerIncidentData(input.data),
+    createdAt,
+  );
+  return Number(result.lastInsertRowid);
+}
+
+export function listServerIncidentEventsByRequestId(
+  requestId: string,
+  limit: number = 250,
+): ServerIncidentEventRow[] {
+  const normalized = requestId.trim();
+  if (!normalized) return [];
+  const safeLimit = Math.max(1, Math.min(limit, 1000));
+  return getDb().prepare(`
+    SELECT *
+    FROM server_incident_events
+    WHERE request_id = ?
+    ORDER BY created_at ASC, id ASC
+    LIMIT ?
+  `).all(normalized, safeLimit) as ServerIncidentEventRow[];
+}
+
+export function listServerIncidentEventsInTimeRange(
+  slug: string,
+  fromIsoInclusive: string,
+  toIsoInclusive: string,
+  limit: number = 250,
+): ServerIncidentEventRow[] {
+  const safeLimit = Math.max(1, Math.min(limit, 1000));
+  return getDb().prepare(`
+    SELECT *
+    FROM server_incident_events
+    WHERE slug = ? AND created_at >= ? AND created_at <= ?
+    ORDER BY created_at ASC, id ASC
+    LIMIT ?
+  `).all(slug, fromIsoInclusive, toIsoInclusive, safeLimit) as ServerIncidentEventRow[];
 }
 
 export type DocumentBaselineCandidate = {
@@ -3021,8 +3721,8 @@ export interface DashboardDocumentRow {
   copy_url?: string;
 }
 
-export function listUserOwnedDocuments(oauthUserId: number, limit: number = 50): DashboardDocumentRow[] {
-  const asStr = String(oauthUserId);
+export function listUserOwnedDocuments(everyUserId: number, limit: number = 50): DashboardDocumentRow[] {
+  const asStr = String(everyUserId);
   return getDb().prepare(`
     SELECT slug, title, share_state, updated_at, created_at
     FROM documents
@@ -3030,11 +3730,11 @@ export function listUserOwnedDocuments(oauthUserId: number, limit: number = 50):
       AND deleted_at IS NULL
     ORDER BY updated_at DESC
     LIMIT ?
-  `).all(asStr, `oauth:${asStr}`, `oauth_user:${asStr}`, limit) as DashboardDocumentRow[];
+  `).all(asStr, `every:${asStr}`, `every_user:${asStr}`, limit) as DashboardDocumentRow[];
 }
 
-export function listSharedWithMeDocuments(oauthUserId: number, limit: number = 50): DashboardDocumentRow[] {
-  const asStr = String(oauthUserId);
+export function listSharedWithMeDocuments(everyUserId: number, limit: number = 50): DashboardDocumentRow[] {
+  const asStr = String(everyUserId);
   return getDb().prepare(`
     SELECT d.slug, d.title, d.share_state, d.updated_at, d.created_at, v.last_visited_at
     FROM user_document_visits v
@@ -3045,11 +3745,11 @@ export function listSharedWithMeDocuments(oauthUserId: number, limit: number = 5
       AND (d.owner_id IS NULL OR (d.owner_id != ? AND d.owner_id != ? AND d.owner_id != ?))
     ORDER BY v.last_visited_at DESC
     LIMIT ?
-  `).all(oauthUserId, asStr, `oauth:${asStr}`, `oauth_user:${asStr}`, limit) as DashboardDocumentRow[];
+  `).all(everyUserId, asStr, `every:${asStr}`, `every_user:${asStr}`, limit) as DashboardDocumentRow[];
 }
 
-export function listRecentlyOpenedDocuments(oauthUserId: number, limit: number = 50): DashboardDocumentRow[] {
-  const asStr = String(oauthUserId);
+export function listRecentlyOpenedDocuments(everyUserId: number, limit: number = 50): DashboardDocumentRow[] {
+  const asStr = String(everyUserId);
   return getDb().prepare(`
     SELECT d.slug, d.title, d.share_state, d.updated_at, d.created_at, v.last_visited_at,
       CASE
@@ -3063,11 +3763,11 @@ export function listRecentlyOpenedDocuments(oauthUserId: number, limit: number =
       AND d.share_state != 'DELETED'
     ORDER BY v.last_visited_at DESC
     LIMIT ?
-  `).all(asStr, `oauth:${asStr}`, `oauth_user:${asStr}`, oauthUserId, limit) as DashboardDocumentRow[];
+  `).all(asStr, `every:${asStr}`, `every_user:${asStr}`, everyUserId, limit) as DashboardDocumentRow[];
 }
 
-export function listDashboardDocuments(oauthUserId: number, limit: number = 100): DashboardDocumentRow[] {
-  const asStr = String(oauthUserId);
+export function listDashboardDocuments(everyUserId: number, limit: number = 100): DashboardDocumentRow[] {
+  const asStr = String(everyUserId);
   return getDb().prepare(`
     SELECT slug, title, share_state, updated_at, created_at, last_visited_at, is_owned
     FROM (
@@ -3106,12 +3806,12 @@ export function listDashboardDocuments(oauthUserId: number, limit: number = 100)
     LIMIT ?
   `).all(
     asStr,
-    `oauth:${asStr}`,
-    `oauth_user:${asStr}`,
-    oauthUserId,
+    `every:${asStr}`,
+    `every_user:${asStr}`,
+    everyUserId,
     asStr,
-    `oauth:${asStr}`,
-    `oauth_user:${asStr}`,
+    `every:${asStr}`,
+    `every_user:${asStr}`,
     limit,
   ) as DashboardDocumentRow[];
 }

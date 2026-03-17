@@ -104,6 +104,10 @@ function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(value, max));
 }
 
+function hasNonEmptyCommentText(value: string): boolean {
+  return value.trim().length > 0;
+}
+
 function installTouchSafeButton(
   button: HTMLButtonElement,
   onClick: (event: MouseEvent) => void,
@@ -944,6 +948,10 @@ class MarkPopoverController {
     const textarea = document.createElement('textarea');
     textarea.className = 'mark-popover-textarea';
     textarea.placeholder = 'Write a comment...';
+    const updateAddButtonState = (button: HTMLButtonElement) => {
+      button.disabled = !hasNonEmptyCommentText(textarea.value);
+      button.setAttribute('aria-disabled', button.disabled ? 'true' : 'false');
+    };
     textarea.addEventListener('focus', () => {
       if (this.renderMode !== 'mobile-sheet') return;
       this.updateSheetViewportOffset();
@@ -981,8 +989,12 @@ class MarkPopoverController {
     const addButton = document.createElement('button');
     addButton.type = 'button';
     addButton.textContent = 'Add';
+    updateAddButtonState(addButton);
     installTouchSafeButton(addButton, () => {
       submit();
+    });
+    textarea.addEventListener('input', () => {
+      updateAddButtonState(addButton);
     });
 
     const cancelButton = document.createElement('button');
@@ -1059,6 +1071,12 @@ class MarkPopoverController {
       replyBox = document.createElement('textarea');
       replyBox.className = 'mark-popover-textarea';
       replyBox.placeholder = 'Reply...';
+      let replyButton: HTMLButtonElement | null = null;
+      const updateReplyButtonState = () => {
+        if (!replyButton) return;
+        replyButton.disabled = !hasNonEmptyCommentText(replyBox.value);
+        replyButton.setAttribute('aria-disabled', replyButton.disabled ? 'true' : 'false');
+      };
       replyBox.addEventListener('focus', () => {
         this.threadFocusMode = 'reply-box';
         if (this.renderMode !== 'mobile-sheet') return;
@@ -1070,6 +1088,9 @@ class MarkPopoverController {
             // ignore browser quirks
           }
         });
+      });
+      replyBox.addEventListener('input', () => {
+        updateReplyButtonState();
       });
 
       const reply = () => {
@@ -1099,9 +1120,10 @@ class MarkPopoverController {
         }
       });
 
-      const replyButton = document.createElement('button');
+      replyButton = document.createElement('button');
       replyButton.type = 'button';
       replyButton.textContent = 'Reply';
+      updateReplyButtonState();
       installTouchSafeButton(replyButton, () => {
         reply();
       });

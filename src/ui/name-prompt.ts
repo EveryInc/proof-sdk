@@ -5,6 +5,11 @@
  */
 
 const STORAGE_KEY = 'proof-share-viewer-name';
+const MAX_VIEWER_NAME_LENGTH = 48;
+
+function normalizeViewerName(rawName: string): string {
+  return rawName.replace(/\s+/g, ' ').trim().slice(0, MAX_VIEWER_NAME_LENGTH);
+}
 
 function shouldAutofocusInput(): boolean {
   if (typeof window === 'undefined') return false;
@@ -78,6 +83,7 @@ export function promptForName(): Promise<string> {
     input.autocomplete = 'name';
     input.autocapitalize = 'words';
     input.enterKeyHint = 'done';
+    input.maxLength = MAX_VIEWER_NAME_LENGTH;
     input.style.cssText = `
       width: 100%; padding: 10px 14px; border: 1px solid #e0e0e0;
       border-radius: 10px; font-size: 16px; outline: none;
@@ -91,6 +97,22 @@ export function promptForName(): Promise<string> {
       input.style.borderColor = '#e0e0e0';
     });
 
+    const counter = document.createElement('div');
+    counter.dataset.proofNamePrompt = 'counter';
+    counter.style.cssText = `
+      margin-top: 8px; text-align: right; font-size: 12px;
+      color: #8a8a8a; line-height: 1;
+    `;
+
+    const validationMessage = document.createElement('p');
+    validationMessage.dataset.proofNamePrompt = 'validation';
+    validationMessage.textContent = 'Please enter your name or continue anonymously.';
+    validationMessage.style.cssText = `
+      margin: 8px 0 0; min-height: 16px; text-align: left;
+      color: #b42318; font-size: 12px; line-height: 1.25;
+      opacity: 0; transition: opacity 0.12s;
+    `;
+
     const button = document.createElement('button');
     button.dataset.proofNamePrompt = 'submit';
     button.textContent = 'Continue';
@@ -101,6 +123,7 @@ export function promptForName(): Promise<string> {
       cursor: pointer; transition: background 0.15s;
     `;
     button.addEventListener('mouseenter', () => {
+      if (button.disabled) return;
       button.style.background = '#333';
     });
     button.addEventListener('mouseleave', () => {
@@ -127,7 +150,15 @@ export function promptForName(): Promise<string> {
     });
 
     const submit = () => {
-      const name = input.value.trim() || 'Anonymous';
+      const name = normalizeViewerName(input.value);
+      if (!name) {
+        validationMessage.style.opacity = '1';
+        input.setAttribute('aria-invalid', 'true');
+        input.focus();
+        return;
+      }
+      validationMessage.style.opacity = '0';
+      input.setAttribute('aria-invalid', 'false');
       setViewerName(name);
       overlay.remove();
       resolve(name);
@@ -141,6 +172,34 @@ export function promptForName(): Promise<string> {
 
     button.addEventListener('click', submit);
     skipLink.addEventListener('click', continueAsViewer);
+    const updateSubmitState = () => {
+      const normalizedName = normalizeViewerName(input.value);
+      const hasName = normalizedName.length > 0;
+      button.disabled = !hasName;
+      button.style.opacity = hasName ? '1' : '0.62';
+      button.style.cursor = hasName ? 'pointer' : 'not-allowed';
+      button.setAttribute('aria-disabled', hasName ? 'false' : 'true');
+      counter.textContent = `${normalizedName.length}/${MAX_VIEWER_NAME_LENGTH}`;
+      if (hasName) {
+        validationMessage.style.opacity = '0';
+        input.setAttribute('aria-invalid', 'false');
+      }
+    };
+    const normalizeInputValue = () => {
+      const normalizedValue = normalizeViewerName(input.value);
+      if (normalizedValue !== input.value) {
+        input.value = normalizedValue;
+      }
+    };
+    updateSubmitState();
+    input.addEventListener('input', () => {
+      normalizeInputValue();
+      updateSubmitState();
+    });
+    input.addEventListener('blur', () => {
+      normalizeInputValue();
+      updateSubmitState();
+    });
     input.addEventListener('keydown', (e) => {
       if (e.key === 'Enter') submit();
       if (e.key === 'Escape') continueAsViewer();
@@ -150,6 +209,8 @@ export function promptForName(): Promise<string> {
     dialog.appendChild(title);
     dialog.appendChild(subtitle);
     dialog.appendChild(input);
+    dialog.appendChild(counter);
+    dialog.appendChild(validationMessage);
     dialog.appendChild(button);
     dialog.appendChild(skipLink);
     overlay.appendChild(dialog);

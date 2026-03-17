@@ -10,14 +10,23 @@ export function canonicalizeVisibleTextBlockSeparators(text: string): string {
 export function stripMarkdownVisibleText(markdown: string): string {
   let text = markdown ?? '';
 
+  // Replace block-level tags with visible-text block separators, then remove remaining tags.
   text = text.replace(/<\/?(?:p|br|div|li)\b[^>]*>/gi, '\n');
   text = text.replace(/<[^>]+>/g, '');
+
+  // Convert images/links to their visible text.
   text = text.replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1');
   text = text.replace(/\[([^\]]+)\]\([^)]*\)/g, '$1');
   text = text.replace(/\[([^\]]+)\]\[[^\]]*\]/g, '$1');
+
+  // Strip fenced code blocks but keep inner text.
   text = text.replace(/```([\s\S]*?)```/g, '$1');
   text = text.replace(/~~~([\s\S]*?)~~~/g, '$1');
+
+  // Strip inline code markers.
   text = text.replace(/`([^`]+)`/g, '$1');
+
+  // Strip common emphasis/strike markers.
   text = text.replace(/\*\*\*([^*]+)\*\*\*/g, '$1');
   text = text.replace(/(?<!\w)___([^_]+)___(?!\w)/g, '$1');
   text = text.replace(/\*\*([^*]+)\*\*/g, '$1');
@@ -25,12 +34,16 @@ export function stripMarkdownVisibleText(markdown: string): string {
   text = text.replace(/\*([^*]+)\*/g, '$1');
   text = text.replace(/(?<!\w)_([^_]+)_(?!\w)/g, '$1');
   text = text.replace(/~~([^~]+)~~/g, '$1');
+
+  // Remove markdown line prefixes (headings, lists, blockquotes).
   text = text.replace(/^[ \t]*#{1,6}[ \t]+/gm, '');
   text = text.replace(/^[ \t]*>[ \t]?/gm, '');
   text = text.replace(/^[ \t]*(?:[-*+]|\d+\.)[ \t]+/gm, '');
   text = text.replace(/^[ \t]*\[(?: |x|X)\][ \t]+/gm, '');
   text = text.replace(/^[ \t]*([-*_]){3,}[ \t]*$/gm, '');
-  text = text.replace(/\\([\\`*_{}\[\]()#+\-.!])/g, '$1');
+
+  // Unescape markdown escapes.
+  text = text.replace(/\\([\\`*_{}\[\]()#+\-.!|])/g, '$1');
 
   return text;
 }

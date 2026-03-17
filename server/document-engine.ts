@@ -12,13 +12,17 @@ import {
 } from './db.js';
 import { refreshSnapshotForSlug } from './snapshot.js';
 import {
-  applyCanonicalDocumentToCollab,
   type AuthoritativeMutationBase,
   getCanonicalReadableDocument as getAuthoritativeCanonicalReadableDocument,
   getCanonicalReadableDocumentSync,
   getLoadedCollabMarkdownFromFragment,
+  hasPotentiallyLiveCollabDoc,
   invalidateCollabDocument,
+  invalidateCollabDocumentAndWait,
   isCanonicalReadMutationReady,
+  preserveMarksOnlyWriteIfAuthoritativeYjsMatches,
+  reportCanonicalSyncRecoveryFailure,
+  syncCanonicalDocumentStateToCollab,
   stripEphemeralCollabSpans,
   type CanonicalReadableDocument,
 } from './collab.js';
@@ -44,6 +48,7 @@ import {
   finalizeSuggestionThroughRehydration,
   type ProofMarkRehydrationFailure,
 } from './proof-mark-rehydration.js';
+import { stripAllProofSpanTags } from './proof-span-strip.js';
 import {
   recordEditAnchorAmbiguous,
   recordEditAnchorNotFound,
@@ -87,6 +92,7 @@ type AsyncDocumentMutationPrecondition = {
 export type AsyncDocumentMutationContext = {
   doc: CanonicalReadableDocument;
   mutationBase?: AuthoritativeMutationBase | null;
+  enforceProjectionReadiness?: boolean;
   precondition?: AsyncDocumentMutationPrecondition;
   idempotencyKey?: string;
   idempotencyRoute?: string;
@@ -142,7 +148,7 @@ function getMutationReadyDocument(
 ):
   | { doc: MutationReadyDocument; error: null }
   | { doc: null; error: EngineExecutionResult } {
-  if (context?.mutationBase) {
+  if (context?.mutationBase && !context.enforceProjectionReadiness) {
     return { doc: context.doc, error: null };
   }
   const doc = context?.doc ?? getCanonicalReadableDocument(slug);
@@ -150,6 +156,19 @@ function getMutationReadyDocument(
     return { doc: null, error: { status: 404, body: { success: false, error: 'Document not found' } } };
   }
   if (!isMutationReadyRead(doc)) {
+    const fallbackDoc = getDocumentBySlug(slug);
+    const persistedVisible = normalizeVisibleMutationMarkdown(fallbackDoc?.markdown ?? '');
+    const authoritativeVisible = normalizeVisibleMutationMarkdown(doc.markdown ?? '');
+    if (fallbackDoc && persistedVisible === authoritativeVisible) {
+      return {
+        doc: {
+          ...(fallbackDoc as MutationReadyDocument),
+          marks: doc.marks,
+          plain_text: fallbackDoc.markdown,
+        } as MutationReadyDocument,
+        error: null,
+      };
+    }
     return { doc: null, error: projectionStaleMutationResult() };
   }
   return { doc, error: null };
@@ -163,7 +182,7 @@ async function getMutationReadyDocumentAsync(
     | { doc: MutationReadyDocument; error: null }
     | { doc: null; error: EngineExecutionResult }
   > {
-  if (context?.mutationBase) {
+  if (context?.mutationBase && !context.enforceProjectionReadiness) {
     return { doc: context.doc, error: null };
   }
   let doc = context?.doc
@@ -210,6 +229,73 @@ function projectionStaleMutationResult(): EngineExecutionResult {
       error: 'Document projection is stale; retry after repair completes',
     },
   };
+}
+
+function normalizeVisibleMutationMarkdown(markdown: string): string {
+  return normalizeMarkdownForQuote(stripEphemeralCollabSpans(stripAllProofSpanTags(markdown)));
+}
+
+async function getAsyncMutationReadyDocumentWithVisibleFallback(
+  slug: string,
+  context?: AsyncDocumentMutationContext,
+): Promise<
+  | { doc: MutationReadyDocument; error: null }
+  | { doc: null; error: EngineExecutionResult }
+> {
+  const ready = await getMutationReadyDocumentAsync(slug, context);
+  if (ready.error) {
+    const fallbackDoc = (
+      ready.error.status === 409
+      && isRecord(ready.error.body)
+      && ready.error.body.code === 'PROJECTION_STALE'
+    )
+      ? getDocumentBySlug(slug)
+      : null;
+    const authoritativeFallback = fallbackDoc
+      ? await getCanonicalReadableDocumentAsync(slug)
+      : null;
+    const authoritativeFallbackMarkdown = typeof context?.mutationBase?.markdown === 'string'
+      ? context.mutationBase.markdown
+      : (authoritativeFallback?.markdown ?? '');
+    const authoritativeFallbackMarks = context?.mutationBase
+      ? JSON.stringify(context.mutationBase.marks ?? {})
+      : (authoritativeFallback?.marks ?? '{}');
+    const persistedVisible = fallbackDoc
+      ? normalizeVisibleMutationMarkdown(fallbackDoc.markdown ?? '')
+      : '';
+    const authoritativeVisible = normalizeVisibleMutationMarkdown(authoritativeFallbackMarkdown);
+    if (!fallbackDoc || persistedVisible !== authoritativeVisible) return ready;
+    return {
+      doc: {
+        ...(fallbackDoc as MutationReadyDocument),
+        marks: authoritativeFallbackMarks,
+        plain_text: fallbackDoc.markdown,
+      } as MutationReadyDocument,
+      error: null,
+    };
+  }
+
+  let doc = ready.doc;
+  if (context?.mutationBase) {
+    const persistedDoc = getDocumentBySlug(slug);
+    const persistedMarkdown = persistedDoc?.markdown ?? '';
+    const authoritativeMarkdown = doc.markdown ?? '';
+    const persistedVisible = normalizeVisibleMutationMarkdown(persistedMarkdown);
+    const authoritativeVisible = normalizeVisibleMutationMarkdown(authoritativeMarkdown);
+    if (
+      persistedDoc
+      && persistedMarkdown.includes('data-proof=')
+      && persistedVisible === authoritativeVisible
+    ) {
+      doc = {
+        ...doc,
+        markdown: persistedDoc.markdown,
+        plain_text: persistedDoc.markdown,
+      };
+    }
+  }
+
+  return { doc, error: null };
 }
 
 function buildCanonicalMutationBaseArgs(
@@ -1172,6 +1258,8 @@ function readState(slug: string): EngineExecutionResult {
           warning: {
             code: 'PROJECTION_STALE',
             error: 'Canonical reads are serving Yjs fallback content while projection repair catches up.',
+            fallbackReason: 'read_fallback_reason' in doc ? doc.read_fallback_reason ?? null : null,
+            yjsSource: 'yjs_source' in doc ? doc.yjs_source ?? null : null,
           },
         }
         : {}),
@@ -1210,7 +1298,14 @@ async function readStateAsync(slug: string): Promise<EngineExecutionResult> {
       repairPending,
       mutationReady,
       ...(repairPending
-        ? { warning: 'Content is being repaired from authoritative collaborative state.' }
+        ? {
+          warning: {
+            code: 'PROJECTION_STALE',
+            error: 'Canonical reads are serving Yjs fallback content while projection repair catches up.',
+            fallbackReason: 'read_fallback_reason' in doc ? doc.read_fallback_reason ?? null : null,
+            yjsSource: 'yjs_source' in doc ? doc.yjs_source ?? null : null,
+          },
+        }
         : {}),
     },
   };
@@ -1233,15 +1328,21 @@ function persistMarks(slug: string, marks: Record<string, StoredMark>, actor: st
     });
   }
 
+  if (hasPotentiallyLiveCollabDoc(slug)) {
+    return {
+      status: 503,
+      body: {
+        success: false,
+        code: 'COLLAB_SYNC_REQUIRED',
+        error: 'Live collaborative state requires the async collab-aware mark mutation path',
+      },
+    };
+  }
+
   const ok = updateMarks(slug, normalizedMarks as unknown as Record<string, unknown>);
   if (!ok) {
     return { status: 500, body: { success: false, error: 'Failed to update marks' } };
   }
-  // Sync marks to Yjs collab layer so they aren't overwritten on next materialization
-  applyCanonicalDocumentToCollab(slug, { marks: normalizedMarks as unknown as Record<string, unknown>, source: 'engine' }).catch((error) => {
-    console.error('[document-engine] Failed to sync marks to collab projection; invalidating collab state', { slug, error });
-    invalidateCollabDocument(slug);
-  });
   const eventId = addDocumentEvent(slug, eventType, eventData, actor);
   refreshSnapshotForSlug(slug);
   const doc = getDocumentBySlug(slug);
@@ -1257,6 +1358,116 @@ function persistMarks(slug: string, marks: Record<string, StoredMark>, actor: st
       shareState: doc?.share_state ?? 'ACTIVE',
       updatedAt: doc?.updated_at ?? new Date().toISOString(),
       marks: normalizedMarks,
+    },
+  };
+}
+
+async function persistMarksWithAuthoritativeSync(
+  slug: string,
+  previousMarks: Record<string, StoredMark>,
+  nextMarks: Record<string, StoredMark>,
+  actor: string,
+  eventType: string,
+  eventData: JsonRecord,
+): Promise<EngineExecutionResult> {
+  const ok = updateMarks(slug, nextMarks as unknown as Record<string, unknown>);
+  if (!ok) {
+    return { status: 500, body: { success: false, error: 'Failed to update marks' } };
+  }
+
+  let syncFailureReason: string | null = null;
+  try {
+    const syncResult = await syncCanonicalDocumentStateToCollab(slug, {
+      marks: nextMarks as unknown as Record<string, unknown>,
+      source: 'engine',
+    });
+    if (!syncResult.applied) {
+      syncFailureReason = syncResult.reason;
+    }
+  } catch (error) {
+    console.error('[document-engine] Failed to sync marks into canonical collab state:', { slug, error });
+    syncFailureReason = 'apply_failed';
+  }
+
+  if (syncFailureReason) {
+    if (
+      syncFailureReason === 'fragment_unhealthy_marks_only'
+      && await preserveMarksOnlyWriteIfAuthoritativeYjsMatches(slug, nextMarks as unknown as Record<string, unknown>)
+    ) {
+      const eventId = addDocumentEvent(slug, eventType, eventData, actor);
+      refreshSnapshotForSlug(slug);
+      const doc = getDocumentBySlug(slug);
+      const markId = typeof eventData.markId === 'string' && eventData.markId.trim().length > 0
+        ? eventData.markId.trim()
+        : undefined;
+      return {
+        status: 200,
+        body: {
+          success: true,
+          eventId,
+          ...(markId ? { markId } : {}),
+          shareState: doc?.share_state ?? 'ACTIVE',
+          updatedAt: doc?.updated_at ?? new Date().toISOString(),
+          marks: nextMarks,
+        },
+      };
+    }
+    const rolledBack = updateMarks(slug, previousMarks as unknown as Record<string, unknown>);
+    if (!rolledBack) {
+      console.error('[document-engine] Failed to roll back marks after collab sync refusal', {
+        slug,
+        reason: syncFailureReason,
+      });
+      reportCanonicalSyncRecoveryFailure(slug, {
+        surface: 'document_engine',
+        route: eventType,
+        stage: 'rollback_failed',
+        reason: syncFailureReason,
+        rolledBack: false,
+      });
+    }
+    try {
+      await invalidateCollabDocumentAndWait(slug);
+    } catch (error) {
+      console.error('[document-engine] Failed to fully invalidate collab state after marks sync refusal', {
+        slug,
+        reason: syncFailureReason,
+        error,
+      });
+      reportCanonicalSyncRecoveryFailure(slug, {
+        surface: 'document_engine',
+        route: eventType,
+        stage: 'invalidate_failed',
+        reason: syncFailureReason,
+        rolledBack,
+        error,
+      });
+    }
+    return {
+      status: 503,
+      body: {
+        success: false,
+        code: 'COLLAB_SYNC_FAILED',
+        error: 'Failed to synchronize marks with collab state; retry with latest state',
+      },
+    };
+  }
+
+  const eventId = addDocumentEvent(slug, eventType, eventData, actor);
+  refreshSnapshotForSlug(slug);
+  const doc = getDocumentBySlug(slug);
+  const markId = typeof eventData.markId === 'string' && eventData.markId.trim().length > 0
+    ? eventData.markId.trim()
+    : undefined;
+  return {
+    status: 200,
+    body: {
+      success: true,
+      eventId,
+      ...(markId ? { markId } : {}),
+      shareState: doc?.share_state ?? 'ACTIVE',
+      updatedAt: doc?.updated_at ?? new Date().toISOString(),
+      marks: nextMarks,
     },
   };
 }
@@ -1297,6 +1508,16 @@ async function persistMarksAsync(
       && stripEphemeralCollabSpans(targetMarkdown) !== persistedMarkdown);
 
   if (!shouldCommitCanonical) {
+    if (hasPotentiallyLiveCollabDoc(slug)) {
+      return persistMarksWithAuthoritativeSync(
+        slug,
+        parseMarks(doc.marks),
+        normalizedMarks,
+        actor,
+        eventType,
+        eventData,
+      );
+    }
     return persistMarks(slug, normalizedMarks, actor, eventType, eventData);
   }
 
@@ -1645,6 +1866,17 @@ function updateSuggestionStatus(
     };
   }
 
+  if (status !== 'rejected' && hasPotentiallyLiveCollabDoc(slug)) {
+    return {
+      status: 503,
+      body: {
+        success: false,
+        code: 'COLLAB_SYNC_REQUIRED',
+        error: 'Live collaborative state requires the async collab-aware suggestion mutation path',
+      },
+    };
+  }
+
   const existingWithTarget = isRecord(existing.target) ? existing.target : null;
   const existingForApply = existingWithTarget
     ? (() => {
@@ -1748,16 +1980,6 @@ function updateSuggestionStatus(
     // canonical DB state instead of reusing stale in-memory rooms on other instances.
     bumpDocumentAccessEpoch(slug);
     invalidateCollabDocument(slug);
-  } else {
-    const collabMarkdown = updated?.markdown ?? nextMarkdown;
-    void applyCanonicalDocumentToCollab(slug, {
-      markdown: collabMarkdown,
-      marks: nextMarks as unknown as Record<string, unknown>,
-      source: 'engine',
-    }).catch((error) => {
-      console.error('[document-engine] Failed to sync suggestion status to collab projection; invalidating collab state', { slug, status, error });
-      invalidateCollabDocument(slug);
-    });
   }
   if (updated) {
     void rebuildDocumentBlocks(updated, updated.markdown, updated.revision).catch((error) => {
@@ -1784,7 +2006,7 @@ async function addSuggestionAsync(
   kind: 'insert' | 'delete' | 'replace',
   context?: AsyncDocumentMutationContext,
 ): Promise<EngineExecutionResult> {
-  const ready = await getMutationReadyDocumentAsync(slug, context);
+  const ready = await getAsyncMutationReadyDocumentWithVisibleFallback(slug, context);
   if (ready.error) return ready.error;
   const doc = ready.doc;
   const requestedStatus = typeof body.status === 'string' ? body.status.trim().toLowerCase() : 'pending';
@@ -2009,7 +2231,7 @@ async function updateSuggestionStatusAsync(
   status: 'accepted' | 'rejected',
   context?: AsyncDocumentMutationContext,
 ): Promise<EngineExecutionResult> {
-  const ready = await getMutationReadyDocumentAsync(slug, context);
+  const ready = await getAsyncMutationReadyDocumentWithVisibleFallback(slug, context);
   if (ready.error) return ready.error;
   const doc = ready.doc;
   const markId = typeof body.markId === 'string' ? body.markId : '';
@@ -2048,9 +2270,6 @@ async function updateSuggestionStatusAsync(
   }
 
   if (existing.kind !== 'insert' && existing.kind !== 'delete' && existing.kind !== 'replace') {
-    if (!context?.mutationBase) {
-      return updateSuggestionStatus(slug, body, status, doc);
-    }
     const nextMarks: Record<string, StoredMark> = {
       ...marks,
       [markId]: { ...existing, status },

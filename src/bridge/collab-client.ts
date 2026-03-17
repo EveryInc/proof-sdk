@@ -187,11 +187,12 @@ export class CollabClient {
   private unsyncedChanges = 0;
   private localUser: CollabLocalUser | null = null;
   private pendingMarksSnapshot: Record<string, unknown> | null = null;
+  private pendingReconnectReplayUpdates: string[] = [];
+  private recentReconnectReplayUpdates: Array<{ encoded: string; at: number }> = [];
   private durableBufferKey: string | null = null;
   private durablePendingUpdates: string[] = [];
   private durablePendingSince: number | null = null;
   private durableUpdatesEnabled = false;
-  private skipDurableReplayOnce = false;
   private readonly durableClientId: string;
   private mergedDurableKeys: string[] = [];
   private documentUpdatedResyncTimer: ReturnType<typeof setTimeout> | null = null;
@@ -298,6 +299,7 @@ export class CollabClient {
 
   private durableFlushTimer: ReturnType<typeof setTimeout> | null = null;
   private static readonly DURABLE_FLUSH_DEBOUNCE_MS = 500;
+  private static readonly RECENT_RECONNECT_REPLAY_GRACE_MS = 5_000;
 
   private persistDurableBuffer(): void {
     // Debounce localStorage writes to avoid synchronous I/O jank under high edit throughput.
@@ -328,6 +330,7 @@ export class CollabClient {
   private appendDurableUpdate(update: Uint8Array): void {
     if (!this.durableUpdatesEnabled || !this.durableBufferKey) return;
     const encoded = encodeBase64(update);
+    this.rememberRecentReconnectReplayUpdate(encoded);
     this.durablePendingUpdates.push(encoded);
     if (this.durablePendingUpdates.length > MAX_DURABLE_UPDATES) {
       this.durablePendingUpdates = this.durablePendingUpdates.slice(-MAX_DURABLE_UPDATES);
@@ -337,6 +340,23 @@ export class CollabClient {
     }
     this.persistDurableBuffer();
     this.emitSyncStatus();
+  }
+
+  private rememberRecentReconnectReplayUpdate(encoded: string): void {
+    const now = Date.now();
+    this.recentReconnectReplayUpdates = this.recentReconnectReplayUpdates
+      .filter((entry) => (now - entry.at) <= CollabClient.RECENT_RECONNECT_REPLAY_GRACE_MS);
+    this.recentReconnectReplayUpdates.push({ encoded, at: now });
+    if (this.recentReconnectReplayUpdates.length > MAX_DURABLE_UPDATES) {
+      this.recentReconnectReplayUpdates = this.recentReconnectReplayUpdates.slice(-MAX_DURABLE_UPDATES);
+    }
+  }
+
+  private getRecentReconnectReplayUpdates(): string[] {
+    const now = Date.now();
+    this.recentReconnectReplayUpdates = this.recentReconnectReplayUpdates
+      .filter((entry) => (now - entry.at) <= CollabClient.RECENT_RECONNECT_REPLAY_GRACE_MS);
+    return this.recentReconnectReplayUpdates.map((entry) => entry.encoded);
   }
 
   private clearDurableBuffer(): void {
@@ -364,8 +384,6 @@ export class CollabClient {
   private shouldPersistDurableUpdate(origin: unknown): boolean {
     if (origin === 'durable-replay') return false;
     if (origin === 'local-projection-sync') return false;
-    if (origin === 'local-marks-sync') return false;
-    if (origin === 'local-reconnect-bootstrap') return false;
     if (origin && origin === this.provider) return false;
     if (typeof origin === 'string' && origin.startsWith('remote')) return false;
     return true;
@@ -373,13 +391,18 @@ export class CollabClient {
 
   private replayDurableUpdates(ydoc: Y.Doc): void {
     if (!this.durableUpdatesEnabled) return;
-    if (this.skipDurableReplayOnce) {
-      this.skipDurableReplayOnce = false;
-      return;
-    }
     if (this.durablePendingUpdates.length === 0) return;
+    const nextUpdates = this.replayEncodedUpdates(ydoc, this.durablePendingUpdates);
+    this.durablePendingUpdates = nextUpdates;
+    if (this.durablePendingUpdates.length === 0) {
+      this.durablePendingSince = null;
+      this.persistDurableBuffer();
+    }
+  }
+
+  private replayEncodedUpdates(ydoc: Y.Doc, encodedUpdates: string[]): string[] {
     const nextUpdates: string[] = [];
-    for (const encoded of this.durablePendingUpdates) {
+    for (const encoded of encodedUpdates) {
       const update = decodeBase64(encoded);
       if (!update) continue;
       try {
@@ -389,11 +412,7 @@ export class CollabClient {
         // skip invalid update entries
       }
     }
-    this.durablePendingUpdates = nextUpdates;
-    if (this.durablePendingUpdates.length === 0) {
-      this.durablePendingSince = null;
-      this.persistDurableBuffer();
-    }
+    return nextUpdates;
   }
 
   private maybeClearDurableBuffer(): void {
@@ -529,7 +548,7 @@ export class CollabClient {
     return !this.usesSameLiveSession(session);
   }
 
-  connect(session: CollabSessionInfo): void {
+  connect(session: CollabSessionInfo, options?: { replayDurableBuffer?: boolean }): void {
     if (session.syncProtocol !== 'pm-yjs-v1') {
       throw new Error(`Unsupported collab sync protocol: ${session.syncProtocol}`);
     }
@@ -546,6 +565,9 @@ export class CollabClient {
     this.durableUpdatesEnabled = this.canPersistDurableUpdates(session.role);
     if (this.durableUpdatesEnabled) {
       this.loadDurableBuffer(session.slug);
+      if (options?.replayDurableBuffer === false) {
+        this.clearDurableBuffer();
+      }
     } else {
       this.resetDurableState();
     }
@@ -681,6 +703,10 @@ export class CollabClient {
     this.marksMap = marksMap;
     this.applyPendingMarksSnapshot();
     this.replayDurableUpdates(ydoc);
+    if (this.pendingReconnectReplayUpdates.length > 0) {
+      this.pendingReconnectReplayUpdates = this.replayEncodedUpdates(ydoc, this.pendingReconnectReplayUpdates);
+    }
+    this.pendingReconnectReplayUpdates = [];
     this.emitSyncStatus();
 
     if (this.marksHandler) {
@@ -714,18 +740,35 @@ export class CollabClient {
 
   reconnectWithSession(session: CollabSessionInfo, options?: { preserveLocalState?: boolean }): void {
     const preserveLocalState = options?.preserveLocalState !== false;
-    const canPreserveLocalState = preserveLocalState
+    const recentReconnectReplayUpdates = preserveLocalState
       && this.canPersistDurableUpdates(session.role)
-      && this.hasPendingLocalStateForReconnect();
-    this.debugLog('reconnect', { preserveLocalState, canPreserveLocalState, nextRole: session.role });
-    const localState = canPreserveLocalState && this.ydoc ? Y.encodeStateAsUpdate(this.ydoc) : null;
-    this.disconnect();
-    const wantsDurableReplay = preserveLocalState && canPreserveLocalState && !localState;
-    this.skipDurableReplayOnce = !wantsDurableReplay;
-    this.connect(session);
-    if (localState && this.ydoc) {
-      Y.applyUpdate(this.ydoc, localState, 'local-reconnect-bootstrap');
+      ? this.getRecentReconnectReplayUpdates()
+      : [];
+    const canPreserveBufferedLocalState = preserveLocalState
+      && this.canPersistDurableUpdates(session.role)
+      && (this.hasPendingLocalStateForReconnect() || recentReconnectReplayUpdates.length > 0);
+    if (canPreserveBufferedLocalState && this.marksMap) {
+      this.pendingMarksSnapshot = this.readMarks();
     }
+    this.pendingReconnectReplayUpdates = canPreserveBufferedLocalState
+      ? recentReconnectReplayUpdates
+      : [];
+    if (!canPreserveBufferedLocalState) {
+      this.pendingMarksSnapshot = null;
+      this.recentReconnectReplayUpdates = [];
+    }
+    this.debugLog('reconnect', {
+      preserveLocalState,
+      canPreserveBufferedLocalState,
+      recentReconnectReplayUpdates: recentReconnectReplayUpdates.length,
+      nextRole: session.role,
+    });
+    // Hard reconnects change the live room identity. Replaying the entire previous
+    // Y.Doc into the new room can duplicate or resurrect semantically stale content
+    // when the server has already rebuilt authoritative state. Buffered local updates
+    // are the only safe unit of preservation across that boundary.
+    this.disconnect();
+    this.connect(session, { replayDurableBuffer: canPreserveBufferedLocalState });
   }
 
   setProjectionMarkdown(markdown: string): void {
@@ -798,6 +841,11 @@ export class CollabClient {
       this.unsyncedChanges = 1;
       this.emitSyncStatus();
     }
+  }
+
+  flushPendingLocalStateForUnload(): void {
+    if (this.durablePendingUpdates.length === 0) return;
+    this.flushDurableBuffer();
   }
 
   disconnect(): void {

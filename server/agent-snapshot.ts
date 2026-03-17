@@ -1,14 +1,21 @@
 import { createHash } from 'crypto';
 import type { DocumentRow, DocumentBlockRow } from './db.js';
 import { getDocumentBySlug, listLiveDocumentBlocks } from './db.js';
-import { getCanonicalReadableDocumentSync, isCanonicalReadMutationReady } from './collab.js';
+import {
+  type AuthoritativeMutationBase,
+  getCanonicalReadableDocument,
+  isCanonicalReadMutationReady,
+  resolveAuthoritativeMutationBase,
+} from './collab.js';
+import { recoverCanonicalDocumentIfNeeded } from './canonical-document.js';
 import {
   getHeadlessMilkdownParser,
   parseMarkdownWithHtmlFallback,
   serializeSingleNode,
   summarizeParseError,
 } from './milkdown-headless.js';
-import { stripProofSpanTags } from './proof-span-strip.js';
+import { stripAllProofSpanTags } from './proof-span-strip.js';
+import { getActiveCollabClientCount } from './ws.js';
 
 export type AgentSnapshotResult = {
   status: number;
@@ -87,9 +94,12 @@ function needsBlockRebuild(blocks: BlockDescriptor[], stored: DocumentBlockRow[]
 async function buildSnapshotPayload(
   document: SnapshotDocument,
   includeTextPreview: boolean,
+  mutationBase?: AuthoritativeMutationBase | null,
 ): Promise<Record<string, unknown>> {
-  const mutationReady = isCanonicalReadMutationReady(document);
+  const mutationReady = !('mutation_ready' in document)
+    || isCanonicalReadMutationReady(document as { mutation_ready?: boolean });
   const projectionFresh = 'projection_fresh' in document ? document.projection_fresh : true;
+  const repairPending = 'repair_pending' in document ? document.repair_pending : !projectionFresh;
   const blocks = await buildBlockDescriptors(document.markdown);
   if (!document.doc_id) {
     throw new Error('Document is missing doc_id; cannot build snapshot.');
@@ -107,6 +117,7 @@ async function buildSnapshotPayload(
 
   const snapshotBlocks = blocks.map((block, index) => {
     const row = byOrdinal.get(block.ordinal);
+    const currentRow = storedBlocksAreCurrent ? row : undefined;
     const stableBlockId = storedBlocksAreCurrent && row
       ? row.block_id
       : `snapshot:${document.doc_id}:${mutationReady ? document.revision : 'fallback'}:b${index + 1}`;
@@ -114,7 +125,7 @@ async function buildSnapshotPayload(
       ref: `b${index + 1}`,
       id: stableBlockId,
       type: block.nodeType,
-      markdown: stripProofSpanTags(block.markdown),
+      markdown: stripAllProofSpanTags(block.markdown),
     };
 
     if (block.nodeType === 'heading') {
@@ -123,7 +134,7 @@ async function buildSnapshotPayload(
     }
 
     if (includeTextPreview) {
-      payload.textPreview = row?.text_preview ?? block.textPreview;
+      payload.textPreview = currentRow?.text_preview ?? block.textPreview;
     }
 
     return payload;
@@ -135,15 +146,25 @@ async function buildSnapshotPayload(
     revision: mutationReady ? document.revision : null,
     readSource: document.read_source ?? 'projection',
     projectionFresh,
+    repairPending,
     mutationReady,
+    ...(mutationBase
+      ? {
+          mutationBase: {
+            token: mutationBase.token,
+            source: mutationBase.source,
+            schemaVersion: mutationBase.schemaVersion,
+          },
+        }
+      : {}),
     generatedAt: new Date().toISOString(),
     blocks: snapshotBlocks,
-    _links: mutationReady
+    _links: (mutationReady || Boolean(mutationBase))
       ? {
         editV2: { method: 'POST', href: `/api/agent/${document.slug}/edit/v2` },
       }
       : {},
-    ...(!mutationReady
+    ...(repairPending
       ? {
         warning: {
           code: 'PROJECTION_STALE',
@@ -154,8 +175,18 @@ async function buildSnapshotPayload(
   };
 }
 
+async function resolveSnapshotMutationBase(slug: string): Promise<AuthoritativeMutationBase | null> {
+  const activeCollabClients = getActiveCollabClientCount(slug);
+  const resolved = await resolveAuthoritativeMutationBase(slug, {
+    liveRequired: activeCollabClients > 0,
+  });
+  return resolved.ok ? resolved.base : null;
+}
+
 export async function buildAgentSnapshot(slug: string, options: SnapshotOptions = {}): Promise<AgentSnapshotResult> {
-  const doc = getCanonicalReadableDocumentSync(slug, 'state') ?? getDocumentBySlug(slug);
+  const doc = await recoverCanonicalDocumentIfNeeded(slug, 'snapshot')
+    ?? await getCanonicalReadableDocument(slug, 'snapshot')
+    ?? getDocumentBySlug(slug);
   if (!doc || doc.share_state === 'DELETED') {
     return { status: 404, body: { success: false, error: 'Document not found', code: 'NOT_FOUND' } };
   }
@@ -165,10 +196,12 @@ export async function buildAgentSnapshot(slug: string, options: SnapshotOptions 
 
   const includeTextPreview = options.includeTextPreview !== false;
   const requestedRevision = typeof options.revision === 'number' ? options.revision : null;
-  const mutationReady = isCanonicalReadMutationReady(doc);
+  const mutationBase = await resolveSnapshotMutationBase(slug);
+  const mutationReady = !('mutation_ready' in doc)
+    || isCanonicalReadMutationReady(doc as { mutation_ready?: boolean });
 
   if (requestedRevision !== null && !mutationReady) {
-    const snapshot = await buildSnapshotPayload(doc, includeTextPreview);
+    const snapshot = await buildSnapshotPayload(doc, includeTextPreview, mutationBase);
     return {
       status: 409,
       body: {
@@ -182,7 +215,7 @@ export async function buildAgentSnapshot(slug: string, options: SnapshotOptions 
   }
 
   if (requestedRevision !== null && requestedRevision !== doc.revision) {
-    const snapshot = await buildSnapshotPayload(doc, includeTextPreview);
+    const snapshot = await buildSnapshotPayload(doc, includeTextPreview, mutationBase);
     return {
       status: 409,
       body: {
@@ -195,6 +228,6 @@ export async function buildAgentSnapshot(slug: string, options: SnapshotOptions 
     };
   }
 
-  const payload = await buildSnapshotPayload(doc, includeTextPreview);
+  const payload = await buildSnapshotPayload(doc, includeTextPreview, mutationBase);
   return { status: 200, body: payload };
 }

@@ -549,6 +549,24 @@ export function recordLegacyReverseFlowBlocked(
 export function recordFragmentCacheMismatch(_source: string): void {
 }
 
+export function recordCanonicalSyncFailure(
+  _reason: string,
+  _source: string,
+): void {
+}
+
+export function recordCanonicalSyncRecoveryFailure(
+  _reason: string,
+  _source: string,
+): void {
+}
+
+export function recordCanonicalSyncRefusal(
+  _reason: string,
+  _source: string,
+): void {
+}
+
 export function recordSuspiciousDocBlocked(
   _path: 'legacy_reseed' | 'pending_delta_clear',
   _reason: string,

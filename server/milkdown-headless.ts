@@ -12,6 +12,7 @@ import { unified } from 'unified';
 // Reuse the same Milkdown schema plugins + proof span remark plugin as the browser editor so
 // markdown replacements can be applied into the Yjs ProseMirror fragment server-side.
 import { codeBlockExtPlugins } from '../src/editor/schema/code-block-ext.js';
+import { parseMarkdownPreservingExplicitBlankParagraphs } from '../src/editor/explicit-blank-paragraphs.js';
 import { frontmatterSchema } from '../src/editor/schema/frontmatter.js';
 import { proofMarkPlugins } from '../src/editor/schema/proof-marks.js';
 import { remarkProofMarks, proofMarkHandler } from '../src/formats/remark-proof-marks.js';
@@ -35,13 +36,22 @@ type HeadlessMilkdown = HeadlessMilkdownParser & {
 };
 
 let enginePromise: Promise<HeadlessMilkdown> | null = null;
+let resolvedEngine: HeadlessMilkdown | null = null;
+let engineGeneration = 0;
+let forcedWarmFailureForTests: Error | null = null;
 
 const INLINE_HTML_TAG_PATTERN = /<\/?[A-Za-z][A-Za-z0-9-]*(?:\s+[^>\n]*)?\s*\/?>/g;
-const STANDALONE_HTML_LINE_PATTERN = /^[ \t]*(?:<!--[^\n]*-->|<\/?[A-Za-z][A-Za-z0-9-]*(?:\s+[^>\n]*)?\s*\/?>)[ \t]*$/gm;
+const STANDALONE_HTML_LINE_PATTERN = /^[ \t]*(?:<!--[^\n]*-->|<\/?[A-Za-z][A-Za-z0-9-]*(?:\s+[^>\n]*)?\s*\/?>)[ \t]*$/;
+const EXPLICIT_BLANK_PARAGRAPH_LINE_PATTERN = /^[ \t]*<br\s*\/?>[ \t]*$/i;
 
 export function stripStandaloneHtmlLines(markdown: string): string {
   return markdown
-    .replace(STANDALONE_HTML_LINE_PATTERN, '')
+    .split('\n')
+    .filter((line) => {
+      if (EXPLICIT_BLANK_PARAGRAPH_LINE_PATTERN.test(line)) return true;
+      return !STANDALONE_HTML_LINE_PATTERN.test(line);
+    })
+    .join('\n')
     .replace(/\n{3,}/g, '\n\n')
     .trimEnd();
 }
@@ -49,7 +59,7 @@ export function stripStandaloneHtmlLines(markdown: string): string {
 export function stripInlineHtmlTags(markdown: string): string {
   return markdown
     .replace(/<!--[\s\S]*?-->/g, '')
-    .replace(INLINE_HTML_TAG_PATTERN, '')
+    .replace(INLINE_HTML_TAG_PATTERN, (tag) => (EXPLICIT_BLANK_PARAGRAPH_LINE_PATTERN.test(tag) ? tag : ''))
     .replace(/\n{3,}/g, '\n\n')
     .trimEnd();
 }
@@ -81,7 +91,11 @@ export function parseMarkdownWithHtmlFallback(
   for (const candidate of candidates) {
     try {
       return {
-        doc: parser.parseMarkdown(candidate.value),
+        doc: parseMarkdownPreservingExplicitBlankParagraphs({
+          markdown: candidate.value,
+          parser: parser.parseMarkdown,
+          schema: parser.schema,
+        }),
         mode: candidate.mode,
         error: null,
       };
@@ -181,12 +195,25 @@ async function buildHeadless(): Promise<HeadlessMilkdown> {
 }
 
 async function getHeadlessMilkdown(): Promise<HeadlessMilkdown> {
+  if (resolvedEngine) return resolvedEngine;
   if (!enginePromise) {
+    const generation = engineGeneration;
     // If initialization fails once, don't permanently poison the singleton with a rejected promise.
-    enginePromise = buildHeadless().catch((error) => {
-      enginePromise = null;
-      throw error;
-    });
+    enginePromise = buildHeadless()
+      .then((engine) => {
+        if (generation !== engineGeneration) {
+          throw new Error('stale_headless_milkdown_initialization');
+        }
+        resolvedEngine = engine;
+        return engine;
+      })
+      .catch((error) => {
+        if (generation === engineGeneration) {
+          enginePromise = null;
+          resolvedEngine = null;
+        }
+        throw error;
+      });
   }
   return enginePromise;
 }
@@ -194,6 +221,25 @@ async function getHeadlessMilkdown(): Promise<HeadlessMilkdown> {
 export async function getHeadlessMilkdownParser(): Promise<HeadlessMilkdownParser> {
   const engine = await getHeadlessMilkdown();
   return { schema: engine.schema, parseMarkdown: engine.parseMarkdown };
+}
+
+export function getHeadlessMilkdownParserIfReady(): HeadlessMilkdownParser | null {
+  if (!resolvedEngine) return null;
+  return {
+    schema: resolvedEngine.schema,
+    parseMarkdown: resolvedEngine.parseMarkdown,
+  };
+}
+
+export async function warmHeadlessMilkdown(): Promise<void> {
+  if (forcedWarmFailureForTests) {
+    throw forcedWarmFailureForTests;
+  }
+  await getHeadlessMilkdown();
+}
+
+export function __setWarmHeadlessMilkdownFailureForTests(error: Error | null): void {
+  forcedWarmFailureForTests = error;
 }
 
 export async function serializeMarkdown(doc: ProseMirrorNode): Promise<string> {
@@ -204,4 +250,29 @@ export async function serializeMarkdown(doc: ProseMirrorNode): Promise<string> {
 export async function serializeSingleNode(node: ProseMirrorNode): Promise<string> {
   const engine = await getHeadlessMilkdown();
   return engine.serializeSingleNode(node);
+}
+
+export function getWarmHeadlessMilkdownParserSync(): HeadlessMilkdownParser | null {
+  if (!resolvedEngine) return null;
+  return {
+    schema: resolvedEngine.schema,
+    parseMarkdown: resolvedEngine.parseMarkdown,
+  };
+}
+
+export function warmHeadlessMilkdownParserInBackground(): void {
+  void getHeadlessMilkdown().catch(() => {
+    // Best-effort warm-up only.
+  });
+}
+
+export async function warmHeadlessMilkdownParser(): Promise<void> {
+  await getHeadlessMilkdown();
+}
+
+export function __unsafeResetHeadlessMilkdownForTests(): void {
+  engineGeneration += 1;
+  enginePromise = null;
+  resolvedEngine = null;
+  forcedWarmFailureForTests = null;
 }

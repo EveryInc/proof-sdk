@@ -10,6 +10,10 @@ import {
   getCollabRuntime,
   invalidateCollabDocument,
   invalidateCollabDocumentAndWait,
+  loadedCollabMarksMatch,
+  preserveMarksOnlyWriteIfAuthoritativeYjsMatches,
+  refreshLoadedCollabMetaFromDb,
+  syncCanonicalDocumentStateToCollab,
   stripEphemeralCollabSpans,
   acquireRewriteLock,
 } from './collab.js';
@@ -39,7 +43,7 @@ import {
   updateMarks,
 } from './db.js';
 import { isShareRole, type ShareRole } from './share-types.js';
-import { broadcastToRoom, closeRoom, getRoomSize } from './ws.js';
+import { broadcastToRoom, closeRoom, getActiveCollabClientBreakdown, getRoomSize } from './ws.js';
 import { runLegacyMarkRangeBackfillOnce } from './marks-range-backfill.js';
 import { createRateLimiter } from './rate-limiter.js';
 import { getCookie, shareTokenCookieName } from './cookies.js';
@@ -1376,6 +1380,8 @@ apiRoutes.put('/documents/:slug', async (req: Request, res: Response) => {
   let didUpdate = false;
   let writeSucceeded = true;
   let updatedDoc = currentDoc;
+  let collabSyncFailed = false;
+  let marksHandledDuringUpdate = false;
   if (hasMarkdownUpdate) {
     didUpdate = true;
     const mutation = await mutateCanonicalDocument({
@@ -1400,7 +1406,54 @@ apiRoutes.put('/documents/:slug', async (req: Request, res: Response) => {
     updatedDoc = mutation.document;
   } else if (hasMarksUpdate) {
     didUpdate = true;
+    const previousCanonicalMarks = canonicalizeStoredMarks(parseJson(currentDoc.marks) as Record<string, unknown>);
     writeSucceeded = updateMarks(slug, normalizedMarks ?? {});
+    if (writeSucceeded) {
+      marksHandledDuringUpdate = true;
+      const collabClientBreakdown = getActiveCollabClientBreakdown(slug);
+      const preserveLiveRoomOnMarksFallback = collabClientBreakdown.anyEpochCount > 0;
+      let syncResult: { applied: boolean; reason?: string } | null = null;
+      try {
+        syncResult = await syncCanonicalDocumentStateToCollab(slug, {
+          marks: normalizedMarks ?? {},
+          source: 'rest-put',
+        });
+      } catch (error) {
+        console.error('[routes] Failed to sync marks-only write into collab runtime:', { slug, error });
+      }
+
+      if (!syncResult?.applied) {
+        const liveRoomAlreadyHasRequestedMarks = loadedCollabMarksMatch(slug, normalizedMarks ?? {});
+        const preservedAuthoritativeMarks = syncResult?.reason === 'fragment_unhealthy_marks_only'
+          ? await preserveMarksOnlyWriteIfAuthoritativeYjsMatches(slug, normalizedMarks ?? {})
+          : false;
+        if (preservedAuthoritativeMarks) {
+          refreshLoadedCollabMetaFromDb(slug);
+        } else {
+          if (
+            preserveLiveRoomOnMarksFallback
+            && syncResult?.reason === 'fragment_unhealthy_marks_only'
+            && !liveRoomAlreadyHasRequestedMarks
+          ) {
+            console.error('[routes] Refused marks-only canonical sync without matching live-authoritative marks', {
+              slug,
+              reason: syncResult.reason,
+            });
+          }
+          const rolledBack = updateMarks(slug, previousCanonicalMarks);
+          if (!rolledBack) {
+            console.error('[routes] Failed to roll back marks-only write after collab sync failure', { slug });
+          }
+          try {
+            await invalidateCollabDocumentAndWait(slug);
+          } catch (error) {
+            console.error('[routes] Failed to fully invalidate collab state after marks-only sync failure', { slug, error });
+          }
+          collabSyncFailed = true;
+          writeSucceeded = false;
+        }
+      }
+    }
   }
   if (hasTitleUpdate) {
     didUpdate = true;
@@ -1411,6 +1464,13 @@ apiRoutes.put('/documents/:slug', async (req: Request, res: Response) => {
     return;
   }
   if (!writeSucceeded) {
+    if (collabSyncFailed) {
+      res.status(503).json({
+        error: 'Failed to synchronize marks with collab state; retry with latest state',
+        code: 'COLLAB_SYNC_FAILED',
+      });
+      return;
+    }
     res.status(409).json({ error: 'Document changed during update; retry with latest state', code: 'STALE_BASE' });
     return;
   }
@@ -1451,7 +1511,7 @@ apiRoutes.put('/documents/:slug', async (req: Request, res: Response) => {
   }
   payload.shareState = updatedDoc.share_state;
 
-  if (!hasMarkdownUpdate) {
+  if (!hasMarkdownUpdate && !marksHandledDuringUpdate) {
     // Marks-only updates still need explicit Yjs synchronization.
     try {
       const collabRuntime = getCollabRuntime();

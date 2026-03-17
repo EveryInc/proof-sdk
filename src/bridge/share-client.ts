@@ -4,6 +4,7 @@
  */
 
 import { executeBridgeCall } from './bridge-executor';
+import { buildShareMutationBaseToken } from './share-mutation-base.js';
 
 export interface ShareDocument {
   slug: string;
@@ -11,6 +12,7 @@ export interface ShareDocument {
   title: string | null;
   markdown: string;
   marks: Record<string, unknown>;
+  readAuthority?: 'authoritative' | 'persisted_recovery';
   shareState?: 'ACTIVE' | 'PAUSED' | 'REVOKED' | 'DELETED';
   createdAt?: string;
   updatedAt?: string;
@@ -37,7 +39,15 @@ export interface CollabSessionInfo {
 export interface ShareOpenContext {
   success: boolean;
   collabAvailable?: boolean;
+  code?: string;
+  retryAfterMs?: number | null;
+  requestId?: string | null;
   snapshotUrl?: string | null;
+  mutationBase?: {
+    token?: string;
+    source?: string;
+    schemaVersion?: number;
+  } | null;
   doc: ShareDocument & {
     active?: boolean;
   };
@@ -68,6 +78,7 @@ export type ShareRequestError = {
     code: string;
     message: string;
     retryAfterMs?: number | null;
+    requestId?: string | null;
   };
 };
 
@@ -81,6 +92,7 @@ type CollabUnavailablePayload = {
   snapshotUrl: string | null;
   code?: string;
   retryAfterMs?: number | null;
+  requestId?: string | null;
 };
 
 export interface AccessLinkResponse {
@@ -101,7 +113,18 @@ type ShareMutationBase = {
   baseUpdatedAt?: string;
 };
 
+type KeepaliveMutationBaseOptions = {
+  allowLocalBaseToken?: boolean;
+};
+
+type KeepaliveMutationBaseSelection = {
+  base: ShareMutationBase | null;
+  reusedObservedBase: boolean;
+};
+
 export type ShareEventHandler = (message: Record<string, unknown>) => void;
+export type ShareSocketState = 'connecting' | 'connected' | 'disconnected';
+type ShareConnectionStateHandler = (state: ShareSocketState) => void;
 
 const MUTATION_BASE_STATE_RETRY_ATTEMPTS = 4;
 const MUTATION_BASE_STATE_RETRY_DELAY_MS = 100;
@@ -118,6 +141,8 @@ export class ShareClient {
   private clientId: string | null = null;
   private ws: WebSocket | null = null;
   private eventHandlers: ShareEventHandler[] = [];
+  private connectionStateHandlers: ShareConnectionStateHandler[] = [];
+  private connectionState: ShareSocketState = 'disconnected';
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private viewerName: string | null = null;
   private reconnectDelay = 1000;
@@ -125,12 +150,18 @@ export class ShareClient {
   private clientVersion = '0.31.0';
   private clientBuild = 'web';
   private clientProtocol = '3';
+  private lastObservedUpdatedAt: string | null = null;
+  private lastObservedMutationBase: ShareMutationBase | null = null;
+  private mutationAccessEpoch: number | null = null;
 
   constructor() {
     this.detectShareMode();
   }
 
   private detectShareMode(): void {
+    this.lastObservedUpdatedAt = null;
+    this.lastObservedMutationBase = null;
+    this.mutationAccessEpoch = null;
     const proofConfig = (window as Window & {
       __PROOF_CONFIG__?: {
         shareSlug?: string;
@@ -188,6 +219,25 @@ export class ShareClient {
       : '3';
   }
 
+  private rememberObservedDocument(doc: { updatedAt?: string | undefined } | null | undefined): void {
+    if (typeof doc?.updatedAt === 'string' && doc.updatedAt.trim().length > 0) {
+      this.lastObservedUpdatedAt = doc.updatedAt.trim();
+    }
+  }
+
+  private rememberObservedMutationBase(payload: Record<string, unknown> | null | undefined): void {
+    const base = this.extractMutationBase(payload ?? null);
+    if (base) {
+      this.lastObservedMutationBase = base;
+    }
+  }
+
+  private rememberAccessEpoch(accessEpoch: unknown): void {
+    if (typeof accessEpoch === 'number' && Number.isFinite(accessEpoch)) {
+      this.mutationAccessEpoch = Math.max(0, Math.trunc(accessEpoch));
+    }
+  }
+
   isShareMode(): boolean {
     return this.slug !== null;
   }
@@ -243,6 +293,7 @@ export class ShareClient {
   }
 
   private async parseRequestError(response: Response): Promise<ShareRequestError> {
+    const requestId = this.readRequestId(response);
     const body = await response.json().catch(() => ({} as {
       error?: unknown;
       code?: unknown;
@@ -263,14 +314,32 @@ export class ShareClient {
         code,
         message,
         retryAfterMs,
+        requestId,
       },
     };
+  }
+
+  private readRequestId(response: Response): string | null {
+    const requestId = response.headers.get('x-request-id') ?? response.headers.get('X-Request-Id');
+    return requestId && requestId.trim().length > 0 ? requestId.trim() : null;
   }
 
   private createLocalRequestError(status: number, code: string, message: string): ShareRequestError {
     return {
       error: { status, code, message, retryAfterMs: null },
     };
+  }
+
+  private setConnectionState(state: ShareSocketState): void {
+    if (this.connectionState === state) return;
+    this.connectionState = state;
+    for (const handler of [...this.connectionStateHandlers]) {
+      handler(state);
+    }
+  }
+
+  getConnectionState(): ShareSocketState {
+    return this.connectionState;
   }
 
   private parseShareMarkMutationResponse(payload: Record<string, unknown> | null): ShareMarkMutationResponse {
@@ -404,7 +473,10 @@ export class ShareClient {
 
       const payload = await response.json().catch(() => null) as Record<string, unknown> | null;
       const base = this.extractMutationBase(payload);
-      if (base) return base;
+      if (base) {
+        this.lastObservedMutationBase = base;
+        return base;
+      }
       if (attempt < (MUTATION_BASE_STATE_RETRY_ATTEMPTS - 1)) {
         await sleep(MUTATION_BASE_STATE_RETRY_DELAY_MS);
       }
@@ -464,11 +536,14 @@ export class ShareClient {
   /**
    * Fetch the shared document from the server
    */
-  async fetchDocument(): Promise<ShareDocument | null> {
+  async fetchDocument(options?: { preferPersisted?: boolean }): Promise<ShareDocument | null> {
     if (!this.slug) return null;
 
     try {
-      const response = await fetch(`${this.getApiBase()}/documents/${this.slug}`, {
+      const documentPath = options?.preferPersisted === true
+        ? `/documents/${this.slug}/recovery`
+        : `/documents/${this.slug}`;
+      const response = await fetch(`${this.getApiBase()}${documentPath}`, {
         headers: this.getShareAuthHeaders(),
       });
       if (!response.ok) {
@@ -477,7 +552,12 @@ export class ShareClient {
         }
         throw new Error(`Failed to fetch document: ${response.status}`);
       }
-      return await response.json();
+      const payload = await response.json() as ShareDocument;
+      if (options?.preferPersisted !== true) {
+        this.rememberObservedDocument(payload);
+        this.rememberObservedMutationBase(payload as Record<string, unknown>);
+      }
+      return payload;
     } catch (error) {
       console.error('[ShareClient] Failed to fetch document:', error);
       throw error;
@@ -500,6 +580,8 @@ export class ShareClient {
     });
     if (!response.ok) return this.parseRequestError(response);
     const payload = await response.json() as { success?: boolean; title?: string | null; updatedAt?: string };
+    this.rememberObservedDocument(payload);
+    this.rememberObservedMutationBase(payload as Record<string, unknown>);
     return {
       success: payload.success === true,
       title: typeof payload.title === 'string' ? payload.title : null,
@@ -525,9 +607,16 @@ export class ShareClient {
       return {
         collabAvailable: false,
         snapshotUrl: payload.snapshotUrl ?? null,
+        code: typeof payload.code === 'string' ? payload.code : undefined,
+        retryAfterMs: typeof payload.retryAfterMs === 'number' && Number.isFinite(payload.retryAfterMs)
+          ? Math.max(0, Math.trunc(payload.retryAfterMs))
+          : null,
+        requestId: this.readRequestId(response),
       };
     }
     if (!this.isCollabSessionInfo(payload.session) || !payload.capabilities) return null;
+    this.rememberAccessEpoch(payload.session.accessEpoch);
+    this.rememberObservedMutationBase(payload as unknown as Record<string, unknown>);
     return {
       session: payload.session,
       capabilities: payload.capabilities,
@@ -542,6 +631,10 @@ export class ShareClient {
     const payload = await response.json() as ShareOpenContext;
     if (!payload?.doc || !payload?.capabilities) return null;
     if (payload.session && !this.isCollabSessionInfo(payload.session)) return null;
+    payload.requestId = this.readRequestId(response);
+    this.rememberObservedDocument(payload.doc);
+    this.rememberAccessEpoch(payload.session?.accessEpoch);
+    this.rememberObservedMutationBase(payload as unknown as Record<string, unknown>);
     return payload;
   }
 
@@ -606,6 +699,11 @@ export class ShareClient {
       return {
         collabAvailable: false,
         snapshotUrl: payload.snapshotUrl ?? null,
+        code: typeof payload.code === 'string' ? payload.code : undefined,
+        retryAfterMs: typeof payload.retryAfterMs === 'number' && Number.isFinite(payload.retryAfterMs)
+          ? Math.max(0, Math.trunc(payload.retryAfterMs))
+          : null,
+        requestId: this.readRequestId(response),
       };
     }
     if (!this.isCollabSessionInfo(payload.session) || !payload.capabilities) return null;
@@ -784,6 +882,55 @@ export class ShareClient {
     return result.success === true;
   }
 
+  private async buildKeepaliveMutationBase(
+    markdown: string,
+    marks: Record<string, unknown>,
+    options?: KeepaliveMutationBaseOptions,
+  ): Promise<KeepaliveMutationBaseSelection> {
+    const allowLocalBaseToken = options?.allowLocalBaseToken !== false;
+    if (allowLocalBaseToken && this.mutationAccessEpoch !== null) {
+      const baseToken = await buildShareMutationBaseToken({
+        markdown,
+        marks,
+        accessEpoch: this.mutationAccessEpoch,
+      });
+      if (baseToken) {
+        return {
+          base: { baseToken },
+          reusedObservedBase: false,
+        };
+      }
+    }
+    if (this.lastObservedMutationBase?.baseToken) {
+      return {
+        base: { baseToken: this.lastObservedMutationBase.baseToken },
+        reusedObservedBase: true,
+      };
+    }
+    if (typeof this.lastObservedMutationBase?.baseRevision === 'number') {
+      return {
+        base: { baseRevision: this.lastObservedMutationBase.baseRevision },
+        reusedObservedBase: true,
+      };
+    }
+    if (typeof this.lastObservedMutationBase?.baseUpdatedAt === 'string') {
+      return {
+        base: { baseUpdatedAt: this.lastObservedMutationBase.baseUpdatedAt },
+        reusedObservedBase: true,
+      };
+    }
+    if (this.lastObservedUpdatedAt) {
+      return {
+        base: { baseUpdatedAt: this.lastObservedUpdatedAt },
+        reusedObservedBase: false,
+      };
+    }
+    return {
+      base: null,
+      reusedObservedBase: false,
+    };
+  }
+
   /**
    * Push marks update to server
    */
@@ -820,11 +967,16 @@ export class ShareClient {
     markdown: string,
     marks: Record<string, unknown>,
     actor: string,
-    options?: { keepalive?: boolean },
+    options?: { keepalive?: boolean; allowLocalKeepaliveBaseToken?: boolean },
   ): Promise<boolean> {
     if (!this.slug) return false;
 
     try {
+      const keepaliveBase = options?.keepalive
+        ? await this.buildKeepaliveMutationBase(markdown, marks, {
+          allowLocalBaseToken: options.allowLocalKeepaliveBaseToken,
+        })
+        : { base: null, reusedObservedBase: false };
       const response = await fetch(`${this.getApiBase()}/documents/${this.slug}`, {
         method: 'PUT',
         headers: {
@@ -832,8 +984,17 @@ export class ShareClient {
           ...this.getShareAuthHeaders(),
         },
         keepalive: Boolean(options?.keepalive),
-        body: JSON.stringify({ markdown, marks, actor, clientId: this.clientId }),
+        body: JSON.stringify({ markdown, marks, actor, clientId: this.clientId, ...keepaliveBase.base }),
       });
+      const payload = await response.json().catch(() => null) as Record<string, unknown> | null;
+      this.rememberObservedDocument(payload);
+      this.rememberObservedMutationBase(payload);
+      if (response.ok && keepaliveBase.reusedObservedBase) {
+        const nextBase = this.extractMutationBase(payload);
+        if (!nextBase) {
+          this.lastObservedMutationBase = null;
+        }
+      }
       return response.ok;
     } catch (error) {
       console.error('[ShareClient] Failed to push update:', error);
@@ -846,11 +1007,17 @@ export class ShareClient {
    */
   connectWebSocket(): void {
     if (!this.slug) return;
-    if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.setConnectionState('connected');
+      return;
+    }
+    if (this.ws?.readyState === WebSocket.CONNECTING) {
+      this.setConnectionState('connecting');
       return;
     }
     const wsToken = this.shareToken?.trim() || '';
     if (!wsToken) {
+      this.setConnectionState('disconnected');
       console.warn('[ShareClient] Skipping WebSocket connection because no share token is available.');
       return;
     }
@@ -858,14 +1025,19 @@ export class ShareClient {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const wsUrl = `${protocol}//${window.location.host}/ws?slug=${encodeURIComponent(this.slug)}&token=${encodeURIComponent(wsToken)}`;
 
-    this.ws = new WebSocket(wsUrl);
+    const socket = new WebSocket(wsUrl);
+    this.ws = socket;
+    this.setConnectionState('connecting');
 
-    this.ws.onopen = () => {
+    socket.onopen = () => {
+      if (this.ws !== socket) return;
       console.log('[ShareClient] WebSocket connected');
       this.reconnectDelay = 1000;
+      this.setConnectionState('connected');
     };
 
-    this.ws.onmessage = (event) => {
+    socket.onmessage = (event) => {
+      if (this.ws !== socket) return;
       try {
         const message = JSON.parse(event.data);
 
@@ -897,12 +1069,16 @@ export class ShareClient {
       }
     };
 
-    this.ws.onclose = () => {
+    socket.onclose = () => {
+      if (this.ws !== socket) return;
+      this.ws = null;
       console.log('[ShareClient] WebSocket disconnected');
+      this.setConnectionState('disconnected');
       this.scheduleReconnect();
     };
 
-    this.ws.onerror = (error) => {
+    socket.onerror = (error) => {
+      if (this.ws !== socket) return;
       console.error('[ShareClient] WebSocket error:', error);
     };
   }
@@ -981,6 +1157,14 @@ export class ShareClient {
     };
   }
 
+  onConnectionStateChange(handler: ShareConnectionStateHandler): () => void {
+    this.connectionStateHandlers.push(handler);
+    handler(this.connectionState);
+    return () => {
+      this.connectionStateHandlers = this.connectionStateHandlers.filter((entry) => entry !== handler);
+    };
+  }
+
   reportCollabReconnect(durationMs: number, source: string = 'web'): void {
     if (!Number.isFinite(durationMs) || durationMs < 0) return;
     this.postMetric('collab-reconnect', {
@@ -1005,10 +1189,12 @@ export class ShareClient {
       this.reconnectTimer = null;
     }
     if (this.ws) {
-      this.ws.onclose = null; // prevent reconnect
-      this.ws.close();
+      const socket = this.ws;
       this.ws = null;
+      socket.onclose = null; // prevent reconnect
+      socket.close();
     }
+    this.setConnectionState('disconnected');
   }
 }
 

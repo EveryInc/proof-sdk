@@ -10,14 +10,17 @@ import {
   getDb,
   getDocumentBySlug,
   getDocumentProjectionBySlug,
+  getAccumulatedYUpdateBytesAfter,
   getLatestYSnapshot,
   getLatestYStateVersion,
+  pruneObsoleteYHistory,
   getYUpdatesAtOrAfter,
   getYUpdatesAfter,
   replaceDocumentProjection,
   rebuildDocumentBlocks,
   OversizedYjsUpdateError,
   saveYSnapshot,
+  updateYStateBlob,
   type DocumentRow,
 } from './db.js';
 import {
@@ -37,6 +40,7 @@ import {
   loadCanonicalYDoc,
   noteDocumentIntegrityWarning,
   queueProjectionRepair,
+  quarantineCorruptPersistedYjsState,
   quarantineOversizedYjsUpdate,
   registerCanonicalYDocPersistence,
   resolveAuthoritativeMutationBase,
@@ -46,23 +50,32 @@ import {
 import { getHeadlessMilkdownParser, parseMarkdownWithHtmlFallback, serializeMarkdown } from './milkdown-headless.js';
 import {
   buildProofSpanReplacementMap,
+  stripProofSpanTags,
   stripAllProofSpanTagsWithReplacements,
 } from './proof-span-strip.js';
 import {
   extractAuthoredMarksFromDoc,
+  extractAuthoredMarksFromMarkdown,
   synchronizeAuthoredMarks,
 } from './proof-authored-mark-sync.js';
-import { estimateTopLevelBlockCount, summarizeDocumentIntegrity } from './document-integrity.js';
+import {
+  analyzeRepeatedStructureDelta,
+  estimateTopLevelBlockCount,
+  summarizeDocumentIntegrity,
+} from './document-integrity.js';
 import { recordProjectionRepair } from './metrics.js';
 import { isHostedRewriteEnvironment } from './rewrite-policy.js';
 import { refreshSnapshotForSlug } from './snapshot.js';
 import { pauseDocumentAndPropagate } from './share-state.js';
 import { getActiveCollabClientBreakdown, getActiveCollabClientCount } from './ws.js';
+import { extractMarks } from '../src/formats/marks.js';
+import { restoreStandaloneBlankParagraphLines } from '../src/editor/explicit-blank-paragraphs.js';
 
 type PersistedCanonicalState = {
   ydoc: Y.Doc;
   stateVector: Uint8Array;
   yStateVersion: number;
+  degradedReason: 'corrupt_persisted_yjs_state' | null;
 };
 
 type CanonicalMutationArgs = {
@@ -114,6 +127,8 @@ const RUNAWAY_BLOCK_GUARD_BASELINE_MIN_TOP_LEVEL_BLOCKS = 2_000;
 const RUNAWAY_BLOCK_GUARD_GROWTH_MULTIPLIER = 2;
 const HOSTED_LIVE_DOC_GRACE_MS = parsePositiveInt(process.env.HOSTED_LIVE_DOC_GRACE_MS, 1500);
 const HOSTED_LIVE_DOC_GRACE_POLL_MS = parsePositiveInt(process.env.HOSTED_LIVE_DOC_GRACE_POLL_MS, 100);
+const DEFAULT_CANONICAL_COMPACTION_MAX_BYTES = 500_000;
+const onDemandProjectionRecoveryInFlight = new Map<string, Promise<CanonicalReadableDocument | DocumentRow | undefined>>();
 
 type RunawayCanonicalWriteGuardResult = {
   blocked: true;
@@ -125,6 +140,16 @@ type RunawayCanonicalWriteGuardResult = {
 } | {
   blocked: false;
 };
+
+let beforeCanonicalApplyHookForTests:
+  | null
+  | ((args: { slug: string; source: string; hasBaseToken: boolean; liveRequired: boolean }) => Promise<void> | void) = null;
+
+export function __setBeforeCanonicalApplyHookForTests(
+  hook: typeof beforeCanonicalApplyHookForTests,
+): void {
+  beforeCanonicalApplyHookForTests = hook;
+}
 
 function evaluateRunawayCanonicalWriteGuard(
   baselineMarkdown: string,
@@ -201,6 +226,68 @@ function shouldDeferOnDemandProjectionRepair(
   return false;
 }
 
+function buildDeferredCanonicalRowFallback(
+  current: CanonicalReadableDocument | DocumentRow,
+  canonicalRow: DocumentRow,
+): CanonicalReadableDocument {
+  const projection = current as Partial<CanonicalReadableDocument>;
+  return {
+    ...canonicalRow,
+    plain_text: typeof projection.plain_text === 'string' ? projection.plain_text : canonicalRow.markdown,
+    projection_health: projection.projection_health ?? 'projection_stale',
+    projection_revision: projection.projection_revision ?? null,
+    projection_y_state_version: projection.projection_y_state_version ?? null,
+    projection_updated_at: projection.projection_updated_at ?? null,
+    projection_fresh: false,
+    mutation_ready: true,
+    repair_pending: true,
+    read_source: 'canonical_row',
+  };
+}
+
+async function buildVerifiedHealthyProjectionReadableDocument(
+  slug: string,
+  canonicalRow: DocumentRow,
+  projection: ReturnType<typeof getDocumentProjectionBySlug>,
+): Promise<CanonicalReadableDocument | null> {
+  if (!projection) return null;
+  if (projection.health !== 'healthy') return null;
+  if (projection.y_state_version !== canonicalRow.y_state_version) return null;
+  const authoritativeBase = await resolveAuthoritativeMutationBase(slug, {
+    liveRequired: false,
+  });
+  if (!authoritativeBase.ok) return null;
+  if (stripEphemeralCollabSpans(projection.markdown ?? '') !== stripEphemeralCollabSpans(authoritativeBase.base.markdown)) {
+    return null;
+  }
+  if (stableStringify(parseMarks(projection.marks_json)) !== stableStringify(authoritativeBase.base.marks)) {
+    return null;
+  }
+  return {
+    ...canonicalRow,
+    markdown: projection.markdown,
+    marks: projection.marks_json,
+    plain_text: projection.plain_text,
+    projection_health: projection.health,
+    projection_revision: projection.revision,
+    projection_y_state_version: projection.y_state_version,
+    projection_updated_at: projection.updated_at,
+    projection_fresh: true,
+    mutation_ready: true,
+    repair_pending: false,
+    read_source: 'projection',
+  };
+}
+
+function shouldPreserveDeferredAuthoritativeFallback(
+  source: ProjectionRecoverySource,
+  current: CanonicalReadableDocument | DocumentRow | undefined,
+): current is CanonicalReadableDocument {
+  if (!current || !('read_source' in current)) return false;
+  if (current.read_source !== 'yjs_fallback') return false;
+  return source === 'share' || source === 'snapshot';
+}
+
 async function waitForHostedLiveLeaseMaterialization(
   slug: string,
 ): Promise<ReturnType<typeof getActiveCollabClientBreakdown>> {
@@ -251,6 +338,16 @@ function stableSortValue(value: unknown): unknown {
 
 function stableStringify(value: unknown): string {
   return JSON.stringify(stableSortValue(value));
+}
+
+function normalizeStoredMarkdownSnapshot(markdown: string): string {
+  const normalized = markdown.replace(/\r\n/g, '\n').trimEnd();
+  return normalized.length > 0 ? `${normalized}\n` : '';
+}
+
+function shouldPreserveRichMarkdownSnapshot(markdown: string): boolean {
+  return /<br\s*\/?>/i.test(markdown)
+    || /data-proof\s*=/.test(markdown);
 }
 
 function normalizeFragmentPlainText(input: string): string {
@@ -308,6 +405,31 @@ function normalizeProjectionPlainText(markdown: string): string {
     .trim();
 }
 
+function normalizeRichProjectionVisibleText(markdown: string): string {
+  return markdown
+    .replace(/<br\s*\/?>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function hasRichProjectionStructure(markdown: string): boolean {
+  return /<br\s*\/?>/i.test(markdown)
+    || /data-proof\s*=/.test(markdown);
+}
+
+function preferEquivalentRichMarkdown(
+  derivedMarkdown: string,
+  authoritativeMarkdown: string,
+): string {
+  if (!hasRichProjectionStructure(authoritativeMarkdown)) return derivedMarkdown;
+  if (hasRichProjectionStructure(derivedMarkdown)) return derivedMarkdown;
+  if (normalizeRichProjectionVisibleText(derivedMarkdown) !== normalizeRichProjectionVisibleText(authoritativeMarkdown)) {
+    return derivedMarkdown;
+  }
+  return authoritativeMarkdown;
+}
+
 function applyYTextDiff(target: Y.Text, nextValue: string): void {
   const currentValue = target.toString();
   if (currentValue === nextValue) return;
@@ -360,7 +482,7 @@ function seedFragmentFromLegacyMarkdownFallback(ydoc: Y.Doc, markdown: string): 
   if (fragment.length > 0) {
     fragment.delete(0, fragment.length);
   }
-  const blocks = markdown
+  const blocks = normalizeLegacyMarkdownForFragmentSeed(markdown)
     .split(/\n{2,}/)
     .map((block) => block.trim())
     .filter(Boolean);
@@ -370,6 +492,11 @@ function seedFragmentFromLegacyMarkdownFallback(ydoc: Y.Doc, markdown: string): 
   }
   const nodes: Y.XmlElement[] = [];
   for (const block of blocks) {
+    if (/^<br\s*\/?>$/i.test(block)) {
+      nodes.push(new Y.XmlElement('paragraph'));
+      continue;
+    }
+
     const headingMatch = block.match(/^(#{1,6})\s+([\s\S]+)$/);
     if (headingMatch) {
       const heading = new Y.XmlElement('heading');
@@ -389,10 +516,14 @@ function seedFragmentFromLegacyMarkdownFallback(ydoc: Y.Doc, markdown: string): 
   fragment.insert(0, nodes);
 }
 
+function normalizeLegacyMarkdownForFragmentSeed(markdown: string): string {
+  return restoreStandaloneBlankParagraphLines(stripProofSpanTags(markdown));
+}
+
 async function seedFragmentFromLegacyMarkdown(ydoc: Y.Doc, markdown: string): Promise<void> {
   try {
     const parser = await getHeadlessMilkdownParser();
-    const parsed = parseMarkdownWithHtmlFallback(parser, markdown);
+    const parsed = parseMarkdownWithHtmlFallback(parser, normalizeLegacyMarkdownForFragmentSeed(markdown));
     if (parsed.doc) {
       replaceYXmlFragment(ydoc.getXmlFragment('prosemirror'), parsed.doc);
       return;
@@ -409,24 +540,87 @@ async function seedFragmentFromLegacyMarkdown(ydoc: Y.Doc, markdown: string): Pr
   seedFragmentFromLegacyMarkdownFallback(ydoc, markdown);
 }
 
+async function recoverLegacyAuthoredMarks(
+  markdown: string,
+  marks: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  const hasAuthoredSpans = markdown.includes('data-proof="authored"') || markdown.includes("data-proof='authored'");
+  if (!hasAuthoredSpans) return marks;
+
+  const extractedAuthoredMarks = await extractAuthoredMarksFromMarkdown(markdown).catch(() => null);
+  if (!extractedAuthoredMarks || Object.keys(extractedAuthoredMarks).length === 0) {
+    return marks;
+  }
+  return synchronizeAuthoredMarks(marks, extractedAuthoredMarks, { preserveExistingAnchors: true });
+}
+
+async function buildLegacyCanonicalState(
+  doc: DocumentRow,
+  yStateVersion: number = doc.y_state_version ?? 0,
+): Promise<PersistedCanonicalState> {
+  const ydoc = new Y.Doc();
+  const rawMarkdown = doc.markdown ?? '';
+  const markdown = stripEphemeralCollabSpans(rawMarkdown);
+  const marks = await recoverLegacyAuthoredMarks(rawMarkdown, parseMarks(doc.marks));
+  ydoc.transact(() => {
+    ydoc.getText('markdown').insert(0, markdown);
+    applyMarksMapDiff(ydoc.getMap('marks'), marks);
+  }, 'legacy-baseline');
+  await seedFragmentFromLegacyMarkdown(ydoc, rawMarkdown);
+  return {
+    ydoc,
+    stateVector: Y.encodeStateVector(ydoc),
+    yStateVersion: Math.max(yStateVersion, doc.y_state_version ?? 0),
+    degradedReason: null,
+  };
+}
+
 async function buildPersistedCanonicalState(doc: DocumentRow): Promise<PersistedCanonicalState> {
   const ydoc = new Y.Doc();
+  const latestYStateVersion = getLatestYStateVersion(doc.slug);
   const snapshot = getLatestYSnapshot(doc.slug);
   const updates = snapshot
     ? getYUpdatesAtOrAfter(doc.slug, snapshot.version)
     : getYUpdatesAfter(doc.slug, 0);
   if (snapshot) {
-    Y.applyUpdate(ydoc, snapshot.snapshot);
+    try {
+      Y.applyUpdate(ydoc, snapshot.snapshot);
+    } catch (error) {
+      const fallbackDoc = quarantineCorruptPersistedYjsState(doc.slug, {
+        surface: 'canonical_mutation',
+        stage: 'snapshot',
+        error,
+        row: doc,
+        yStateVersion: latestYStateVersion,
+        seq: snapshot.version,
+        bytes: snapshot.snapshot.byteLength,
+      }) ?? doc;
+      return {
+        ...(await buildLegacyCanonicalState(fallbackDoc, latestYStateVersion)),
+        degradedReason: 'corrupt_persisted_yjs_state',
+      };
+    }
   } else if (updates.length === 0) {
-    const markdown = stripEphemeralCollabSpans(doc.markdown ?? '');
-    ydoc.transact(() => {
-      ydoc.getText('markdown').insert(0, markdown);
-      applyMarksMapDiff(ydoc.getMap('marks'), parseMarks(doc.marks));
-    }, 'legacy-baseline');
-    await seedFragmentFromLegacyMarkdown(ydoc, markdown);
+    return buildLegacyCanonicalState(doc, latestYStateVersion);
   }
   for (const update of updates) {
-    Y.applyUpdate(ydoc, update.update);
+    try {
+      Y.applyUpdate(ydoc, update.update);
+    } catch (error) {
+      const fallbackDoc = quarantineCorruptPersistedYjsState(doc.slug, {
+        surface: 'canonical_mutation',
+        stage: 'update',
+        error,
+        row: doc,
+        yStateVersion: latestYStateVersion,
+        seq: update.seq,
+        bytes: update.update.byteLength,
+      }) ?? doc;
+      return {
+        ...(await buildLegacyCanonicalState(fallbackDoc, latestYStateVersion)),
+        degradedReason: 'corrupt_persisted_yjs_state',
+      };
+    }
   }
   return {
     ydoc,
@@ -435,7 +629,8 @@ async function buildPersistedCanonicalState(doc: DocumentRow): Promise<Persisted
     // which causes encodeStateAsUpdate to treat all content as new inserts, leading to
     // content duplication when the delta is applied on top of the original snapshot.
     stateVector: Y.encodeStateVector(ydoc),
-    yStateVersion: getLatestYStateVersion(doc.slug),
+    yStateVersion: latestYStateVersion,
+    degradedReason: null,
   };
 }
 
@@ -543,9 +738,10 @@ export async function deriveProjectionFromCanonicalDoc(
     ydoc.getXmlFragment('prosemirror') as any,
     parser.schema as any,
   ) as ProseMirrorNode;
-  const markdown = await serializeMarkdown(root);
+  const derivedMarkdown = stripEphemeralCollabSpans(await serializeMarkdown(root));
+  const authoritativeMarkdown = stripEphemeralCollabSpans(ydoc.getText('markdown').toString());
   return {
-    markdown: stripEphemeralCollabSpans(markdown),
+    markdown: preferEquivalentRichMarkdown(derivedMarkdown, authoritativeMarkdown),
     marks: encodeMarksMap(ydoc.getMap('marks')),
   };
 }
@@ -595,7 +791,8 @@ export async function mutateCanonicalDocument(args: CanonicalMutationArgs): Prom
     };
   }
 
-  const sanitizedMarkdown = stripEphemeralCollabSpans(args.nextMarkdown ?? '');
+  const extractedInput = extractMarks(stripEphemeralCollabSpans(args.nextMarkdown ?? ''));
+  const sanitizedMarkdown = stripEphemeralCollabSpans(extractedInput.content ?? '');
   const hasExplicitNextMarks = args.nextMarks !== undefined;
   const nextMarks = hasExplicitNextMarks ? args.nextMarks : {};
   const collabRuntimeEnabled = getCollabRuntime().enabled;
@@ -642,7 +839,6 @@ export async function mutateCanonicalDocument(args: CanonicalMutationArgs): Prom
     && activeCollabClients === 0;
   let initialBaseResolution = await resolveAuthoritativeMutationBase(args.slug, {
     liveRequired,
-    preferProjection: false,
   });
   if (!initialBaseResolution.ok && liveRequired && hostedRuntime) {
     collabClientBreakdown = await waitForHostedLiveLeaseMaterialization(args.slug);
@@ -652,10 +848,18 @@ export async function mutateCanonicalDocument(args: CanonicalMutationArgs): Prom
     liveRequired = strictLiveDocRequested && activeCollabClients > 0;
     initialBaseResolution = await resolveAuthoritativeMutationBase(args.slug, {
       liveRequired,
-      preferProjection: false,
     });
   }
   if (!initialBaseResolution.ok) {
+    if (initialBaseResolution.reason === 'persisted_yjs_corrupt') {
+      return {
+        ok: false,
+        status: 409,
+        code: 'PERSISTED_YJS_CORRUPT',
+        error: 'Persisted collaborative state is corrupt; document is quarantined until repair',
+        retryWithState: `/api/agent/${args.slug}/state`,
+      };
+    }
     return initialBaseResolution.reason === 'missing_document'
       ? { ok: false, status: 404, code: 'NOT_FOUND', error: 'Document not found' }
       : {
@@ -678,9 +882,7 @@ export async function mutateCanonicalDocument(args: CanonicalMutationArgs): Prom
   let handle = await loadCanonicalYDoc(args.slug, { liveRequired });
   if (!handle && liveRequired && hostedRuntime) {
     collabClientBreakdown = await waitForHostedLiveLeaseMaterialization(args.slug);
-    activeCollabClients = strictLiveDocRequested
-      ? collabClientBreakdown.total
-      : collabClientBreakdown.anyEpochCount;
+    activeCollabClients = collabClientBreakdown.anyEpochCount;
     liveRequired = strictLiveDocRequested && activeCollabClients > 0;
     handle = await loadCanonicalYDoc(args.slug, { liveRequired });
   }
@@ -705,26 +907,75 @@ export async function mutateCanonicalDocument(args: CanonicalMutationArgs): Prom
       error: 'Failed to parse markdown into the canonical fragment',
     };
   }
-  const authoritativeNextMarkdown = stripEphemeralCollabSpans(await serializeMarkdown(parsedNext.doc));
+  const serializedNextMarkdown = stripEphemeralCollabSpans(await serializeMarkdown(parsedNext.doc));
 
   let authoritativeMarkdown = stripEphemeralCollabSpans(initialBaseResolution.base.markdown);
   let authoritativeMarks = stripAuthoredMarks(initialBaseResolution.base.marks);
+  let structuralBaselineMarkdown = authoritativeMarkdown;
   const persistedState = await buildPersistedCanonicalState(doc);
-  const ydoc = handle.ydoc;
-  const currentMutationBase = initialBaseResolution.base;
-  if (baseToken && currentMutationBase.token !== baseToken) {
-    await handle.cleanup?.();
+  if (persistedState.degradedReason === 'corrupt_persisted_yjs_state') {
     return {
       ok: false,
       status: 409,
-      code: 'STALE_BASE',
-      error: 'Document changed since baseToken',
+      code: 'PERSISTED_YJS_CORRUPT',
+      error: 'Persisted collaborative state is corrupt; document is quarantined until repair',
       retryWithState: `/api/agent/${args.slug}/state`,
     };
+  }
+  const ydoc = handle.ydoc;
+  const currentMutationBase = initialBaseResolution.base;
+  const revalidateLiveBaseBeforeApply = liveRequired;
+  if (beforeCanonicalApplyHookForTests) {
+    await beforeCanonicalApplyHookForTests({
+      slug: args.slug,
+      source: args.source,
+      hasBaseToken: Boolean(baseToken),
+      liveRequired,
+    });
+  }
+  if (revalidateLiveBaseBeforeApply) {
+    const currentBaseResolution = await resolveAuthoritativeMutationBase(args.slug, {
+      liveRequired,
+    });
+    if (!currentBaseResolution.ok) {
+      if (currentBaseResolution.reason === 'persisted_yjs_corrupt') {
+        return {
+          ok: false,
+          status: 409,
+          code: 'PERSISTED_YJS_CORRUPT',
+          error: 'Persisted collaborative state is corrupt; document is quarantined until repair',
+          retryWithState: `/api/agent/${args.slug}/state`,
+        };
+      }
+      return currentBaseResolution.reason === 'missing_document'
+        ? { ok: false, status: 404, code: 'NOT_FOUND', error: 'Document not found' }
+        : {
+            ok: false,
+            status: 409,
+            code: 'LIVE_DOC_UNAVAILABLE',
+            error: 'Live canonical document is unavailable; retry after refreshing state',
+          retryWithState: `/api/agent/${args.slug}/state`,
+        };
+    }
+    const currentBaseToken = currentBaseResolution.base.token;
+    const expectedBaseToken = baseToken ?? currentMutationBase.token;
+    if (currentBaseToken !== expectedBaseToken) {
+      await handle.cleanup?.();
+      return {
+        ok: false,
+        status: 409,
+        code: 'STALE_BASE',
+        error: baseToken ? 'Document changed since baseToken' : 'Document changed during mutation',
+        retryWithState: `/api/agent/${args.slug}/state`,
+      };
+    }
   }
   const nextMarksBase = hasExplicitNextMarks ? nextMarks : authoritativeMarks;
   const authoredMarks = extractAuthoredMarksFromDoc(parsedNext.doc as ProseMirrorNode, parser.schema as Schema);
   const effectiveNextMarks = synchronizeAuthoredMarks(nextMarksBase, authoredMarks);
+  const authoritativeNextMarkdown = shouldPreserveRichMarkdownSnapshot(sanitizedMarkdown)
+    ? normalizeStoredMarkdownSnapshot(sanitizedMarkdown)
+    : serializedNextMarkdown;
 
   try {
     if (liveRequired && currentMutationBase.source !== 'live_yjs') {
@@ -748,9 +999,24 @@ export async function mutateCanonicalDocument(args: CanonicalMutationArgs): Prom
       }
     }
 
+    if (currentMutationBase.source === 'live_yjs' || currentMutationBase.source === 'persisted_yjs') {
+      try {
+        const currentRoot = yXmlFragmentToProseMirrorRootNode(
+          ydoc.getXmlFragment('prosemirror') as any,
+          parser.schema as any,
+        ) as ProseMirrorNode;
+        const fragmentComparableBaseline = await serializeMarkdown(currentRoot);
+        if (typeof fragmentComparableBaseline === 'string' && fragmentComparableBaseline.trim().length > 0) {
+          structuralBaselineMarkdown = stripEphemeralCollabSpans(fragmentComparableBaseline);
+        }
+      } catch {
+        structuralBaselineMarkdown = authoritativeMarkdown;
+      }
+    }
+
     if (args.guardPathologicalGrowth !== false) {
       const guardBaselineMarkdown = stripAllProofSpanTagsWithReplacements(
-        authoritativeMarkdown,
+        structuralBaselineMarkdown,
         buildProofSpanReplacementMap(authoritativeMarks as any),
       );
       const guardCandidateMarkdown = stripAllProofSpanTagsWithReplacements(
@@ -805,28 +1071,17 @@ export async function mutateCanonicalDocument(args: CanonicalMutationArgs): Prom
       // headings like "Notes" with different bodies.
       const baselineIntegrity = summarizeDocumentIntegrity(guardBaselineMarkdown);
       const candidateIntegrity = summarizeDocumentIntegrity(guardCandidateMarkdown);
-      if (
-        candidateIntegrity.repeatedHeadings.length > 0
-        && candidateIntegrity.repeatedSectionSignatures.length > 0
-      ) {
-        const baselineRepeatedSet = new Set(baselineIntegrity.repeatedHeadings);
-        const newRepeatedHeadings = candidateIntegrity.repeatedHeadings.filter(
-          (h) => !baselineRepeatedSet.has(h),
-        );
-        const baselineRepeatedSectionSet = new Set(baselineIntegrity.repeatedSectionSignatures);
-        const newRepeatedSectionSignatures = candidateIntegrity.repeatedSectionSignatures.filter(
-          (signature) => !baselineRepeatedSectionSet.has(signature),
-        );
+      const repeatedStructureDelta = analyzeRepeatedStructureDelta(candidateIntegrity, baselineIntegrity);
+      if (repeatedStructureDelta.hasRepeatedStructuralSignals) {
         if (
-          newRepeatedHeadings.length > 0
-          && newRepeatedSectionSignatures.length > 0
-          && candidateIntegrity.topLevelBlockCount > baselineIntegrity.topLevelBlockCount + 50
+          repeatedStructureDelta.introducesRepeatedStructuralSignals
+          && repeatedStructureDelta.hasMeaningfulBlockGrowth
         ) {
           console.error('[canonical] blocked structural heading duplication', {
             slug: args.slug,
             source: args.source,
-            newRepeatedHeadings,
-            newRepeatedSectionSignatures,
+            newRepeatedHeadings: repeatedStructureDelta.newRepeatedHeadings,
+            newRepeatedSectionSignatures: repeatedStructureDelta.newRepeatedSectionSignatures,
             baselineBlocks: baselineIntegrity.topLevelBlockCount,
             candidateBlocks: candidateIntegrity.topLevelBlockCount,
           });
@@ -900,7 +1155,11 @@ export async function mutateCanonicalDocument(args: CanonicalMutationArgs): Prom
         };
       }
     }
-    const compactionInterval = parsePositiveInt(process.env.COLLAB_COMPACTION_EVERY, 100);
+    const compactionEvery = parsePositiveInt(process.env.COLLAB_COMPACTION_EVERY, 100);
+    const compactionMaxBytes = parsePositiveInt(
+      process.env.COLLAB_COMPACTION_MAX_BYTES,
+      DEFAULT_CANONICAL_COMPACTION_MAX_BYTES,
+    );
     const now = new Date().toISOString();
     let nextRevision = doc.revision + 1;
     let nextYStateVersion = Math.max(doc.y_state_version, persistedState.yStateVersion);
@@ -914,13 +1173,13 @@ export async function mutateCanonicalDocument(args: CanonicalMutationArgs): Prom
     const tx = getDb().transaction(() => {
       if (deltaUpdate.byteLength > 0) {
         nextYStateVersion = appendYUpdate(args.slug, deltaUpdate, args.source);
+        updateYStateBlob(args.slug, Y.encodeStateAsUpdate(persistedCandidateDoc));
         const latestSnapshot = getLatestYSnapshot(args.slug);
         const updatesSinceSnapshot = latestSnapshot ? (nextYStateVersion - latestSnapshot.version) : nextYStateVersion;
-        if (updatesSinceSnapshot >= compactionInterval) {
-          getDb().prepare(`
-            INSERT OR REPLACE INTO document_y_snapshots (document_slug, version, snapshot_blob, created_at)
-            VALUES (?, ?, ?, ?)
-          `).run(args.slug, nextYStateVersion, Buffer.from(Y.encodeStateAsUpdate(persistedCandidateDoc)), now);
+        const bytesSinceSnapshot = getAccumulatedYUpdateBytesAfter(args.slug, latestSnapshot?.version ?? 0);
+        if (updatesSinceSnapshot >= compactionEvery || bytesSinceSnapshot >= compactionMaxBytes) {
+          saveYSnapshot(args.slug, nextYStateVersion, Y.encodeStateAsUpdate(persistedCandidateDoc));
+          pruneObsoleteYHistory(args.slug, nextYStateVersion);
         }
       }
 
@@ -974,6 +1233,7 @@ export async function mutateCanonicalDocument(args: CanonicalMutationArgs): Prom
       actor: args.source,
       revision: updated.revision,
       integrity: summarizeDocumentIntegrity(updated.markdown),
+      baseline: summarizeDocumentIntegrity(structuralBaselineMarkdown),
       source: args.source,
     });
     refreshSnapshotForSlug(args.slug);
@@ -1035,51 +1295,84 @@ export async function recoverCanonicalDocumentIfNeeded(
   }
 
   const reason = `on_demand_${source}`;
+  const existingRecovery = onDemandProjectionRecoveryInFlight.get(slug);
+  if (existingRecovery) {
+    return await existingRecovery;
+  }
   if (!isOnDemandProjectionRepairEnabled()) {
     return current;
   }
   if (shouldDeferOnDemandProjectionRepair(slug, source)) {
+    const concurrentRecovery = onDemandProjectionRecoveryInFlight.get(slug);
+    if (concurrentRecovery) {
+      return await concurrentRecovery;
+    }
+    const canonicalRow = getDocumentBySlug(slug);
+    const healthyProjection = canonicalRow
+      ? await buildVerifiedHealthyProjectionReadableDocument(slug, canonicalRow, getDocumentProjectionBySlug(slug))
+      : null;
+    if (healthyProjection) {
+      return healthyProjection;
+    }
+    if (shouldPreserveDeferredAuthoritativeFallback(source, current)) {
+      return current;
+    }
+    if (current && 'read_source' in current && current.read_source === 'yjs_fallback') {
+      if (canonicalRow) {
+        return buildDeferredCanonicalRowFallback(current, canonicalRow);
+      }
+    }
     return current;
   }
 
-  const repair = await repairCanonicalProjection(slug, { enforceProjectionGuard: true });
-  if (repair.ok) {
-    recordProjectionRepair('success', reason);
-    const repairedProjection = getDocumentProjectionBySlug(slug);
-    if (
-      repairedProjection
-      && repairedProjection.health === 'healthy'
-      && repairedProjection.y_state_version === repair.document.y_state_version
-    ) {
-      return {
-        ...repair.document,
-        markdown: repairedProjection.markdown,
-        marks: repairedProjection.marks_json,
-        plain_text: repairedProjection.plain_text,
-        projection_health: repairedProjection.health,
-        projection_revision: repairedProjection.revision,
-        projection_y_state_version: repairedProjection.y_state_version,
-        projection_updated_at: repairedProjection.updated_at,
-        projection_fresh: true,
-        mutation_ready: true,
-        repair_pending: false,
-        read_source: 'projection',
-      };
+  const recovery = (async (): Promise<CanonicalReadableDocument | DocumentRow | undefined> => {
+    const repair = await repairCanonicalProjection(slug, { enforceProjectionGuard: true });
+    if (repair.ok) {
+      recordProjectionRepair('success', reason);
+      const repairedProjection = getDocumentProjectionBySlug(slug);
+      if (
+        repairedProjection
+        && repairedProjection.health === 'healthy'
+        && repairedProjection.y_state_version === repair.document.y_state_version
+      ) {
+        return {
+          ...repair.document,
+          markdown: repairedProjection.markdown,
+          marks: repairedProjection.marks_json,
+          plain_text: repairedProjection.plain_text,
+          projection_health: repairedProjection.health,
+          projection_revision: repairedProjection.revision,
+          projection_y_state_version: repairedProjection.y_state_version,
+          projection_updated_at: repairedProjection.updated_at,
+          projection_fresh: true,
+          mutation_ready: true,
+          repair_pending: false,
+          read_source: 'projection',
+        };
+      }
+      return await getCanonicalReadableDocument(slug, readSource) ?? repair.document;
     }
-    return await getCanonicalReadableDocument(slug, readSource) ?? repair.document;
-  }
 
-  recordProjectionRepair('failure', `${reason}:${repair.code}`);
-  queueProjectionRepair(slug, reason);
-  const fallback = await getCanonicalReadableDocument(slug, readSource) ?? getDocumentBySlug(slug);
-  if (
-    fallback
-    && shouldRepairPendingProjection(fallback as unknown as Record<string, unknown>)
-    && isRecoveryMutationReady(fallback as unknown as Record<string, unknown>)
-  ) {
-    return fallback;
+    recordProjectionRepair('failure', `${reason}:${repair.code}`);
+    queueProjectionRepair(slug, reason);
+    const fallback = await getCanonicalReadableDocument(slug, readSource) ?? getDocumentBySlug(slug);
+    if (
+      fallback
+      && shouldRepairPendingProjection(fallback as unknown as Record<string, unknown>)
+      && isRecoveryMutationReady(fallback as unknown as Record<string, unknown>)
+    ) {
+      return fallback;
+    }
+    return current;
+  })();
+  onDemandProjectionRecoveryInFlight.set(slug, recovery);
+  try {
+    return await recovery;
+  } finally {
+    if (onDemandProjectionRecoveryInFlight.get(slug) === recovery) {
+      onDemandProjectionRecoveryInFlight.delete(slug);
+    }
   }
-  return current;
 }
 
 export async function executeCanonicalRewrite(
@@ -1353,6 +1646,7 @@ export async function cloneFromCanonical(slug: string, actor: string = 'system')
     const nextYStateVersion = authoritativeSnapshot.byteLength > 0 ? 1 : 0;
     if (authoritativeSnapshot.byteLength > 0) {
       saveYSnapshot(cloneSlug, nextYStateVersion, authoritativeSnapshot);
+      pruneObsoleteYHistory(cloneSlug, nextYStateVersion);
     }
     getDb().prepare(`
       UPDATE documents

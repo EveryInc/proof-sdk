@@ -14,7 +14,6 @@ import { buildAgentSnapshot } from './agent-snapshot.js';
 import { applySingleWriterMutation, isSingleWriterEditEnabled } from './collab-mutation-coordinator.js';
 import {
   acquireRewriteLock,
-  applyCanonicalDocumentToCollabWithVerification,
   type CollabApplyVerificationResult,
   getCanonicalReadableDocument,
   getLoadedCollabMarkdownFromFragment,
@@ -23,7 +22,9 @@ import {
   isValidMutationBaseToken,
   isCanonicalReadMutationReady,
   resolveAuthoritativeMutationBase,
+  syncCanonicalDocumentStateToCollab,
   stripEphemeralCollabSpans,
+  verifyCanonicalDocumentInLoadedCollab,
   verifyAuthoritativeMutationBaseStable,
 } from './collab.js';
 import {
@@ -575,7 +576,6 @@ async function finalizeAgentEditV2Response(
 
     const authoritative = await verifyAuthoritativeMutationBaseStable(slug, markdown, marks, {
       liveRequired: activeCollabClients > 0,
-      preferProjection: false,
       stabilityMs: EDIT_V2_COLLAB_STABILITY_MS,
       sampleMs: EDIT_V2_COLLAB_STABILITY_SAMPLE_MS,
     });
@@ -604,13 +604,33 @@ async function finalizeAgentEditV2Response(
     return next;
   };
 
-  let collabResult: Awaited<ReturnType<typeof applyCanonicalDocumentToCollabWithVerification>>;
+  const syncAndVerify = async (source: string): Promise<CollabApplyVerificationResult> => {
+    const syncResult = await syncCanonicalDocumentStateToCollab(slug, {
+      markdown,
+      marks,
+      source,
+    });
+    if (!syncResult.applied) {
+      return {
+        applied: false,
+        confirmed: false,
+        reason: syncResult.reason ?? 'apply_failed',
+        yStateVersion: 0,
+        markdownConfirmed: false,
+        fragmentConfirmed: false,
+        expectedFragmentTextHash: null,
+        liveFragmentTextHash: null,
+        markdownSource: 'none',
+      };
+    }
+    return verifyCanonicalDocumentInLoadedCollab(slug, {
+      markdown,
+      marks,
+      source,
+    }, EDIT_V2_COLLAB_TIMEOUT_MS);
+  };
 
-  collabResult = await applyCanonicalDocumentToCollabWithVerification(slug, {
-    markdown,
-    marks,
-    source: by,
-  }, EDIT_V2_COLLAB_TIMEOUT_MS);
+  let collabResult = await syncAndVerify(by);
   collabResult = await finalizeVerification(collabResult);
 
   if (!collabResult.confirmed) {
@@ -635,12 +655,7 @@ async function finalizeAgentEditV2Response(
             reason: 'canonical_changed_during_fallback',
           };
         } else {
-          collabResult = await applyCanonicalDocumentToCollabWithVerification(slug, {
-            markdown,
-            marks,
-            source: `${by}-fallback`,
-            preserveLoadedDoc: true,
-          }, EDIT_V2_COLLAB_TIMEOUT_MS);
+          collabResult = await syncAndVerify(`${by}-fallback`);
           collabResult = await finalizeVerification(collabResult);
         }
       }
@@ -776,7 +791,6 @@ export async function applyAgentEditV2(
   }
   const authoritativeBase = await resolveAuthoritativeMutationBase(slug, {
     liveRequired: activeCollabClients > 0,
-    preferProjection: false,
   });
   if (!authoritativeBase.ok) {
     if (authoritativeBase.reason === 'missing_document') {
@@ -994,6 +1008,17 @@ export async function applyAgentEditV2(
           success: false,
           code: 'LIVE_DOC_UNAVAILABLE',
           error: 'Live collaborative document unavailable while clients are connected',
+        },
+      };
+    }
+    if (!mutation.ok && mutation.code === 'persisted_yjs_corrupt') {
+      return {
+        status: 409,
+        body: {
+          success: false,
+          code: 'PERSISTED_YJS_CORRUPT',
+          error: 'Persisted collaborative state is corrupt; document is quarantined until repair',
+          retryWithState: `/api/agent/${slug}/state`,
         },
       };
     }
