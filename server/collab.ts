@@ -10406,6 +10406,12 @@ export async function startCollabRuntimeEmbedded(mainHttpPort: number): Promise<
       },
     } as unknown);
 
+    // Signal embedded mode so resolveRequestScopedCollabWsBase keeps the
+    // main HTTP port instead of adding +1 for a standalone collab port.
+    if (!process.env.COLLAB_EMBEDDED_WS) {
+      process.env.COLLAB_EMBEDDED_WS = '1';
+    }
+
     runtime = {
       enabled: true,
       wsUrlBase: wsUrlBase.replace(/\/+$/, ''),
