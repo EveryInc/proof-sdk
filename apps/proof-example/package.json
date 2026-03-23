@@ -5,7 +5,9 @@
   "version": "0.1.0",
   "description": "Reference demo app target for the future Proof SDK extraction",
   "scripts": {
-    "demo:agent": "tsx examples/agent-http-bridge.ts"
+    "demo:agent": "tsx examples/agent-http-bridge.ts",
+    "demo:workflow": "tsx examples/multi-step-workflow.ts",
+    "demo:operations": "tsx examples/editv2-operations.ts"
   },
   "dependencies": {
     "@proof/agent-bridge": "file:../../packages/agent-bridge"
