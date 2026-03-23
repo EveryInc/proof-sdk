@@ -1820,7 +1820,7 @@ export function updateMarks(slug: string, marks: Record<string, unknown>): boole
   const now = new Date().toISOString();
   const result = getDb().prepare(`
     UPDATE documents
-    SET marks = ?, updated_at = ?
+    SET marks = ?, updated_at = ?, revision = revision + 1
     WHERE slug = ? AND share_state IN ('ACTIVE', 'PAUSED')
   `).run(JSON.stringify(marks), now, slug);
   if (result.changes > 0) {
