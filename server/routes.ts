@@ -58,6 +58,7 @@ import {
   handleOAuthCallback,
   pollOAuthFlow,
   resolveShareMarkdownAuthMode,
+  resolveTrustedProxyIdentity,
   revokeHostedSessionToken,
   startOAuthFlow,
   validateHostedSessionToken,
@@ -113,11 +114,18 @@ const DEFAULT_DIRECT_SHARE_RATE_LIMIT_MAX_AUTH_PER_MIN = 120;
 const DIRECT_SHARE_RATE_LIMIT_MAX_BUCKETS = 10_000;
 const OPS_RATE_LIMIT_WINDOW_MS = parsePositiveIntEnv('PROOF_OPS_RATE_LIMIT_WINDOW_MS', 60_000);
 const OPS_RATE_LIMIT_MAX_REQUESTS = parsePositiveIntEnv('PROOF_OPS_RATE_LIMIT_MAX', 120);
+const DOCUMENT_ACCESS_RATE_LIMIT_WINDOW_MS = parsePositiveIntEnv('PROOF_DOCUMENT_ACCESS_RATE_LIMIT_WINDOW_MS', 60_000);
+const DOCUMENT_ACCESS_RATE_LIMIT_MAX_REQUESTS = parsePositiveIntEnv('PROOF_DOCUMENT_ACCESS_RATE_LIMIT_MAX', 600);
 const REWRITE_BARRIER_TIMEOUT_MS = parsePositiveIntEnv('PROOF_REWRITE_BARRIER_TIMEOUT_MS', 5000);
 const opsRateLimiter = createRateLimiter({
   windowMs: OPS_RATE_LIMIT_WINDOW_MS,
   maxRequests: OPS_RATE_LIMIT_MAX_REQUESTS,
   keyFn: (req) => `${getClientIp(req)}:${getSlugParam(req) || 'unknown'}`,
+});
+const documentAccessRateLimiter = createRateLimiter({
+  windowMs: DOCUMENT_ACCESS_RATE_LIMIT_WINDOW_MS,
+  maxRequests: DOCUMENT_ACCESS_RATE_LIMIT_MAX_REQUESTS,
+  keyFn: (req) => `${getClientIp(req)}:${getSlugParam(req) || 'unknown'}:document-access`,
 });
 
 export const shareMarkdownBodyParser = text({
@@ -375,7 +383,9 @@ function getDirectSharePresentedToken(req: Request): string | null {
 type DirectShareAuthorizationResult = {
   authed: boolean;
   authMode: 'none' | 'api_key' | 'oauth' | 'oauth_or_api_key';
+  principalProvider: 'none' | 'api_key' | 'oauth' | 'trusted_proxy_email';
   actor: string;
+  ownerId: string | null;
 };
 
 function buildOAuthNotConfiguredPayload(errorMessage: string): Record<string, unknown> {
@@ -456,7 +466,13 @@ async function authorizeDirectShareRequest(
   const presented = getDirectSharePresentedToken(req);
 
   if (authMode === 'none') {
-    return { authed: false, authMode, actor: 'anonymous' };
+    return {
+      authed: false,
+      authMode,
+      principalProvider: 'none',
+      actor: 'anonymous',
+      ownerId: null,
+    };
   }
 
   if (authMode === 'api_key') {
@@ -469,7 +485,13 @@ async function authorizeDirectShareRequest(
       return null;
     }
     if (presented === requiredApiKey) {
-      return { authed: true, authMode, actor: 'api-key' };
+      return {
+        authed: true,
+        authMode,
+        principalProvider: 'api_key',
+        actor: 'api-key',
+        ownerId: null,
+      };
     }
     res.status(401).json({
       error: 'Unauthorized direct share request',
@@ -481,7 +503,24 @@ async function authorizeDirectShareRequest(
 
   const requiredApiKey = getDirectShareApiKey();
   if (authMode === 'oauth_or_api_key' && requiredApiKey && presented === requiredApiKey) {
-    return { authed: true, authMode, actor: 'api-key' };
+    return {
+      authed: true,
+      authMode,
+      principalProvider: 'api_key',
+      actor: 'api-key',
+      ownerId: null,
+    };
+  }
+
+  const trustedProxyIdentity = resolveTrustedProxyIdentity(req);
+  if (trustedProxyIdentity) {
+    return {
+      authed: true,
+      authMode,
+      principalProvider: 'trusted_proxy_email',
+      actor: trustedProxyIdentity.actor,
+      ownerId: trustedProxyIdentity.ownerId,
+    };
   }
 
   if (!presented) {
@@ -493,7 +532,9 @@ async function authorizeDirectShareRequest(
     return {
       authed: true,
       authMode,
+      principalProvider: 'oauth',
       actor: `oauth:${validated.principal.userId}`,
+      ownerId: `oauth:${validated.principal.userId}`,
     };
   }
 
@@ -712,7 +753,26 @@ function isOAuthPrincipalOwner(ownerId: string | null | undefined, oauthUserId: 
     || normalized === `oauth_user:${asString}`;
 }
 
-async function ownerAuthorizedViaOAuth(req: Request, ownerId: string | null | undefined): Promise<boolean> {
+function isTrustedProxyIdentityOwner(ownerId: string | null | undefined, email: string): boolean {
+  if (!ownerId || !ownerId.trim()) return false;
+  const normalizedOwnerId = ownerId.trim().toLowerCase();
+  const normalizedEmail = email.trim().toLowerCase();
+  return normalizedOwnerId === normalizedEmail
+    || normalizedOwnerId === `email:${normalizedEmail}`
+    || normalizedOwnerId === `trusted_proxy_email:${normalizedEmail}`;
+}
+
+function isRejectedTrustedProxyOwnerId(ownerId: string | null | undefined, email: string | null | undefined): boolean {
+  if (typeof ownerId !== 'string') return false;
+  if (!ownerId.trim()) return true;
+  return !isTrustedProxyIdentityOwner(ownerId, email ?? '');
+}
+
+async function ownerAuthorizedViaHostedIdentity(req: Request, ownerId: string | null | undefined): Promise<boolean> {
+  const trustedIdentity = resolveTrustedProxyIdentity(req);
+  if (trustedIdentity && isTrustedProxyIdentityOwner(ownerId, trustedIdentity.email)) {
+    return true;
+  }
   const bearerToken = getPresentedBearerToken(req);
   if (!bearerToken) return false;
   const validated = await validateHostedSessionToken(bearerToken, getPublicBaseUrl(req));
@@ -738,8 +798,8 @@ async function resolveOpenContextAccess(
   const bearerResolved = !explicitResolved && bearerToken ? resolveDocumentAccess(slug, bearerToken) : null;
   const resolved = explicitResolved ?? bearerResolved;
   const ownerBySecret = canMutateByOwnerIdentity(doc, explicitSecret);
-  const ownerByOAuth = await ownerAuthorizedViaOAuth(req, doc.owner_id);
-  const ownerAuthorized = ownerBySecret || ownerByOAuth;
+  const ownerByHostedIdentity = await ownerAuthorizedViaHostedIdentity(req, doc.owner_id);
+  const ownerAuthorized = ownerBySecret || ownerByHostedIdentity;
 
   if (ownerAuthorized) {
     return { role: 'owner_bot', tokenId: null, ownerAuthorized: true };
@@ -887,7 +947,7 @@ apiRoutes.post('/documents', (req: Request, res: Response) => {
   });
 });
 
-apiRoutes.post('/documents/:slug/access-links', async (req: Request, res: Response) => {
+apiRoutes.post('/documents/:slug/access-links', documentAccessRateLimiter, async (req: Request, res: Response) => {
   const slug = getSlugParam(req);
   if (!slug) {
     res.status(400).json({ error: 'Invalid slug' });
@@ -903,7 +963,7 @@ apiRoutes.post('/documents/:slug/access-links', async (req: Request, res: Respon
     return;
   }
 
-  const ownerAuthorized = canOwnerMutate(req, doc) || await ownerAuthorizedViaOAuth(req, doc.owner_id);
+  const ownerAuthorized = canOwnerMutate(req, doc) || await ownerAuthorizedViaHostedIdentity(req, doc.owner_id);
   const secret = getPresentedSecret(req);
   const role = secret ? resolveDocumentAccessRole(slug, secret) : null;
   const canCreateAccessLinks = ownerAuthorized || role === 'editor' || role === 'owner_bot';
@@ -1066,7 +1126,23 @@ export async function handleShareMarkdown(req: Request, res: Response): Promise<
     ? body.title
     : titleFromQuery;
   const ownerIdFromQuery = typeof req.query.ownerId === 'string' ? req.query.ownerId : undefined;
-  const ownerId = typeof body?.ownerId === 'string' ? body.ownerId : ownerIdFromQuery;
+  const ownerIdFromBody = typeof body?.ownerId === 'string' ? body.ownerId : undefined;
+  if (
+    auth.principalProvider === 'trusted_proxy_email'
+    && (
+      isRejectedTrustedProxyOwnerId(ownerIdFromBody, auth.ownerId ?? '')
+      || isRejectedTrustedProxyOwnerId(ownerIdFromQuery, auth.ownerId ?? '')
+    )
+  ) {
+    res.status(403).json({
+      error: 'ownerId must match the authenticated trusted proxy email',
+      code: 'FORBIDDEN_OWNER_ID_MISMATCH',
+    });
+    return;
+  }
+  const ownerId = auth.principalProvider === 'trusted_proxy_email'
+    ? (auth.ownerId ?? undefined)
+    : (ownerIdFromBody ?? ownerIdFromQuery ?? auth.ownerId ?? undefined);
 
   const roleFromBody = body?.accessRole ?? body?.defaultRole ?? body?.role;
   const roleFromQuery = typeof req.query.role === 'string' ? req.query.role : undefined;
@@ -1921,7 +1997,7 @@ apiRoutes.get('/documents/:slug/info', (req: Request, res: Response) => {
   });
 });
 
-apiRoutes.get('/documents/:slug/open-context', async (req: Request, res: Response) => {
+apiRoutes.get('/documents/:slug/open-context', documentAccessRateLimiter, async (req: Request, res: Response) => {
   const slug = getSlugParam(req);
   if (!slug) {
     res.status(400).json({ error: 'Invalid slug' });
@@ -2013,7 +2089,7 @@ apiRoutes.get('/documents/:slug/open-context', async (req: Request, res: Respons
   });
 });
 
-apiRoutes.post('/documents/:slug/collab-refresh', async (req: Request, res: Response) => {
+apiRoutes.post('/documents/:slug/collab-refresh', documentAccessRateLimiter, async (req: Request, res: Response) => {
   const slug = getSlugParam(req);
   if (!slug) {
     res.status(400).json({ error: 'Invalid slug' });
