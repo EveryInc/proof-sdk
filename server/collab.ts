@@ -5713,6 +5713,20 @@ async function seedLegacyDocumentToPersistedYjsAsync(
     applyMarksMapDiff(ydoc.getMap('marks'), marks);
   }, 'legacy-seed-markdown');
   await seedFragmentFromLegacyMarkdown(ydoc, markdown);
+  // Sync the document row's markdown to the YDoc-derived version so that
+  // sameAuthoritativeContent() comparisons pass. Without this, API-created
+  // documents have a permanent mismatch (raw vs Milkdown-normalized markdown)
+  // that forces mutation_ready: false and breaks share view hydration.
+  const derivedMarkdown = await deriveMarkdownProjectionFromFragment(ydoc);
+  if (derivedMarkdown && derivedMarkdown.trim()) {
+    const derivedMarks = canonicalizeStoredMarks(encodeMarksMap(ydoc.getMap('marks')));
+    updateDocument(slug, derivedMarkdown, derivedMarks);
+    // Re-read the row so persistCanonicalYjsBaseline uses the normalized markdown
+    const updatedRow = getDocumentBySlug(slug);
+    if (updatedRow) {
+      return persistCanonicalYjsBaseline(slug, updatedRow, ydoc);
+    }
+  }
   return persistCanonicalYjsBaseline(slug, row, ydoc);
 }
 
