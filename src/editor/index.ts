@@ -1061,6 +1061,7 @@ class ProofEditorImpl implements ProofEditor {
   private shareMenuCleanup: (() => void) | null = null;
   private presenceMenuCleanup: (() => void) | null = null;
   private agentMenuCleanup: (() => void) | null = null;
+  private moreMenuCleanup: (() => void) | null = null;
   private shareWelcomeToast: HTMLElement | null = null;
   private shareDocTitle: string = 'Untitled';
   private shareBannerTitleEl: HTMLElement | null = null;
@@ -3179,6 +3180,7 @@ class ProofEditorImpl implements ProofEditor {
     const openPresenceMenu = () => {
       this.closeShareMenu();
       this.closeAgentMenu();
+      this.closeMoreMenu();
       if (this.presenceMenuCleanup) {
         this.closePresenceMenu();
         return;
@@ -3405,6 +3407,7 @@ class ProofEditorImpl implements ProofEditor {
     this.closeShareMenu();
     this.closePresenceMenu();
     this.closeAgentMenu();
+    this.closeMoreMenu();
 
     const wordmark = document.createElement('a');
     wordmark.textContent = 'Proof';
@@ -3448,8 +3451,9 @@ class ProofEditorImpl implements ProofEditor {
     this.updateShareBannerSyncDisplay();
 
     const shareBtn = this.createShareMenuButton();
+    const moreBtn = this.createMoreMenuButton();
 
-    banner.replaceChildren(wordmark, separator, title, syncStatusSep, syncStatusInline, avatars, agentSlot, shareBtn);
+    banner.replaceChildren(wordmark, separator, title, syncStatusSep, syncStatusInline, avatars, agentSlot, shareBtn, moreBtn);
     this.scheduleBannerLayoutUpdate();
   }
 
@@ -3836,6 +3840,13 @@ class ProofEditorImpl implements ProofEditor {
     cleanup();
   }
 
+  private closeMoreMenu(): void {
+    if (!this.moreMenuCleanup) return;
+    const cleanup = this.moreMenuCleanup;
+    this.moreMenuCleanup = null;
+    cleanup();
+  }
+
   private clampMenuToViewport(menu: HTMLElement): void {
     const margin = 12;
     const rect = menu.getBoundingClientRect();
@@ -4071,6 +4082,7 @@ class ProofEditorImpl implements ProofEditor {
     const openMenu = () => {
       this.closeAgentMenu();
       this.closePresenceMenu();
+      this.closeMoreMenu();
       if (this.shareMenuCleanup) {
         this.closeShareMenu();
         return;
@@ -4196,6 +4208,138 @@ class ProofEditorImpl implements ProofEditor {
     btn.onclick = () => {
       this.triggerHaptic('selection');
       openMenu();
+    };
+
+    container.appendChild(btn);
+    return container;
+  }
+
+  private createMoreMenuButton(): HTMLElement {
+    const container = document.createElement('div');
+    container.className = 'share-pill-more-btn';
+    container.style.cssText = 'position:relative;display:inline-flex;align-items:center';
+
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'share-pill-utility-btn';
+    btn.setAttribute('aria-label', 'More options');
+    btn.setAttribute('aria-haspopup', 'menu');
+    btn.textContent = '\u2022\u2022\u2022';
+    btn.style.cssText = `
+      display:inline-flex;align-items:center;justify-content:center;min-height:44px;min-width:44px;
+      padding:0 12px;background:transparent;border:none;border-radius:10px;
+      color:#374151;font-size:16px;letter-spacing:2px;cursor:pointer;
+      transition:background 0.15s;flex-shrink:0;font-family:inherit;
+    `;
+
+    btn.onmouseenter = () => { btn.style.background = 'rgba(0,0,0,0.06)'; };
+    btn.onmouseleave = () => { btn.style.background = 'transparent'; };
+
+    const openMoreMenu = () => {
+      this.closeShareMenu();
+      this.closePresenceMenu();
+      this.closeAgentMenu();
+      if (this.moreMenuCleanup) {
+        this.closeMoreMenu();
+        return;
+      }
+
+      const menu = document.createElement('div');
+      menu.setAttribute('role', 'menu');
+      menu.style.cssText = `
+        position:absolute;top:calc(100% + 8px);right:0;min-width:220px;
+        background:rgba(17,24,39,0.96);border:1px solid rgba(255,255,255,0.12);
+        border-radius:12px;padding:6px;z-index:1002;
+        box-shadow:0 16px 40px rgba(0,0,0,0.35);
+        backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);
+      `;
+
+      const item = document.createElement('button');
+      item.type = 'button';
+      item.setAttribute('role', 'menuitem');
+      item.style.cssText = `
+        width:100%;display:flex;align-items:center;gap:10px;
+        padding:10px 12px;min-height:44px;border-radius:10px;border:0;background:transparent;
+        color:rgba(255,255,255,0.92);font-size:12px;font-weight:600;cursor:pointer;text-align:left;
+      `;
+      item.onmouseenter = () => { item.style.background = 'rgba(255,255,255,0.08)'; };
+      item.onmouseleave = () => { item.style.background = 'transparent'; };
+
+      const itemLabel = document.createElement('span');
+      itemLabel.textContent = 'Import document';
+      item.appendChild(itemLabel);
+
+      item.onclick = () => {
+        const input = document.createElement('input');
+        input.type = 'file';
+        input.accept = '.md,.docx';
+        input.style.display = 'none';
+        input.onchange = async () => {
+          const file = input.files?.[0];
+          if (!file) return;
+          itemLabel.textContent = 'Importing\u2026';
+          item.style.opacity = '0.6';
+          item.style.pointerEvents = 'none';
+          try {
+            const form = new FormData();
+            form.append('file', file);
+            const res = await fetch(`${window.location.origin}/documents/import`, {
+              method: 'POST',
+              body: form,
+            });
+            if (!res.ok) {
+              const text = await res.text().catch(() => res.statusText);
+              throw new Error(text || `HTTP ${res.status}`);
+            }
+            const data = await res.json();
+            if (data.tokenUrl) {
+              cleanup();
+              window.location.href = data.tokenUrl;
+            } else {
+              throw new Error('No tokenUrl in response');
+            }
+          } catch (err: any) {
+            itemLabel.textContent = err?.message || 'Import failed';
+            item.style.opacity = '1';
+            item.style.pointerEvents = '';
+            setTimeout(() => { itemLabel.textContent = 'Import document'; }, 2500);
+          } finally {
+            input.remove();
+          }
+        };
+        document.body.appendChild(input);
+        input.click();
+      };
+
+      menu.appendChild(item);
+      container.appendChild(menu);
+      this.clampMenuToViewport(menu);
+
+      const onDocMouseDown = (ev: MouseEvent) => {
+        if (!(ev.target instanceof Node)) return;
+        if (container.contains(ev.target)) return;
+        cleanup();
+      };
+      const onKeyDown = (ev: KeyboardEvent) => {
+        if (ev.key === 'Escape') cleanup();
+      };
+
+      const cleanup = () => {
+        document.removeEventListener('mousedown', onDocMouseDown, true);
+        document.removeEventListener('keydown', onKeyDown, true);
+        if (menu.isConnected) menu.remove();
+        if (this.moreMenuCleanup === cleanup) {
+          this.moreMenuCleanup = null;
+        }
+      };
+
+      this.moreMenuCleanup = cleanup;
+      document.addEventListener('mousedown', onDocMouseDown, true);
+      document.addEventListener('keydown', onKeyDown, true);
+    };
+
+    btn.onclick = () => {
+      openMoreMenu();
     };
 
     container.appendChild(btn);
