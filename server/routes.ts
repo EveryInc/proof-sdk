@@ -16,6 +16,7 @@ import {
   syncCanonicalDocumentStateToCollab,
   stripEphemeralCollabSpans,
   acquireRewriteLock,
+  ensureCanonicalYjsBaselineForDocument,
 } from './collab.js';
 import { getSnapshotPublicUrl, refreshSnapshotForSlug } from './snapshot.js';
 import { executeCanonicalRewrite, mutateCanonicalDocument } from './canonical-document.js';
@@ -784,7 +785,7 @@ function deriveShareCapabilities(role: ShareRole, shareState: string): {
 }
 
 // Create a shared document
-apiRoutes.post('/documents', (req: Request, res: Response) => {
+apiRoutes.post('/documents', async (req: Request, res: Response) => {
   const legacyCreateMode = resolveLegacyCreateMode(getPublicBaseUrl(req));
   if (legacyCreateMode === 'disabled') {
     recordLegacyCreateRouteTelemetry(req, legacyCreateMode, 'blocked_disabled');
@@ -827,6 +828,9 @@ apiRoutes.post('/documents', (req: Request, res: Response) => {
   const ownerSecret = randomUUID();
   const normalizedMarks = canonicalizeStoredMarks(marks ?? {});
   const doc = createDocument(slug, sanitizedMarkdown, normalizedMarks, title, ownerId, ownerSecret);
+  // Bootstrap YDoc so the collab system can hydrate the share view.
+  // Without this, API-created documents have no YDoc and the share view loads empty.
+  await ensureCanonicalYjsBaselineForDocument(slug);
   const defaultAccess = createDocumentAccessToken(slug, 'editor');
   const links = buildShareLink(req, doc.slug);
   const shareUrlWithToken = withShareToken(links.shareUrl, defaultAccess.secret);
