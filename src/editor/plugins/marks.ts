@@ -15,6 +15,7 @@ import type { Node as ProseMirrorNode, MarkType } from '@milkdown/kit/prose/mode
 import { ySyncPluginKey } from 'y-prosemirror';
 import { buildTextIndex, getTextForRange, mapTextOffsetsToRange, resolveQuoteRange } from '../utils/text-range';
 import { SHARE_CONTENT_FILTER_ALLOW_META } from './share-content-filter';
+import { getAuthoredDecorationStyle } from './authorship-color';
 
 import {
   type Mark,
@@ -3030,9 +3031,6 @@ export function resolveMarks(doc: ProseMirrorNode, marks: Mark[]): ResolvedMark[
 // ============================================================================
 
 const STYLES = {
-  authored_human: 'background-color: rgba(110, 231, 183, 0.08);',
-  authored_ai: 'background-color: rgba(165, 180, 252, 0.12);',
-
   flagged: 'border-left: 3px solid #FCA5A5; padding-left: 4px; background-color: rgba(252, 165, 165, 0.1);',
 
   comment: 'background-color: rgba(252, 211, 77, 0.3); border-bottom: 2px solid #FCD34D;',
@@ -3108,7 +3106,12 @@ function createDecorations(
     let replacementContent: string | null = null;
 
     switch (mark.kind) {
-      case 'authored':
+      case 'authored': {
+        style = getAuthoredDecorationStyle(mark.by);
+        cssClass = 'mark-authored';
+        break;
+      }
+
       case 'approved':
       case 'flagged':
         continue;

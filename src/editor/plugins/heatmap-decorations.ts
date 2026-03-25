@@ -25,6 +25,7 @@ import {
   type MarkKind,
   type ReplaceData,
 } from '../../formats/marks.js';
+import { resolveAuthoredBlockColor } from './authorship-color';
 import { getMarks, marksPluginKey, resolveMarks } from './marks';
 import { isMobileTouch } from './mobile-detect';
 
@@ -129,6 +130,8 @@ function getAuthoredBlockColor(
   let human = 0;
   let ai = 0;
   let system = 0;
+  let explicitHuman = 0;
+  let explicitAI = 0;
 
   for (const mark of authored) {
     if (!blockIntersectsMark(blockFrom, blockTo, mark)) continue;
@@ -136,8 +139,10 @@ function getAuthoredBlockColor(
     if (overlap <= 0) continue;
     if (isHuman(mark.mark.by)) {
       human += overlap;
+      explicitHuman += overlap;
     } else if (isAI(mark.mark.by)) {
       ai += overlap;
+      explicitAI += overlap;
     } else if (isSystem(mark.mark.by)) {
       system += overlap;
     }
@@ -145,10 +150,7 @@ function getAuthoredBlockColor(
 
   const unmarked = Math.max(0, blockTextLength - (human + ai + system));
   ai += unmarked;
-
-  if (system > 0) return getMarkColor('system');
-  if (human === 0 && ai === 0) return null;
-  return ai >= human ? getMarkColor('ai') : getMarkColor('human');
+  return resolveAuthoredBlockColor({ human, ai, system, explicitHuman, explicitAI });
 }
 
 /**
@@ -188,6 +190,7 @@ function getBlockStatus(
  * 4 colors total:
  * - Human (soft mint) - human-authored content
  * - AI (soft lavender) - AI-authored content
+ * - Mixed (purple) - block contains both human and AI authored text
  * - System (blue) - system-authored content
  * - Flagged (dusty rose) - needs attention, overrides authorship
  * - Comment (soft gold) - has discussion, overrides authorship
