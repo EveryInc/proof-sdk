@@ -158,5 +158,5 @@ curl -sS -X POST "http://localhost:4000/documents/<slug>/presence" \
 - Discovery JSON: `http://localhost:4000/.well-known/agent.json`
 - Docs: `http://localhost:4000/agent-docs`
 - Setup: `http://localhost:4000/agent-setup`
-- [AGENT_CONTRACT.md](/Users/danshipper/CascadeProjects/every-proof/.worktrees/proof-sdk-split/AGENT_CONTRACT.md)
-- [agent-docs.md](/Users/danshipper/CascadeProjects/every-proof/.worktrees/proof-sdk-split/docs/agent-docs.md)
+- `AGENT_CONTRACT.md`
+- `docs/agent-docs.md`
