@@ -7,8 +7,10 @@ import {
 
 interface CreateDocumentResponse {
   slug: string;
+  ownerSecret: string;
   accessToken: string;
   shareUrl?: string;
+  tokenUrl?: string;
   agent?: {
     stateApi?: string;
   };
@@ -56,14 +58,14 @@ async function run(): Promise<void> {
   const provider = new DemoAgentProvider();
 
   const created = await createDocument(baseUrl, title, markdown);
-  if (!created.slug || !created.accessToken) {
-    throw new Error('Create response did not include slug/accessToken');
+  if (!created.slug || !created.ownerSecret) {
+    throw new Error('Create response did not include slug/ownerSecret');
   }
 
   const bridge = createAgentBridgeClient({
     baseUrl,
     auth: {
-      shareToken: created.accessToken,
+      bridgeToken: created.ownerSecret,
     },
   });
 
@@ -98,10 +100,15 @@ async function run(): Promise<void> {
     text: review.text || review.message.content,
   });
 
+  const viewUrl = created.tokenUrl
+    ?? (created.shareUrl && created.accessToken
+      ? `${created.shareUrl}?token=${encodeURIComponent(created.accessToken)}`
+      : `${baseUrl}/d/${created.slug}`);
+
   console.log(JSON.stringify({
     success: true,
     slug: created.slug,
-    shareUrl: created.shareUrl ?? `${baseUrl}/d/${created.slug}`,
+    viewUrl,
     stateApi: created.agent?.stateApi ?? `${baseUrl}/documents/${created.slug}/state`,
     commentPosted: true,
   }, null, 2));

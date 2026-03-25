@@ -13,13 +13,18 @@ import { shareWebRoutes } from './share-web-routes.js';
 import {
   capabilitiesPayload,
   enforceApiClientCompatibility,
-  enforceBridgeClientCompatibility,
 } from './client-capabilities.js';
 import { getBuildInfo } from './build-info.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const PORT = Number.parseInt(process.env.PORT || '4000', 10);
+
+// WebSocket is multiplexed on the main HTTP port via setupWebSocket — tell the
+// collab session builder to keep the same port rather than offsetting to PORT+1.
+if (!process.env.COLLAB_EMBEDDED_WS) {
+  process.env.COLLAB_EMBEDDED_WS = '1';
+}
 const DEFAULT_ALLOWED_CORS_ORIGINS = [
   'http://localhost:3000',
   'http://127.0.0.1:3000',
@@ -46,6 +51,7 @@ async function main(): Promise<void> {
   const allowedCorsOrigins = parseAllowedCorsOrigins();
 
   app.use(express.json({ limit: '10mb' }));
+  app.use(express.static(path.join(__dirname, '..', 'dist')));
   app.use(express.static(path.join(__dirname, '..', 'public')));
 
   app.use((req, res, next) => {
@@ -123,8 +129,8 @@ async function main(): Promise<void> {
   app.use('/api', enforceApiClientCompatibility, apiRoutes);
   app.use('/api/agent', agentRoutes);
   app.use(apiRoutes);
-  app.use('/d', createBridgeMountRouter(enforceBridgeClientCompatibility));
-  app.use('/documents', createBridgeMountRouter(enforceBridgeClientCompatibility));
+  app.use('/d', createBridgeMountRouter());
+  app.use('/documents', createBridgeMountRouter());
   app.use('/documents', agentRoutes);
   app.use(shareWebRoutes);
 

@@ -1,10 +1,6 @@
 # Proof Example
 
-This workspace is the extraction target for the public `Proof SDK` demo app.
-
-The current private repo still runs the hosted product, but shared editor, server, and bridge code now lives behind the workspace packages in [packages/doc-core](/Users/danshipper/CascadeProjects/every-proof/.worktrees/proof-sdk-split/packages/doc-core), [packages/doc-editor](/Users/danshipper/CascadeProjects/every-proof/.worktrees/proof-sdk-split/packages/doc-editor), [packages/doc-server](/Users/danshipper/CascadeProjects/every-proof/.worktrees/proof-sdk-split/packages/doc-server), [packages/doc-store-sqlite](/Users/danshipper/CascadeProjects/every-proof/.worktrees/proof-sdk-split/packages/doc-store-sqlite), and [packages/agent-bridge](/Users/danshipper/CascadeProjects/every-proof/.worktrees/proof-sdk-split/packages/agent-bridge).
-
-When the public repo is extracted, this app should become the neutral self-host example for:
+This is the self-host example app for the Proof SDK, demonstrating:
 
 - creating a document
 - loading a shared document
@@ -12,12 +8,26 @@ When the public repo is extracted, this app should become the neutral self-host 
 - agent bridge reads and writes
 - anonymous or token-based access
 
+Shared editor, server, and bridge code lives in the workspace packages:
+[packages/doc-core](../../packages/doc-core),
+[packages/doc-editor](../../packages/doc-editor),
+[packages/doc-server](../../packages/doc-server),
+[packages/doc-store-sqlite](../../packages/doc-store-sqlite), and
+[packages/agent-bridge](../../packages/agent-bridge).
+
 ## Agent Bridge Demo
 
-Run the reference external-agent flow:
+First build the editor and start the server from the repo root:
 
 ```bash
-npm run proof-sdk:demo:agent
+npm run build
+npm run serve
+```
+
+Then run the reference external-agent flow:
+
+```bash
+npm --workspace proof-example run demo:agent
 ```
 
 Environment variables:
@@ -26,4 +36,6 @@ Environment variables:
 - `PROOF_DEMO_TITLE`: optional document title override
 - `PROOF_DEMO_MARKDOWN`: optional initial markdown override
 
-The demo creates a document through `POST /documents`, then uses `@proof/agent-bridge` to publish presence, read state, and add a comment through the neutral `/documents/:slug/bridge/*` API.
+The demo creates a document through `POST /documents`, then uses `@proof/agent-bridge` to publish
+presence, read state, and add a comment through the neutral `/documents/:slug/*` API. It prints a
+`viewUrl` you can open in a browser to see the result.

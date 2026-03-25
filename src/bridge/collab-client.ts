@@ -658,6 +658,7 @@ export class CollabClient {
     provider.on('authenticationFailed', (event: { reason?: string }) => {
       const reason = typeof event?.reason === 'string' ? event.reason : 'permission-denied';
       this.lastAuthenticationFailureReason = reason;
+      this.terminalCloseReason = 'permission-denied';
       this.connectionStatus = 'disconnected';
       this.hasSynced = false;
       this.lastDisconnectAt = Date.now();

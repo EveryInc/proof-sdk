@@ -195,7 +195,7 @@ export function createAgentBridgeClient(config: AgentBridgeClientConfig) {
       });
     },
     setPresence<T = unknown>(slug: string, input: AgentBridgePresenceInput, options: AgentBridgeRequestOptions = {}): Promise<T> {
-      return requestJson<T>(config, buildBridgePath(slug, '/presence'), {
+      return requestJson<T>(config, `${documentBasePath(slug)}/presence`, {
         method: 'POST',
         body: JSON.stringify(input),
         ...options,
