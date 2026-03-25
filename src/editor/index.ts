@@ -37,6 +37,7 @@ import {
 import { applyAwarenessUpdate, removeAwarenessStates } from 'y-protocols/awareness';
 import * as encoding from 'lib0/encoding';
 
+import { createShareFormattingBar } from './share-formatting-bar';
 import { proofMarkPlugins } from './schema/proof-marks';
 import { codeBlockExtPlugins } from './schema/code-block-ext';
 import { frontmatterSchema } from './schema/frontmatter';
@@ -1010,6 +1011,7 @@ class ProofEditorImpl implements ProofEditor {
   private isReadOnly: boolean = false;
   private shareAllowLocalEdits: boolean = true;
   private shareContentFilterEnabled: boolean = false;
+  private shareFormattingBar: HTMLElement | null = null;
   private readOnlyBanner: HTMLElement | null = null;
   private reviewLockCount: number = 0;
   private reviewLockReason: string | null = null;
@@ -1280,6 +1282,16 @@ class ProofEditorImpl implements ProofEditor {
     // If in share mode, load from share server
     if (this.isShareMode) {
       await this.initFromShare();
+
+      // Formatting bar — right rail (desktop) / bottom dock (mobile).
+      const bar = createShareFormattingBar(
+        () => this.editor?.ctx.get(editorViewCtx) ?? null,
+      );
+      const container = document.getElementById('editor-container');
+      if (container) {
+        container.appendChild(bar);
+      }
+      this.shareFormattingBar = bar;
     }
   }
 
@@ -4872,10 +4884,7 @@ class ProofEditorImpl implements ProofEditor {
       }
     }
 
-    if (this.isShareMode) {
-      document.documentElement.style.background = '#fff';
-      document.body.style.background = '#fff';
-    }
+    document.body.dataset.shareMode = this.isShareMode ? 'true' : 'false';
   }
 
   private updateBannerLayout(): void {
@@ -4908,6 +4917,16 @@ class ProofEditorImpl implements ProofEditor {
     const isEditable = !this.isReadOnly
       && this.reviewLockCount === 0
       && (!this.isShareMode || this.shareAllowLocalEdits);
+
+    if (this.shareFormattingBar) {
+      this.shareFormattingBar.classList.toggle('visible', isEditable);
+      if (typeof (this.shareFormattingBar as any).__fmtSetEditable === 'function') {
+        (this.shareFormattingBar as any).__fmtSetEditable(isEditable);
+      }
+      if (!isEditable) {
+        delete document.body.dataset.shareContextualToolbarVisible;
+      }
+    }
 
     const applyEditableState = (view: EditorView) => {
       view.setProps({
