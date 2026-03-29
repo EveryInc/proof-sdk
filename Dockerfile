@@ -25,7 +25,8 @@ COPY . .
 # Build frontend SPA (Vite → dist/), then merge into public/ so the
 # Express static middleware can serve the built assets alongside existing
 # static files, then prune dev dependencies.
-# Single RUN so dev deps don't persist in any layer.
+# Single RUN so build + asset merge + prune happen together, and only
+# pruned dependencies are copied into the runtime image.
 RUN npm run build \
     && cp -r dist/* public/ \
     && npm prune --omit=dev
@@ -39,7 +40,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     dumb-init \
     && rm -rf /var/lib/apt/lists/*
 
-RUN npm install -g tsx@4 && npm cache clean --force
+RUN npm install -g tsx@4.21.0 && npm cache clean --force
 
 ENV NODE_ENV=production
 
