@@ -5414,6 +5414,30 @@ class ProofEditorImpl implements ProofEditor {
     if (selectedText.trim()) {
       // Create a comment with @proof mention to trigger the agent
       markComment(view, selectedText, actor, `@proof ${prompt}`, context.range);
+
+      // Also POST to the server ops endpoint so the agent can poll it via HTTP.
+      // The local Yjs mark is not visible to HTTP readers while a live collab
+      // session is active (projection repair is blocked by the collab lease).
+      const slug = shareClient.getSlug();
+      if (slug) {
+        const body = JSON.stringify({
+          type: 'comment.add',
+          by: actor,
+          quote: selectedText,
+          text: `@proof ${prompt}`,
+        });
+        fetch(`${shareClient.getApiBaseUrl()}/agent/${encodeURIComponent(slug)}/ops`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...shareClient.getShareAuthHeaders(),
+          },
+          body,
+        }).catch((err) => {
+          console.warn('[invokeAgentOnSelection] Failed to POST comment to server ops:', err);
+        });
+      }
+
       captureEvent('agent_manual_request_queued', {
         trigger_type: 'comment',
       });
