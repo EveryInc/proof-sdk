@@ -295,6 +295,21 @@ export class WorkOSAuthStrategy implements AuthStrategy {
     label { display: block; font-size: 14px; font-weight: 400; color: rgba(38,37,30,0.6); margin-bottom: 6px; }
     .value { font-size: 15px; color: #26251e; margin-bottom: 16px; padding: 10px 14px; background: #f5f3ec; border: 1px solid rgba(38,37,30,0.08); border-radius: 4px; }
     .hint { font-size: 13px; color: rgba(38,37,30,0.45); text-align: center; margin-bottom: 20px; }
+    .actions { display: flex; gap: 10px; margin-top: 24px; }
+    .btn {
+      flex: 1; display: inline-flex; align-items: center; justify-content: center;
+      padding: 12.48px 21.6px; border-radius: 33554400px;
+      font-family: inherit; font-size: 15px; font-weight: 400;
+      text-decoration: none; text-align: center;
+      transition: filter 0.2s ease, transform 0.1s ease, box-shadow 0.2s ease;
+    }
+    .btn-primary {
+      background: linear-gradient(-1.66deg, #266854 4.43%, #1f8a65 110.83%);
+      color: #f7f7f4; border: none;
+    }
+    .btn-primary:hover { filter: brightness(1.1); transform: translateY(-2px); box-shadow: 0 4px 12px rgba(38,104,84,0.3); }
+    .btn-secondary { background: transparent; color: #26251e; border: 1px solid rgba(38,37,30,0.12); }
+    .btn-secondary:hover { background: rgba(38,37,30,0.04); }
     .footer { text-align: center; margin-top: 20px; font-size: 14px; color: rgba(38,37,30,0.6); }
     .footer a { color: #14a378; font-weight: 600; text-decoration: none; }
     .footer a:hover { text-decoration: underline; }
@@ -309,6 +324,10 @@ export class WorkOSAuthStrategy implements AuthStrategy {
     <div class="value">${escapeHtml(user.email)}</div>
     ${user.organizationName ? `<label>Organisation</label><div class="value">${escapeHtml(user.organizationName)}</div>` : ''}
     <p class="hint">Your account is managed by your organisation via WorkOS.</p>
+    <div class="actions">
+      <a href="/auth/login?prompt=select_organization&return_to=%2F" class="btn btn-secondary">Switch Organisation</a>
+      <a href="/auth/logout" class="btn btn-secondary">Sign out</a>
+    </div>
     <div class="footer"><a href="/">&larr; Back</a></div>
   </div>
 </body>
