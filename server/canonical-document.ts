@@ -886,6 +886,26 @@ export async function mutateCanonicalDocument(args: CanonicalMutationArgs): Prom
       retryWithState: `/api/agent/${args.slug}/state`,
     };
   }
+
+  // Defense-in-depth: when baseRevision is used with a live session, verify
+  // the live authoritative state matches the persisted DB row. baseRevision
+  // validates only the DB revision counter, but the live Yjs doc may contain
+  // unpersisted browser edits — applying against the wrong baseline causes a
+  // split-brain that leaves the projection stuck in yjs_fallback permanently.
+  if (!baseToken && typeof args.baseRevision === 'number' && liveRequired && initialBaseResolution.ok) {
+    const liveMarkdown = stripEphemeralCollabSpans(initialBaseResolution.base.markdown);
+    const persistedMarkdown = stripEphemeralCollabSpans(doc.markdown ?? '');
+    if (liveMarkdown !== persistedMarkdown) {
+      return {
+        ok: false,
+        status: 409,
+        code: 'LIVE_STATE_DIVERGED',
+        error: 'Live document state has diverged from persisted revision; use baseToken instead of baseRevision when collab clients are connected',
+        retryWithState: `/api/agent/${args.slug}/state`,
+      };
+    }
+  }
+
   let handle = await loadCanonicalYDoc(args.slug, { liveRequired });
   if (!handle && liveRequired && hostedRuntime) {
     collabClientBreakdown = await waitForHostedLiveLeaseMaterialization(args.slug);

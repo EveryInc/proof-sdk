@@ -1,0 +1,47 @@
+# See https://fly.io/docs/reference/configuration/ for reference.
+
+app = "proof-sdk"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "5555"
+  NODE_ENV = "production"
+  DATABASE_PATH = "/data/proof-share.db"
+  PROOF_TRUST_PROXY_HEADERS = "true"
+  COLLAB_EMBEDDED_WS = "true"
+  # Set PROOF_PUBLIC_BASE_URL via `fly secrets set` after first deploy
+  # so share links, WebSocket URLs, and agent docs use the correct origin.
+
+[http_service]
+  internal_port = 5555
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 1
+  max_machines_running = 1  # SQLite does not support multi-writer
+
+  [http_service.concurrency]
+    type = "connections"
+    hard_limit = 250
+    soft_limit = 200
+
+[[vm]]
+  memory = "512mb"
+  cpu_kind = "shared"
+  cpus = 1
+
+[mounts]
+  source = "proof_data"
+  destination = "/data"
+
+[checks]
+  [checks.health]
+    type = "http"
+    port = 5555
+    path = "/health"
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "10s"

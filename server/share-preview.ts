@@ -10,7 +10,7 @@ const __dirname = path.dirname(__filename);
 
 const OG_IMAGE_WIDTH = 1200;
 const OG_IMAGE_HEIGHT = 630;
-const DEFAULT_PUBLIC_ORIGIN = 'http://localhost:4000';
+const DEFAULT_PUBLIC_ORIGIN = 'http://localhost:5555';
 const PROJECT_ROOT = path.resolve(__dirname, '..');
 
 const CARD_BACKGROUND = '#f0eee7';

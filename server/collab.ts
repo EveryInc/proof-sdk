@@ -762,7 +762,7 @@ const DEFAULT_INTEGRITY_WARNING_LOG_COOLDOWN_MS = 60 * 1000;
 const DEFAULT_INTEGRITY_WARNING_BLOCK_EXPLOSION = 256;
 const DEFAULT_INTEGRITY_WARNING_REPEAT_BLOCK_THRESHOLD = 64;
 const DEFAULT_INTEGRITY_WARNING_REPEAT_HEADING_THRESHOLD = 3;
-const DEFAULT_PROJECTION_REPAIR_RETRY_SCHEDULE_MS = [0, 500, 2_000];
+const DEFAULT_PROJECTION_REPAIR_RETRY_SCHEDULE_MS = [0, 500, 2_000, 5_000, 15_000, 45_000];
 const DEFAULT_PROJECTION_REPAIR_WORKER_ENABLED = true;
 const DEFAULT_PROJECTION_REPAIR_WORKER_DELAY_MS = 45_000;
 const DEFAULT_PROJECTION_REPAIR_WORKER_INTERVAL_MS = 120_000;
@@ -5191,8 +5191,14 @@ async function runQueuedProjectionRepair(slug: string): Promise<void> {
     const currentIndex = projectionRepairRetryIndex.get(slug) ?? 0;
     const nextIndex = currentIndex + 1;
     if (nextIndex >= schedule.length) {
-      console.error('[collab] projection repair exhausted retries', { slug, reasons, retries: schedule.length });
-      clearProjectionRepairState(slug);
+      console.error('[collab] projection repair exhausted retries; deferring to background worker', { slug, reasons, retries: schedule.length });
+      // Clear scheduling state but preserve reasons so the background
+      // worker can pick up this slug on its next scan cycle instead of
+      // abandoning it permanently.
+      const timer = projectionRepairScheduled.get(slug);
+      if (timer) clearTimeout(timer);
+      projectionRepairScheduled.delete(slug);
+      projectionRepairRetryIndex.delete(slug);
       return;
     }
 

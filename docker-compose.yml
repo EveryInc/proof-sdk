@@ -1,0 +1,25 @@
+services:
+  proof-sdk:
+    build: .
+    ports:
+      - "${PORT:-5555}:${PORT:-5555}"
+    volumes:
+      - proof-data:/data
+    environment:
+      PORT: "${PORT:-5555}"
+      DATABASE_PATH: /data/proof-share.db
+      PROOF_COLLAB_SIGNING_SECRET: "${PROOF_COLLAB_SIGNING_SECRET:?Set PROOF_COLLAB_SIGNING_SECRET in .env or environment}"
+      PROOF_PUBLIC_BASE_URL: "${PROOF_PUBLIC_BASE_URL:-http://localhost:${PORT:-5555}}"
+      PROOF_CORS_ALLOW_ORIGINS: "${PROOF_CORS_ALLOW_ORIGINS:-}"
+      COLLAB_EMBEDDED_WS: "true"
+      NODE_ENV: production
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:${PORT:-5555}/health').then(r=>{if(!r.ok)throw 1})"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  proof-data:

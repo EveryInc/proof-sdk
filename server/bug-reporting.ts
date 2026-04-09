@@ -796,7 +796,7 @@ export function getBugReportSpec(): Record<string, unknown> {
             message: 'PUT /api/documents/example-slug/title returned 500',
             data: {
               method: 'PUT',
-              url: 'http://127.0.0.1:3000/api/documents/example-slug/title',
+              url: 'http://127.0.0.1:5556/api/documents/example-slug/title',
               status: 500,
               statusText: 'Internal Server Error',
               requestId: 'example-request-id',

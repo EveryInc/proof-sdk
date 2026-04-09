@@ -7,7 +7,7 @@ async function run(): Promise<void> {
   try {
     (globalThis as any).window = {
       location: {
-        origin: 'http://localhost:4000',
+        origin: 'http://localhost:5555',
         pathname: '/d/test-slug',
         search: '',
       },

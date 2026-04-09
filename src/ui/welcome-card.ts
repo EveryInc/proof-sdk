@@ -12,7 +12,7 @@ function buildDocUrl(): string {
 function buildPrompt(docUrl: string): string {
   return `Here's my Proof document: ${docUrl}
 
-Proof is a collaborative writing editor that tracks who wrote what (human vs AI). You can read the doc, suggest edits, leave comments, and rewrite content via its HTTP API. API docs: http://localhost:4000/agent-docs
+Proof is a collaborative writing editor that tracks who wrote what (human vs AI). You can read the doc, suggest edits, leave comments, and rewrite content via its HTTP API. API docs: ${window.location.origin}/agent-docs
 
 Connect to this document and help me get started. Write something to kick things off - here are some ideas:
 

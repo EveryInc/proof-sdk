@@ -60,7 +60,7 @@ async function run(): Promise<void> {
     const updated = db.updateDocument(slug, markdownB);
     assert(updated, 'Expected external canonical update to persist');
 
-    const session = collab.buildCollabSession(slug, 'editor', { wsUrlBase: 'ws://localhost:4000/ws' });
+    const session = collab.buildCollabSession(slug, 'editor', { wsUrlBase: 'ws://localhost:5555/ws' });
     assert(Boolean(session), 'Expected buildCollabSession to succeed');
     assert(!collab.__unsafeGetLoadedDocForTests(slug), 'Expected buildCollabSession to evict stale loaded doc after persisted version bump');
 

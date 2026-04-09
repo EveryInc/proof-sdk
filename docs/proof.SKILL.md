@@ -18,7 +18,7 @@ Proof is the hosted product. Proof SDK is the open-source editor, collaboration 
 Shared URL format:
 
 ```text
-http://localhost:4000/d/<slug>?token=<token>
+http://localhost:5555/d/<slug>?token=<token>
 ```
 
 Use one of:
@@ -32,7 +32,7 @@ Use one of:
 ### Create a document
 
 ```bash
-curl -sS -X POST http://localhost:4000/documents \
+curl -sS -X POST http://localhost:5555/documents \
   -H "Content-Type: application/json" \
   -d '{"title":"My Document","markdown":"# Hello\n\nFirst draft."}'
 ```
@@ -42,7 +42,7 @@ Hosted Proof also keeps `POST /share/markdown` as a compatibility alias.
 ### Read state
 
 ```bash
-curl -sS "http://localhost:4000/documents/<slug>/state" \
+curl -sS "http://localhost:5555/documents/<slug>/state" \
   -H "Authorization: Bearer <token>" \
   -H "X-Agent-Id: <your-agent-id>"
 ```
@@ -52,21 +52,21 @@ Include `X-Agent-Id` on `GET /state` only when you want presence to appear for t
 Content negotiation also works directly on shared links:
 
 ```bash
-curl -sS -H "Accept: application/json" "http://localhost:4000/d/<slug>?token=<token>"
-curl -sS -H "Accept: text/markdown" "http://localhost:4000/d/<slug>?token=<token>"
+curl -sS -H "Accept: application/json" "http://localhost:5555/d/<slug>?token=<token>"
+curl -sS -H "Accept: text/markdown" "http://localhost:5555/d/<slug>?token=<token>"
 ```
 
 ### Get a snapshot for structured edits
 
 ```bash
-curl -sS "http://localhost:4000/documents/<slug>/snapshot" \
+curl -sS "http://localhost:5555/documents/<slug>/snapshot" \
   -H "Authorization: Bearer <token>"
 ```
 
 ### Apply block edits with `edit/v2`
 
 ```bash
-curl -sS -X POST "http://localhost:4000/documents/<slug>/edit/v2" \
+curl -sS -X POST "http://localhost:5555/documents/<slug>/edit/v2" \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer <token>" \
   -H "Idempotency-Key: <unique-key>" \
@@ -111,14 +111,14 @@ POST /documents/<slug>/events/ack
 ### Poll events
 
 ```bash
-curl -sS "http://localhost:4000/documents/<slug>/events/pending?after=0" \
+curl -sS "http://localhost:5555/documents/<slug>/events/pending?after=0" \
   -H "Authorization: Bearer <token>"
 ```
 
 ### Send presence
 
 ```bash
-curl -sS -X POST "http://localhost:4000/documents/<slug>/presence" \
+curl -sS -X POST "http://localhost:5555/documents/<slug>/presence" \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer <token>" \
   -H "X-Agent-Id: <your-agent-id>" \
@@ -155,8 +155,8 @@ curl -sS -X POST "http://localhost:4000/documents/<slug>/presence" \
 
 ## References
 
-- Discovery JSON: `http://localhost:4000/.well-known/agent.json`
-- Docs: `http://localhost:4000/agent-docs`
-- Setup: `http://localhost:4000/agent-setup`
+- Discovery JSON: `http://localhost:5555/.well-known/agent.json`
+- Docs: `http://localhost:5555/agent-docs`
+- Setup: `http://localhost:5555/agent-setup`
 - [AGENT_CONTRACT.md](/Users/danshipper/CascadeProjects/every-proof/.worktrees/proof-sdk-split/AGENT_CONTRACT.md)
 - [agent-docs.md](/Users/danshipper/CascadeProjects/every-proof/.worktrees/proof-sdk-split/docs/agent-docs.md)

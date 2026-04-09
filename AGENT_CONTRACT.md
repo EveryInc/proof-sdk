@@ -148,7 +148,7 @@ Send `Idempotency-Key` on mutation requests so retries stay safe.
 ## CLI Example
 
 ```bash
-curl -X POST http://localhost:4000/documents \
+curl -X POST http://localhost:5555/documents \
   -H "Content-Type: application/json" \
   -d '{"markdown":"# Plan\n\nShip the rewrite.","title":"Rewrite Plan","role":"commenter"}'
 ```

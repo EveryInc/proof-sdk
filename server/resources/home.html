@@ -714,7 +714,7 @@
         </div>
         <div class="logo-proof-animation" aria-hidden="true"></div>
       </div>
-      <a href="/get-started" class="btn-primary mobile-btn">Get started</a>
+      <form action="/get-started" method="post" style="display:inline"><button type="submit" class="btn-primary mobile-btn">Get started</button></form>
     </div>
 
     <div class="logo-proof" data-logo-animation="/assets/proof-logo-animation-v2.lottie?v=20260310c">
@@ -731,7 +731,7 @@
       </div>
     </div>
     
-    <a href="/get-started" class="btn-primary">Get started</a>
+    <form action="/get-started" method="post" style="display:inline"><button type="submit" class="btn-primary">Get started</button></form>
   </div>
   
   <div class="showcase">
@@ -768,7 +768,7 @@
         <h2 class="ca-heading">Connect your agent</h2>
         <p class="ca-subheading">Use Proof in your browser — no install needed.</p>
       </div>
-      <a href="/get-started" class="btn-primary" style="width: max-content;">Get started</a>
+      <form action="/get-started" method="post" style="display:inline"><button type="submit" class="btn-primary" style="width: max-content;">Get started</button></form>
       
       <p class="ca-footer-text">
         No app install needed. The by field powers provenance tracking — the human sees exactly what your agent wrote.<br>
@@ -799,7 +799,7 @@
             <button class="copy-btn" onclick="copyCode('code-any-agent')">Copy</button>
 <pre># Quick start: click "Get started" above, then paste the doc URL into your agent.
 
-export PROOF_BASE_URL="${PROOF_BASE_URL:-http://localhost:4000}"
+export PROOF_BASE_URL="${PROOF_BASE_URL:-__PROOF_BASE_URL__}"
 
 # Optional: install the Proof skill (if your agent supports skills)
 # Skill URL: $PROOF_BASE_URL/proof.SKILL.md
@@ -836,7 +836,7 @@ curl -sS -X POST "$PROOF_BASE_URL/documents/&lt;slug&gt;/ops" \
         <div id="tab-claude-code" class="panel-content">
           <div id="code-claude-code" class="code-shell">
             <button class="copy-btn" onclick="copyCode('code-claude-code')">Copy</button>
-<pre>Read http://localhost:4000/agent-setup and follow all the instructions to install the Proof skill and configure yourself for persistent collaboration. Ask me before making config changes.</pre>
+<pre>Read __PROOF_BASE_URL__/agent-setup and follow all the instructions to install the Proof skill and configure yourself for persistent collaboration. Ask me before making config changes.</pre>
           </div>
         <div class="ca-footer-text" style="margin-top: 10px;">Installs the Proof skill, sets up collaboration instructions, and keeps the hosted Proof and Proof SDK workflows aligned.</div>
         </div>
@@ -844,7 +844,7 @@ curl -sS -X POST "$PROOF_BASE_URL/documents/&lt;slug&gt;/ops" \
         <div id="tab-codex" class="panel-content">
           <div id="code-codex" class="code-shell">
             <button class="copy-btn" onclick="copyCode('code-codex')">Copy</button>
-<pre>Read http://localhost:4000/codex-agent-setup and follow all the instructions to install the Proof skill and configure yourself for persistent collaboration, including Proof SDK-style document creation via POST /documents. Ask me before making config changes.</pre>
+<pre>Read __PROOF_BASE_URL__/codex-agent-setup and follow all the instructions to install the Proof skill and configure yourself for persistent collaboration, including Proof SDK-style document creation via POST /documents. Ask me before making config changes.</pre>
           </div>
         <div class="ca-footer-text" style="margin-top: 10px;">Installs the Proof skill and saves collaboration instructions to ~/.codex/AGENTS.md, including the neutral `/documents` and `/documents/:slug/bridge/*` workflow.</div>
         </div>
@@ -852,7 +852,7 @@ curl -sS -X POST "$PROOF_BASE_URL/documents/&lt;slug&gt;/ops" \
         <div id="tab-cursor" class="panel-content">
           <div id="code-cursor" class="code-shell">
             <button class="copy-btn" onclick="copyCode('code-cursor')">Copy</button>
-<pre>Read http://localhost:4000/agent-setup and follow all the instructions to install the Proof skill and configure yourself for persistent collaboration. Ask me before making config changes.</pre>
+<pre>Read __PROOF_BASE_URL__/agent-setup and follow all the instructions to install the Proof skill and configure yourself for persistent collaboration. Ask me before making config changes.</pre>
           </div>
         <div class="ca-footer-text" style="margin-top: 10px;">Installs the Proof skill, sets up collaboration rules, and points you at the hosted Proof plus reusable Proof SDK routes.</div>
         </div>
@@ -860,7 +860,7 @@ curl -sS -X POST "$PROOF_BASE_URL/documents/&lt;slug&gt;/ops" \
         <div id="tab-windsurf" class="panel-content">
           <div id="code-windsurf" class="code-shell">
             <button class="copy-btn" onclick="copyCode('code-windsurf')">Copy</button>
-<pre>Read http://localhost:4000/agent-setup and follow all the instructions to install the Proof skill and configure yourself for persistent collaboration. Ask me before making config changes.</pre>
+<pre>Read __PROOF_BASE_URL__/agent-setup and follow all the instructions to install the Proof skill and configure yourself for persistent collaboration. Ask me before making config changes.</pre>
           </div>
         <div class="ca-footer-text" style="margin-top: 10px;">Installs the Proof skill and sets up collaboration rules so Cascade can use the hosted product or the reusable Proof SDK bridge routes.</div>
         </div>
@@ -870,7 +870,7 @@ curl -sS -X POST "$PROOF_BASE_URL/documents/&lt;slug&gt;/ops" \
 
   <div class="bottom-cta">
     <h2>Ready to try it?</h2>
-    <a href="/get-started" class="btn-primary">Get started</a>
+    <form action="/get-started" method="post" style="display:inline"><button type="submit" class="btn-primary">Get started</button></form>
     <p class="ca-footer-text" style="margin-top: 18px;">Hosted Proof is available at <a href="https://proofeditor.ai">proofeditor.ai</a>.</p>
   </div>
 </div>

@@ -61,7 +61,7 @@ RUN mkdir -p /data && chown node:node /data
 
 USER node
 
-EXPOSE 4000
+EXPOSE 5555
 
 ENTRYPOINT ["/usr/bin/dumb-init", "--"]
 CMD ["tsx", "server/index.ts"]

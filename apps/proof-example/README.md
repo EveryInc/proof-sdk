@@ -22,7 +22,7 @@ npm run proof-sdk:demo:agent
 
 Environment variables:
 
-- `PROOF_BASE_URL`: defaults to `http://127.0.0.1:4000`
+- `PROOF_BASE_URL`: defaults to `http://127.0.0.1:5555`
 - `PROOF_DEMO_TITLE`: optional document title override
 - `PROOF_DEMO_MARKDOWN`: optional initial markdown override
 

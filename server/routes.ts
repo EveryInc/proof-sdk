@@ -622,7 +622,7 @@ function resolveRequestScopedCollabWsBase(req: Request): string {
   }
 }
 
-function buildShareLink(req: Request, slug: string): { url: string; shareUrl: string } {
+export function buildShareLink(req: Request, slug: string): { url: string; shareUrl: string } {
   const url = `/d/${slug}`;
   const base = getPublicBaseUrl(req);
   return {
@@ -631,7 +631,7 @@ function buildShareLink(req: Request, slug: string): { url: string; shareUrl: st
   };
 }
 
-function withShareToken(url: string, token: string): string {
+export function withShareToken(url: string, token: string): string {
   const separator = url.includes('?') ? '&' : '?';
   return `${url}${separator}token=${encodeURIComponent(token)}`;
 }

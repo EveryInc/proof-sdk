@@ -16,15 +16,18 @@ import {
   enforceBridgeClientCompatibility,
 } from './client-capabilities.js';
 import { getBuildInfo } from './build-info.js';
+import { homeRoutes } from './home-routes.js';
+import { isShuttingDown, setShuttingDown } from './shutdown-state.js';
+import { flushAllDocumentsForShutdown } from './collab.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const PORT = Number.parseInt(process.env.PORT || '4000', 10);
+const PORT = Number.parseInt(process.env.PORT || '5555', 10);
 const DEFAULT_ALLOWED_CORS_ORIGINS = [
-  'http://localhost:3000',
-  'http://127.0.0.1:3000',
-  'http://localhost:4000',
-  'http://127.0.0.1:4000',
+  'http://localhost:5556',
+  'http://127.0.0.1:5556',
+  'http://localhost:5555',
+  'http://127.0.0.1:5555',
   'null',
 ];
 
@@ -46,7 +49,6 @@ async function main(): Promise<void> {
   const allowedCorsOrigins = parseAllowedCorsOrigins();
 
   app.use(express.json({ limit: '10mb' }));
-  app.use(express.static(path.join(__dirname, '..', 'public')));
 
   app.use((req, res, next) => {
     const originHeader = req.header('origin');
@@ -80,31 +82,12 @@ async function main(): Promise<void> {
     next();
   });
 
-  app.get('/', (_req, res) => {
-    res.type('html').send(`<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Proof SDK</title>
-    <style>
-      body { font-family: ui-sans-serif, system-ui, sans-serif; margin: 0; padding: 48px 24px; color: #17261d; background: #f7faf5; }
-      main { max-width: 760px; margin: 0 auto; }
-      h1 { font-size: 2.5rem; margin: 0 0 0.5rem; }
-      p { font-size: 1.05rem; line-height: 1.6; }
-      code { background: #eaf2e6; padding: 0.2rem 0.35rem; border-radius: 4px; }
-      a { color: #266854; }
-    </style>
-  </head>
-  <body>
-    <main>
-      <h1>Proof SDK</h1>
-      <p>Open-source collaborative markdown editing with provenance tracking and an agent HTTP bridge.</p>
-      <p>Start with <code>POST /documents</code>, inspect <a href="/agent-docs">agent docs</a>, or read <a href="/.well-known/agent.json">discovery metadata</a>.</p>
-    </main>
-  </body>
-</html>`);
-  });
+  // Home routes before static middleware so / serves the landing page,
+  // not the SPA index.html that the build copies into public/.
+  app.use(homeRoutes);
+
+  app.use(express.static(path.join(__dirname, '..', 'public'), { index: false }));
+  app.use(express.static(path.join(__dirname, '..', 'dist'), { index: false }));
 
   app.get('/health', (_req, res) => {
     const buildInfo = getBuildInfo();
@@ -131,9 +114,35 @@ async function main(): Promise<void> {
   setupWebSocket(wss);
   await startCollabRuntimeEmbedded(PORT);
 
-  server.listen(PORT, () => {
-    console.log(`[proof-sdk] listening on http://127.0.0.1:${PORT}`);
+  const HOST = process.env.HOST || '0.0.0.0';
+  server.listen(PORT, HOST, () => {
+    console.log(`[proof-sdk] listening on http://${HOST}:${PORT}`);
   });
+
+  // Graceful shutdown: drain HTTP connections, flush collab documents, then exit.
+  const shutdown = async (signal: string) => {
+    if (isShuttingDown()) return;
+    setShuttingDown();
+    console.log(`[proof-sdk] ${signal} received, shutting down…`);
+
+    const forceTimeout = setTimeout(() => {
+      console.error('[proof-sdk] shutdown timeout, forcing exit');
+      process.exit(1);
+    }, 10_000);
+    forceTimeout.unref();
+
+    let exitCode = 0;
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    try {
+      await flushAllDocumentsForShutdown();
+    } catch (error) {
+      console.error('[proof-sdk] error during shutdown flush', error);
+      exitCode = 1;
+    }
+    process.exit(exitCode);
+  };
+  process.on('SIGTERM', () => void shutdown('SIGTERM'));
+  process.on('SIGINT', () => void shutdown('SIGINT'));
 }
 
 main().catch((error) => {

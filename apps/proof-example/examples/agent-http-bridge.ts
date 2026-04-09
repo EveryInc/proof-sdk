@@ -50,7 +50,7 @@ async function createDocument(baseUrl: string, title: string, markdown: string):
 }
 
 async function run(): Promise<void> {
-  const baseUrl = (process.env.PROOF_BASE_URL || 'http://127.0.0.1:4000').replace(/\/+$/, '');
+  const baseUrl = (process.env.PROOF_BASE_URL || 'http://127.0.0.1:5555').replace(/\/+$/, '');
   const title = process.env.PROOF_DEMO_TITLE || 'Proof SDK Example';
   const markdown = process.env.PROOF_DEMO_MARKDOWN || '# Hello\n\nThis draft needs a stronger opening.';
   const provider = new DemoAgentProvider();

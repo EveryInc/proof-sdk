@@ -6,7 +6,7 @@
  * - server onboarding/hook routes
  * - route payload validation for share document APIs
  *
- * Run: PORT=4000 npm run test:server-routes-share
+ * Run: PORT=5555 npm run test:server-routes-share
  */
 
 import { readFileSync, unlinkSync } from 'node:fs';
@@ -17,7 +17,7 @@ import express from 'express';
 import * as Y from 'yjs';
 import { buildSharePreviewModel, resolveOgTextLayout } from '../../server/share-preview';
 
-const SHARE_BASE = process.env.SHARE_BASE_URL ?? 'http://localhost:4000';
+const SHARE_BASE = process.env.SHARE_BASE_URL ?? 'http://localhost:5555';
 const CLIENT_HEADERS = {
   'X-Proof-Client-Version': '0.31.0',
   'X-Proof-Client-Build': 'tests',
@@ -481,7 +481,7 @@ async function runServerHookTests(): Promise<void> {
     const body = response.body || '';
     assertIncludes(
       body,
-      'http://localhost:4000/agent-setup',
+      'http://localhost:5555/agent-setup',
       'agent-setup should point at the local SDK setup endpoint',
     );
     assertIncludes(
@@ -513,7 +513,7 @@ async function runServerHookTests(): Promise<void> {
     );
     assertIncludes(
       body,
-      'PROOF_BASE_URL="${PROOF_BASE_URL:-http://localhost:4000}"',
+      'PROOF_BASE_URL="${PROOF_BASE_URL:-http://localhost:5555}"',
       'landing page should include a configurable local Proof SDK base URL',
     );
     assertIncludes(

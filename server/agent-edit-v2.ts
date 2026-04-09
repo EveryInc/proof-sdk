@@ -841,6 +841,29 @@ export async function applyAgentEditV2(
     };
   }
 
+  // When baseRevision is used with live collab clients, verify the live Yjs
+  // state hasn't diverged from the persisted DB row. baseRevision only
+  // validates against the DB revision counter, but the live doc may contain
+  // unpersisted browser edits. Applying operations against the wrong baseline
+  // causes a split-brain where the DB row is updated but the live session
+  // never sees the change, leaving the projection stuck in yjs_fallback.
+  if (!baseToken && baseRevision !== null && activeCollabClients > 0 && authoritativeBase.ok) {
+    const liveMarkdown = stripEphemeralCollabSpans(authoritativeBase.base.markdown);
+    const persistedMarkdown = stripEphemeralCollabSpans(doc.markdown ?? '');
+    if (liveMarkdown !== persistedMarkdown) {
+      const snapshot = await buildSnapshot(slug);
+      return {
+        status: 409,
+        body: {
+          success: false,
+          code: 'LIVE_STATE_DIVERGED',
+          error: 'Live document state has diverged from persisted revision; use baseToken for coherent edits while collab clients are connected',
+          ...(snapshot ? { snapshot } : {}),
+        },
+      };
+    }
+  }
+
   const parser = await getHeadlessMilkdownParser();
   const authoritativeMarkdown = stripEphemeralCollabSpans(authoritativeBase.base.markdown);
   const authoritativeMarks = authoritativeBase.base.marks as Record<string, unknown>;
