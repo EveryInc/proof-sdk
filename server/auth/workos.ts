@@ -26,6 +26,10 @@ function getPublicBaseUrl(): string {
   return requireEnv('PROOF_PUBLIC_BASE_URL').replace(/\/+$/, '');
 }
 
+function getCookiePassword(): string {
+  return requireEnv('WORKOS_COOKIE_PASSWORD');
+}
+
 function getAllowedOrgIds(): Set<string> {
   const raw = (process.env.PROOF_ALLOWED_ORG_IDS || '').trim();
   if (!raw) return new Set();
@@ -39,6 +43,7 @@ interface WorkOSSessionData {
   organizationId: string | null;
   accessToken: string;
   refreshToken: string | null;
+  sealedSession: string | null;
 }
 
 function parseSessionData(accessTokenField: string): WorkOSSessionData | null {
@@ -99,8 +104,8 @@ export class WorkOSAuthStrategy implements AuthStrategy {
       return renderForbiddenPage({
         email: user.email,
         organizationName: user.organizationName,
-        loginUrl: '/auth/logout', // Switch Account = clear session, re-login
-        switchOrgUrl: `/auth/login?return_to=${returnTo}`, // Re-enter AuthKit to pick org
+        loginUrl: '/auth/logout', // Switch Account = clear both local + WorkOS session
+        switchOrgUrl: `/auth/login?return_to=${returnTo}&prompt=select_organization`, // Force org picker
       });
     }
 
@@ -111,11 +116,32 @@ export class WorkOSAuthStrategy implements AuthStrategy {
     return `/auth/login?return_to=${encodeURIComponent(returnTo)}`;
   }
 
-  logout(req: Request, res: Response): void {
+  async logout(req: Request, res: Response): Promise<void> {
     const sessionToken = getSessionCookie(req);
-    if (sessionToken) revokeShareAuthSession(sessionToken);
+    let workosLogoutUrl: string | null = null;
+
+    if (sessionToken) {
+      // Try to get WorkOS logout URL to clear the AuthKit session too
+      const session = getShareAuthSession(sessionToken);
+      if (session) {
+        const data = parseSessionData(session.access_token);
+        if (data?.sealedSession) {
+          try {
+            const workosSession = this.workos.userManagement.loadSealedSession({
+              sessionData: data.sealedSession,
+              cookiePassword: getCookiePassword(),
+            });
+            workosLogoutUrl = await workosSession.getLogoutUrl();
+          } catch {
+            // Sealed session may be expired/invalid — fall through to local logout
+          }
+        }
+      }
+      revokeShareAuthSession(sessionToken);
+    }
+
     clearSessionCookie(req, res);
-    res.redirect('/auth/login');
+    res.redirect(workosLogoutUrl ?? '/auth/login');
   }
 
   // ── Routes ───────────────────────────────────────────────────────────────
@@ -130,11 +156,13 @@ export class WorkOSAuthStrategy implements AuthStrategy {
      *   - return_to: URL to redirect to after login (default: /)
      *   - organization: pre-select an org in AuthKit (for "Switch Organisation")
      *   - screen_hint: 'sign-up' | 'sign-in'
+     *   - prompt: passed through to WorkOS (e.g. 'select_organization')
      */
     router.get('/auth/login', (req: Request, res: Response) => {
       const returnTo = sanitizeReturnTo(typeof req.query.return_to === 'string' ? req.query.return_to : '/');
       const organizationId = typeof req.query.organization === 'string' ? req.query.organization : undefined;
       const screenHint = typeof req.query.screen_hint === 'string' ? req.query.screen_hint : undefined;
+      const prompt = typeof req.query.prompt === 'string' ? req.query.prompt : undefined;
 
       const state = Buffer.from(JSON.stringify({ returnTo })).toString('base64url');
 
@@ -145,6 +173,7 @@ export class WorkOSAuthStrategy implements AuthStrategy {
         state,
         organizationId,
         screenHint: screenHint as 'sign-up' | 'sign-in' | undefined,
+        prompt,
       });
 
       res.redirect(authorizationUrl);
@@ -175,9 +204,11 @@ export class WorkOSAuthStrategy implements AuthStrategy {
       }
 
       try {
+        const cookiePassword = getCookiePassword();
         const result = await this.workos.userManagement.authenticateWithCode({
           clientId: this.clientId,
           code,
+          session: { sealSession: true, cookiePassword },
         });
 
         const user = result.user;
@@ -193,6 +224,7 @@ export class WorkOSAuthStrategy implements AuthStrategy {
           organizationId: orgId,
           accessToken: result.accessToken,
           refreshToken: result.refreshToken,
+          sealedSession: result.sealedSession ?? null,
         };
 
         createShareAuthSession({
@@ -286,8 +318,8 @@ export class WorkOSAuthStrategy implements AuthStrategy {
     /**
      * GET /auth/logout
      */
-    router.get('/auth/logout', (req: Request, res: Response) => {
-      this.logout(req, res);
+    router.get('/auth/logout', async (req: Request, res: Response) => {
+      await this.logout(req, res);
     });
 
     return router;
