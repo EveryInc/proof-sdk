@@ -11,6 +11,8 @@ import {
   getLocalUserByEmail,
   getLocalUserById,
   updateLocalUserName,
+  updateLocalUserEmail,
+  updateLocalUserPassword,
   touchShareAuthSessionVerification,
 } from '../db.js';
 
@@ -353,52 +355,121 @@ export class LocalAuthStrategy implements AuthStrategy {
 
     // ── Account settings ──────────────────────────────────────────────────
 
+    const successBanner = (msg: string) =>
+      `<div style="background:rgba(38,104,84,0.08);border:1px solid rgba(38,104,84,0.15);color:#266854;border-radius:4px;padding:10px 14px;font-size:14px;margin-bottom:20px;text-align:center;">${escapeHtml(msg)}</div>`;
+
+    const errorBanner = (msg: string) =>
+      `<div class="error">${escapeHtml(msg)}</div>`;
+
+    const sectionDivider = '<hr style="border:none;border-top:1px solid rgba(38,37,30,0.08);margin:24px 0;">';
+
+    const renderAccountPage = (user: AuthenticatedUser, opts?: { nameMsg?: string; emailMsg?: string; emailErr?: string; pwMsg?: string; pwErr?: string }) => {
+      const o = opts ?? {};
+      return formPage({
+        title: 'Account',
+        action: '/auth/account/name',
+        returnTo: '/',
+        submitLabel: 'Update Name',
+        fields: `
+          ${o.nameMsg ? successBanner(o.nameMsg) : ''}
+          <label for="name">Name</label>
+          <input type="text" id="name" name="name" value="${escapeAttr(user.name || '')}">
+        </form>
+        ${sectionDivider}
+        <form method="POST" action="/auth/account/email">
+          ${o.emailMsg ? successBanner(o.emailMsg) : ''}${o.emailErr ? errorBanner(o.emailErr) : ''}
+          <label for="email">Email</label>
+          <input type="email" id="email" name="email" value="${escapeAttr(user.email)}" required>
+          <label for="email_password">Current Password</label>
+          <input type="password" id="email_password" name="password" required>
+          <button type="submit" class="btn" style="margin-bottom:0;">Update Email</button>
+        </form>
+        ${sectionDivider}
+        <form method="POST" action="/auth/account/password">
+          ${o.pwMsg ? successBanner(o.pwMsg) : ''}${o.pwErr ? errorBanner(o.pwErr) : ''}
+          <label for="current_password">Current Password</label>
+          <input type="password" id="current_password" name="current_password" required>
+          <label for="new_password">New Password</label>
+          <input type="password" id="new_password" name="new_password" required>
+          <button type="submit" class="btn" style="margin-bottom:0;">Update Password</button>`,
+        footerHtml: '<a href="/">&larr; Back</a>',
+      });
+    };
+
     router.get('/auth/account', (req: Request, res: Response) => {
       const user = req.authenticatedUser;
       if (!user) { res.redirect('/auth/login'); return; }
-      res.type('html').send(formPage({
-        title: 'Account',
-        action: '/auth/account',
-        returnTo: '/',
-        submitLabel: 'Save',
-        fields: `
-          <label for="name">Name</label>
-          <input type="text" id="name" name="name" value="${escapeAttr(user.name || '')}" autofocus>
-          <label>Email</label>
-          <input type="email" value="${escapeAttr(user.email)}" disabled style="opacity:0.6;cursor:not-allowed;">`,
-        footerHtml: '<a href="/">&larr; Back</a>',
-      }));
+      res.type('html').send(renderAccountPage(user));
     });
 
-    router.post('/auth/account', parseForm, (req: Request, res: Response) => {
+    router.post('/auth/account/name', parseForm, (req: Request, res: Response) => {
       const user = req.authenticatedUser;
       if (!user) { res.redirect('/auth/login'); return; }
 
       const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
-      const userId = Number(user.id);
+      updateLocalUserName(Number(user.id), name || null);
+      touchShareAuthSessionVerification({ sessionToken: user.sessionToken, name: name || null });
 
-      updateLocalUserName(userId, name || null);
+      // Reflect updated name in the rendered page
+      const updated = { ...user, name: name || null };
+      res.type('html').send(renderAccountPage(updated, { nameMsg: 'Name updated.' }));
+    });
 
-      // Update the session so the name change is reflected immediately
-      touchShareAuthSessionVerification({
-        sessionToken: user.sessionToken,
-        name: name || null,
-      });
+    router.post('/auth/account/email', parseForm, async (req: Request, res: Response) => {
+      const user = req.authenticatedUser;
+      if (!user) { res.redirect('/auth/login'); return; }
 
-      res.type('html').send(formPage({
-        title: 'Account',
-        action: '/auth/account',
-        returnTo: '/',
-        submitLabel: 'Save',
-        error: null,
-        fields: `
-          <div style="background:rgba(38,104,84,0.08);border:1px solid rgba(38,104,84,0.15);color:#266854;border-radius:4px;padding:10px 14px;font-size:14px;margin-bottom:20px;text-align:center;">Name updated.</div>
-          <label for="name">Name</label>
-          <input type="text" id="name" name="name" value="${escapeAttr(name)}" autofocus>
-          <label>Email</label>
-          <input type="email" value="${escapeAttr(user.email)}" disabled style="opacity:0.6;cursor:not-allowed;">`,
-        footerHtml: '<a href="/">&larr; Back</a>',
-      }));
+      const newEmail = typeof req.body?.email === 'string' ? req.body.email.trim() : '';
+      const password = typeof req.body?.password === 'string' ? req.body.password : '';
+
+      if (!newEmail || !password) {
+        res.status(400).type('html').send(renderAccountPage(user, { emailErr: 'Email and current password are required.' }));
+        return;
+      }
+
+      // Verify current password
+      const dbUser = getLocalUserById(Number(user.id));
+      if (!dbUser || !(await verifyPassword(password, dbUser.password_hash))) {
+        res.status(401).type('html').send(renderAccountPage(user, { emailErr: 'Incorrect password.' }));
+        return;
+      }
+
+      // Check uniqueness
+      const existing = getLocalUserByEmail(newEmail);
+      if (existing && existing.id !== dbUser.id) {
+        res.status(400).type('html').send(renderAccountPage(user, { emailErr: 'That email is already in use.' }));
+        return;
+      }
+
+      updateLocalUserEmail(dbUser.id, newEmail);
+      touchShareAuthSessionVerification({ sessionToken: user.sessionToken, email: newEmail });
+
+      const updated = { ...user, email: newEmail };
+      res.type('html').send(renderAccountPage(updated, { emailMsg: 'Email updated.' }));
+    });
+
+    router.post('/auth/account/password', parseForm, async (req: Request, res: Response) => {
+      const user = req.authenticatedUser;
+      if (!user) { res.redirect('/auth/login'); return; }
+
+      const currentPassword = typeof req.body?.current_password === 'string' ? req.body.current_password : '';
+      const newPassword = typeof req.body?.new_password === 'string' ? req.body.new_password : '';
+
+      if (!currentPassword || !newPassword) {
+        res.status(400).type('html').send(renderAccountPage(user, { pwErr: 'Both fields are required.' }));
+        return;
+      }
+
+      const dbUser = getLocalUserById(Number(user.id));
+      if (!dbUser || !(await verifyPassword(currentPassword, dbUser.password_hash))) {
+        res.status(401).type('html').send(renderAccountPage(user, { pwErr: 'Incorrect current password.' }));
+        return;
+      }
+
+      const newHash = await hashPassword(newPassword);
+      updateLocalUserPassword(dbUser.id, newHash);
+
+      res.type('html').send(renderAccountPage(user, { pwMsg: 'Password updated.' }));
     });
 
     // ── Logout ───────────────────────────────────────────────────────────

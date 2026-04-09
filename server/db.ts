@@ -3746,6 +3746,18 @@ export function updateLocalUserName(id: number, name: string | null): boolean {
   return result.changes > 0;
 }
 
+export function updateLocalUserEmail(id: number, email: string): boolean {
+  assertWritesAllowed('updateLocalUserEmail');
+  const result = getDb().prepare('UPDATE local_users SET email = ? WHERE id = ?').run(email, id);
+  return result.changes > 0;
+}
+
+export function updateLocalUserPassword(id: number, passwordHash: string): boolean {
+  assertWritesAllowed('updateLocalUserPassword');
+  const result = getDb().prepare('UPDATE local_users SET password_hash = ? WHERE id = ?').run(passwordHash, id);
+  return result.changes > 0;
+}
+
 // ── User Document Visits (dashboard) ──────────────────────────────────────────
 
 export function upsertUserDocumentVisit(everyUserId: number, slug: string, role?: string): void {
