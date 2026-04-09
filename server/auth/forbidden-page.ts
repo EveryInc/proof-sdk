@@ -20,12 +20,16 @@ export function renderForbiddenPage(options: {
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Access Denied | Proof</title>
+  <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png?v=20260309p">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://api.fontshare.com/v2/css?f[]=switzer@1,2&display=swap" rel="stylesheet">
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body {
-      font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      background: #0f172a;
-      color: #e2e8f0;
+      font-family: 'Switzer', 'Switzer Variable', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: #f5f3ec;
+      color: #26251e;
       min-height: 100vh;
       display: flex;
       align-items: center;
@@ -34,27 +38,33 @@ export function renderForbiddenPage(options: {
     }
     .card {
       width: min(520px, 100%);
-      background: rgba(15, 23, 42, 0.92);
-      border: 1px solid #334155;
-      border-radius: 24px;
+      background: #edeae0;
+      border: 1px solid rgba(38, 37, 30, 0.03);
+      border-radius: 4px;
       padding: 40px 32px;
-      box-shadow: 0 20px 50px rgba(15, 23, 42, 0.45);
       text-align: center;
     }
     .icon { font-size: 48px; margin-bottom: 16px; }
-    h1 { font-size: 24px; font-weight: 600; color: #f8fafc; margin-bottom: 12px; }
-    .detail { font-size: 15px; line-height: 1.6; color: #94a3b8; margin-bottom: 28px; }
-    .detail strong { color: #cbd5e1; }
+    h1 { font-size: 26px; font-weight: 400; color: #26251e; margin-bottom: 12px; letter-spacing: -0.325px; }
+    .detail { font-size: 16px; line-height: 1.6; color: rgba(38, 37, 30, 0.6); margin-bottom: 28px; }
+    .detail strong { color: #26251e; }
     .actions { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
     .btn {
-      display: inline-flex; align-items: center; padding: 10px 20px;
-      border-radius: 10px; font-size: 14px; font-weight: 500;
-      text-decoration: none; transition: background 0.15s, border-color 0.15s;
+      display: inline-flex; align-items: center; padding: 12.48px 21.6px;
+      border-radius: 33554400px; font-family: inherit; font-size: 16px; font-weight: 400;
+      text-decoration: none;
+      transition: filter 0.2s ease, transform 0.1s ease, box-shadow 0.2s ease;
     }
-    .btn-primary { background: #3b82f6; color: #fff; border: 1px solid #3b82f6; }
-    .btn-primary:hover { background: #2563eb; border-color: #2563eb; }
-    .btn-secondary { background: transparent; color: #cbd5e1; border: 1px solid #475569; }
-    .btn-secondary:hover { background: rgba(71, 85, 105, 0.3); border-color: #64748b; }
+    .btn-primary {
+      background: linear-gradient(-1.66deg, #266854 4.43%, #1f8a65 110.83%);
+      color: #f7f7f4; border: none;
+    }
+    .btn-primary:hover { filter: brightness(1.1); transform: translateY(-2px); box-shadow: 0 4px 12px rgba(38, 104, 84, 0.3); }
+    .btn-secondary {
+      background: transparent; color: #26251e;
+      border: 1px solid rgba(38, 37, 30, 0.12);
+    }
+    .btn-secondary:hover { background: rgba(38, 37, 30, 0.04); }
   </style>
 </head>
 <body>

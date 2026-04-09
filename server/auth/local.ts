@@ -85,39 +85,46 @@ function formPage(options: {
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>${escapeHtml(title)} | Proof</title>
+  <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png?v=20260309p">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://api.fontshare.com/v2/css?f[]=switzer@1,2&display=swap" rel="stylesheet">
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body {
-      font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      background: #0f172a; color: #e2e8f0;
+      font-family: 'Switzer', 'Switzer Variable', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: #f5f3ec; color: #26251e;
       min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 24px;
     }
     .card {
-      width: min(420px, 100%); background: rgba(15, 23, 42, 0.92);
-      border: 1px solid #334155; border-radius: 24px;
-      padding: 40px 32px; box-shadow: 0 20px 50px rgba(15, 23, 42, 0.45);
+      width: min(420px, 100%); background: #edeae0;
+      border: 1px solid rgba(38, 37, 30, 0.03); border-radius: 4px;
+      padding: 40px 32px; position: relative;
     }
-    h1 { font-size: 24px; font-weight: 600; color: #f8fafc; margin-bottom: 24px; text-align: center; }
+    h1 { font-size: 26px; font-weight: 400; color: #26251e; margin-bottom: 24px; text-align: center; letter-spacing: -0.325px; }
     .error {
-      background: rgba(239, 68, 68, 0.15); border: 1px solid rgba(239, 68, 68, 0.3);
-      color: #fca5a5; border-radius: 10px; padding: 10px 14px;
+      background: rgba(220, 38, 38, 0.08); border: 1px solid rgba(220, 38, 38, 0.15);
+      color: #991b1b; border-radius: 4px; padding: 10px 14px;
       font-size: 14px; margin-bottom: 20px; text-align: center;
     }
-    label { display: block; font-size: 13px; font-weight: 500; color: #94a3b8; margin-bottom: 6px; }
+    label { display: block; font-size: 14px; font-weight: 400; color: rgba(38, 37, 30, 0.6); margin-bottom: 6px; }
     input[type="text"], input[type="email"], input[type="password"] {
-      width: 100%; padding: 10px 14px; border-radius: 10px;
-      border: 1px solid #334155; background: #1e293b; color: #f8fafc;
-      font-size: 15px; margin-bottom: 16px; outline: none; transition: border-color 0.15s;
+      width: 100%; padding: 10px 14px; border-radius: 4px;
+      border: 1px solid rgba(38, 37, 30, 0.12); background: #f5f3ec; color: #26251e;
+      font-family: inherit; font-size: 15px; margin-bottom: 16px; outline: none; transition: border-color 0.15s;
     }
-    input:focus { border-color: #3b82f6; }
+    input:focus { border-color: #266854; }
     .btn {
-      width: 100%; padding: 12px; border-radius: 10px; border: none;
-      background: #3b82f6; color: #fff; font-size: 15px; font-weight: 500;
-      cursor: pointer; transition: background 0.15s; margin-top: 4px;
+      width: 100%; padding: 12.48px; border-radius: 33554400px; border: none;
+      background: linear-gradient(-1.66deg, #266854 4.43%, #1f8a65 110.83%);
+      color: #f7f7f4; font-family: inherit; font-size: 16px; font-weight: 400;
+      cursor: pointer; margin-top: 4px;
+      transition: filter 0.2s ease, transform 0.1s ease, box-shadow 0.2s ease;
     }
-    .btn:hover { background: #2563eb; }
-    .footer { text-align: center; margin-top: 20px; font-size: 14px; color: #64748b; }
-    .footer a { color: #3b82f6; text-decoration: none; }
+    .btn:hover { filter: brightness(1.1); transform: translateY(-2px); box-shadow: 0 4px 12px rgba(38, 104, 84, 0.3); }
+    .btn:active { transform: translateY(1px); }
+    .footer { text-align: center; margin-top: 20px; font-size: 14px; color: rgba(38, 37, 30, 0.6); }
+    .footer a { color: #14a378; font-weight: 600; text-decoration: none; }
     .footer a:hover { text-decoration: underline; }
   </style>
 </head>
