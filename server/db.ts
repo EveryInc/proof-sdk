@@ -3735,6 +3735,17 @@ export function getLocalUserByEmail(email: string): LocalUserRow | null {
   return row ?? null;
 }
 
+export function getLocalUserById(id: number): LocalUserRow | null {
+  const row = getDb().prepare('SELECT * FROM local_users WHERE id = ?').get(id) as LocalUserRow | undefined;
+  return row ?? null;
+}
+
+export function updateLocalUserName(id: number, name: string | null): boolean {
+  assertWritesAllowed('updateLocalUserName');
+  const result = getDb().prepare('UPDATE local_users SET name = ? WHERE id = ?').run(name, id);
+  return result.changes > 0;
+}
+
 // ── User Document Visits (dashboard) ──────────────────────────────────────────
 
 export function upsertUserDocumentVisit(everyUserId: number, slug: string, role?: string): void {

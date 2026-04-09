@@ -9,6 +9,9 @@ import {
   revokeShareAuthSession,
   createLocalUser,
   getLocalUserByEmail,
+  getLocalUserById,
+  updateLocalUserName,
+  touchShareAuthSessionVerification,
 } from '../db.js';
 
 // ── Password hashing ─────────────────────────────────────────────────────────
@@ -346,6 +349,56 @@ export class LocalAuthStrategy implements AuthStrategy {
 
       this.createSession(user.id, user.email, user.name, req, res);
       res.redirect(returnTo);
+    });
+
+    // ── Account settings ──────────────────────────────────────────────────
+
+    router.get('/auth/account', (req: Request, res: Response) => {
+      const user = req.authenticatedUser;
+      if (!user) { res.redirect('/auth/login'); return; }
+      res.type('html').send(formPage({
+        title: 'Account',
+        action: '/auth/account',
+        returnTo: '/',
+        submitLabel: 'Save',
+        fields: `
+          <label for="name">Name</label>
+          <input type="text" id="name" name="name" value="${escapeAttr(user.name || '')}" autofocus>
+          <label>Email</label>
+          <input type="email" value="${escapeAttr(user.email)}" disabled style="opacity:0.6;cursor:not-allowed;">`,
+        footerHtml: '<a href="/">&larr; Back</a>',
+      }));
+    });
+
+    router.post('/auth/account', parseForm, (req: Request, res: Response) => {
+      const user = req.authenticatedUser;
+      if (!user) { res.redirect('/auth/login'); return; }
+
+      const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
+      const userId = Number(user.id);
+
+      updateLocalUserName(userId, name || null);
+
+      // Update the session so the name change is reflected immediately
+      touchShareAuthSessionVerification({
+        sessionToken: user.sessionToken,
+        name: name || null,
+      });
+
+      res.type('html').send(formPage({
+        title: 'Account',
+        action: '/auth/account',
+        returnTo: '/',
+        submitLabel: 'Save',
+        error: null,
+        fields: `
+          <div style="background:rgba(38,104,84,0.08);border:1px solid rgba(38,104,84,0.15);color:#266854;border-radius:4px;padding:10px 14px;font-size:14px;margin-bottom:20px;text-align:center;">Name updated.</div>
+          <label for="name">Name</label>
+          <input type="text" id="name" name="name" value="${escapeAttr(name)}" autofocus>
+          <label>Email</label>
+          <input type="email" value="${escapeAttr(user.email)}" disabled style="opacity:0.6;cursor:not-allowed;">`,
+        footerHtml: '<a href="/">&larr; Back</a>',
+      }));
     });
 
     // ── Logout ───────────────────────────────────────────────────────────
