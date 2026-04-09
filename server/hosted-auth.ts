@@ -3,7 +3,8 @@ export type ShareMarkdownAuthMode = 'none' | 'api_key' | 'oauth' | 'oauth_or_api
 type PendingAuthStatus = 'pending' | 'completed' | 'failed';
 
 export function isOAuthConfigured(_publicBaseUrl?: string): boolean {
-  return false;
+  const strategy = (process.env.PROOF_AUTH_STRATEGY || 'none').trim().toLowerCase();
+  return strategy !== 'none';
 }
 
 export function resolveShareMarkdownAuthMode(_publicBaseUrl?: string): Exclude<ShareMarkdownAuthMode, 'auto'> {
@@ -63,7 +64,7 @@ export async function handleOAuthCallback(_input: {
 }
 
 export async function validateHostedSessionToken(
-  _sessionToken: string,
+  sessionToken: string,
   _publicBaseUrl?: string,
 ): Promise<{
   ok: boolean;
@@ -75,9 +76,22 @@ export async function validateHostedSessionToken(
   };
   reason?: string;
 }> {
+  const { getShareAuthSession } = await import('./db.js');
+  const session = getShareAuthSession(sessionToken);
+  if (!session || session.revoked_at) {
+    return { ok: false, reason: 'invalid_session' };
+  }
+  if (new Date(session.session_expires_at) < new Date()) {
+    return { ok: false, reason: 'session_expired' };
+  }
   return {
-    ok: false,
-    reason: 'unsupported',
+    ok: true,
+    principal: {
+      userId: session.every_user_id,
+      email: session.email,
+      name: session.name,
+      sessionToken,
+    },
   };
 }
 
