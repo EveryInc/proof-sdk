@@ -6,6 +6,7 @@ const PUBLIC_PATHS = new Set([
   '/health',
   '/auth/login',
   '/auth/callback',
+  '/api/auth/callback',
   '/auth/logout',
 ]);
 

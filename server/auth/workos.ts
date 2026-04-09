@@ -63,7 +63,7 @@ export class WorkOSAuthStrategy implements AuthStrategy {
   constructor() {
     this.workos = new WorkOS(requireEnv('WORKOS_API_KEY'));
     this.clientId = requireEnv('WORKOS_CLIENT_ID');
-    this.redirectUri = `${getPublicBaseUrl()}/auth/callback`;
+    this.redirectUri = `${getPublicBaseUrl()}/api/auth/callback`;
     this.allowedOrgIds = getAllowedOrgIds();
     this.router = this.buildRouter();
   }
@@ -151,10 +151,10 @@ export class WorkOSAuthStrategy implements AuthStrategy {
     });
 
     /**
-     * GET /auth/callback
+     * GET /api/auth/callback
      * WorkOS redirects here after authentication.
      */
-    router.get('/auth/callback', async (req: Request, res: Response) => {
+    router.get('/api/auth/callback', async (req: Request, res: Response) => {
       const code = typeof req.query.code === 'string' ? req.query.code : '';
       const stateParam = typeof req.query.state === 'string' ? req.query.state : '';
       const error = typeof req.query.error === 'string' ? req.query.error : '';
