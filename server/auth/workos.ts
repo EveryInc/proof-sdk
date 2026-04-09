@@ -6,6 +6,14 @@ import { renderForbiddenPage } from './forbidden-page.js';
 import { getSessionCookie, setSessionCookie, clearSessionCookie } from '../cookies.js';
 import { createShareAuthSession, getShareAuthSession, revokeShareAuthSession } from '../db.js';
 
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+/** Prevent open redirects: only allow relative paths. */
+function sanitizeReturnTo(value: string): string {
+  if (value.startsWith('/') && !value.startsWith('//')) return value;
+  return '/';
+}
+
 // ── Config helpers ───────────────────────────────────────────────────────────
 
 function requireEnv(name: string): string {
@@ -124,7 +132,7 @@ export class WorkOSAuthStrategy implements AuthStrategy {
      *   - screen_hint: 'sign-up' | 'sign-in'
      */
     router.get('/auth/login', (req: Request, res: Response) => {
-      const returnTo = typeof req.query.return_to === 'string' ? req.query.return_to : '/';
+      const returnTo = sanitizeReturnTo(typeof req.query.return_to === 'string' ? req.query.return_to : '/');
       const organizationId = typeof req.query.organization === 'string' ? req.query.organization : undefined;
       const screenHint = typeof req.query.screen_hint === 'string' ? req.query.screen_hint : undefined;
 
@@ -208,7 +216,7 @@ export class WorkOSAuthStrategy implements AuthStrategy {
         if (stateParam) {
           try {
             const parsed = JSON.parse(Buffer.from(stateParam, 'base64url').toString());
-            if (typeof parsed.returnTo === 'string') returnTo = parsed.returnTo;
+            if (typeof parsed.returnTo === 'string') returnTo = sanitizeReturnTo(parsed.returnTo);
           } catch {
             // ignore malformed state
           }

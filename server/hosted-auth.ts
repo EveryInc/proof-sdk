@@ -1,3 +1,5 @@
+import { revokeShareAuthSession } from './db.js';
+
 export type ShareMarkdownAuthMode = 'none' | 'api_key' | 'oauth' | 'oauth_or_api_key' | 'auto';
 
 type PendingAuthStatus = 'pending' | 'completed' | 'failed';
@@ -95,6 +97,6 @@ export async function validateHostedSessionToken(
   };
 }
 
-export function revokeHostedSessionToken(_sessionToken: string): boolean {
-  return false;
+export function revokeHostedSessionToken(sessionToken: string): boolean {
+  return revokeShareAuthSession(sessionToken);
 }
