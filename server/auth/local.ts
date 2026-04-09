@@ -1,0 +1,352 @@
+import { randomBytes, scrypt, timingSafeEqual } from 'crypto';
+import { randomUUID } from 'crypto';
+import { Router, urlencoded, type Request, type Response } from 'express';
+import type { AuthStrategy, AuthenticatedUser } from './strategy.js';
+import { getSessionCookie, setSessionCookie, clearSessionCookie } from '../cookies.js';
+import {
+  createShareAuthSession,
+  getShareAuthSession,
+  revokeShareAuthSession,
+  createLocalUser,
+  getLocalUserByEmail,
+} from '../db.js';
+
+// ── Password hashing ─────────────────────────────────────────────────────────
+
+function hashPassword(password: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const salt = randomBytes(16).toString('hex');
+    scrypt(password, salt, 64, (err, derived) => {
+      if (err) reject(err);
+      else resolve(`${salt}:${derived.toString('hex')}`);
+    });
+  });
+}
+
+function verifyPassword(password: string, stored: string): Promise<boolean> {
+  return new Promise((resolve, reject) => {
+    const [salt, hash] = stored.split(':');
+    if (!salt || !hash) { resolve(false); return; }
+    scrypt(password, salt, 64, (err, derived) => {
+      if (err) reject(err);
+      else resolve(timingSafeEqual(Buffer.from(hash, 'hex'), derived));
+    });
+  });
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+function sanitizeReturnTo(value: string): string {
+  if (value.startsWith('/') && !value.startsWith('//')) return value;
+  return '/';
+}
+
+function getInviteCode(): string | null {
+  const code = (process.env.PROOF_LOCAL_INVITE_CODE || '').trim();
+  return code || null;
+}
+
+function constantTimeCompare(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  return timingSafeEqual(Buffer.from(a), Buffer.from(b));
+}
+
+// ── HTML helpers ─────────────────────────────────────────────────────────────
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function escapeAttr(value: string): string {
+  return escapeHtml(value).replace(/'/g, '&#39;');
+}
+
+function formPage(options: {
+  title: string;
+  error?: string | null;
+  fields: string;
+  submitLabel: string;
+  footerHtml?: string;
+  action: string;
+  returnTo: string;
+}): string {
+  const { title, error, fields, submitLabel, footerHtml, action, returnTo } = options;
+  const errorBlock = error
+    ? `<div class="error">${escapeHtml(error)}</div>`
+    : '';
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>${escapeHtml(title)} | Proof</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #0f172a; color: #e2e8f0;
+      min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 24px;
+    }
+    .card {
+      width: min(420px, 100%); background: rgba(15, 23, 42, 0.92);
+      border: 1px solid #334155; border-radius: 24px;
+      padding: 40px 32px; box-shadow: 0 20px 50px rgba(15, 23, 42, 0.45);
+    }
+    h1 { font-size: 24px; font-weight: 600; color: #f8fafc; margin-bottom: 24px; text-align: center; }
+    .error {
+      background: rgba(239, 68, 68, 0.15); border: 1px solid rgba(239, 68, 68, 0.3);
+      color: #fca5a5; border-radius: 10px; padding: 10px 14px;
+      font-size: 14px; margin-bottom: 20px; text-align: center;
+    }
+    label { display: block; font-size: 13px; font-weight: 500; color: #94a3b8; margin-bottom: 6px; }
+    input[type="text"], input[type="email"], input[type="password"] {
+      width: 100%; padding: 10px 14px; border-radius: 10px;
+      border: 1px solid #334155; background: #1e293b; color: #f8fafc;
+      font-size: 15px; margin-bottom: 16px; outline: none; transition: border-color 0.15s;
+    }
+    input:focus { border-color: #3b82f6; }
+    .btn {
+      width: 100%; padding: 12px; border-radius: 10px; border: none;
+      background: #3b82f6; color: #fff; font-size: 15px; font-weight: 500;
+      cursor: pointer; transition: background 0.15s; margin-top: 4px;
+    }
+    .btn:hover { background: #2563eb; }
+    .footer { text-align: center; margin-top: 20px; font-size: 14px; color: #64748b; }
+    .footer a { color: #3b82f6; text-decoration: none; }
+    .footer a:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>${escapeHtml(title)}</h1>
+    ${errorBlock}
+    <form method="POST" action="${escapeAttr(action)}">
+      <input type="hidden" name="return_to" value="${escapeAttr(returnTo)}">
+      ${fields}
+      <button type="submit" class="btn">${escapeHtml(submitLabel)}</button>
+    </form>
+    ${footerHtml ? `<div class="footer">${footerHtml}</div>` : ''}
+  </div>
+</body>
+</html>`;
+}
+
+// ── Strategy ─────────────────────────────────────────────────────────────────
+
+export class LocalAuthStrategy implements AuthStrategy {
+  readonly name = 'local';
+  readonly router: Router;
+
+  constructor() {
+    this.router = this.buildRouter();
+  }
+
+  resolveUser(req: Request): AuthenticatedUser | null {
+    const sessionToken = getSessionCookie(req);
+    if (!sessionToken) return null;
+
+    const session = getShareAuthSession(sessionToken);
+    if (!session || session.revoked_at || session.provider !== 'local') return null;
+    if (new Date(session.session_expires_at) < new Date()) return null;
+
+    let data: { localUserId: number };
+    try {
+      data = JSON.parse(session.access_token);
+    } catch {
+      return null;
+    }
+
+    return {
+      id: String(data.localUserId),
+      email: session.email,
+      name: session.name,
+      organizationId: null,
+      organizationName: null,
+      sessionToken,
+    };
+  }
+
+  checkAccess(_user: AuthenticatedUser, _req: Request): string | null {
+    return null;
+  }
+
+  loginUrl(returnTo: string): string {
+    return `/auth/login?return_to=${encodeURIComponent(returnTo)}`;
+  }
+
+  logout(req: Request, res: Response): void {
+    const sessionToken = getSessionCookie(req);
+    if (sessionToken) revokeShareAuthSession(sessionToken);
+    clearSessionCookie(req, res);
+    res.redirect('/auth/login');
+  }
+
+  private createSession(userId: number, email: string, name: string | null, req: Request, res: Response): void {
+    const sessionToken = randomUUID();
+    const now = new Date();
+    const sessionExpiresAt = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
+
+    createShareAuthSession({
+      sessionToken,
+      provider: 'local',
+      everyUserId: 0,
+      email,
+      name,
+      accessToken: JSON.stringify({ localUserId: userId }),
+      accessExpiresAt: sessionExpiresAt.toISOString(),
+      sessionExpiresAt: sessionExpiresAt.toISOString(),
+    });
+
+    setSessionCookie(req, res, sessionToken);
+  }
+
+  private buildRouter(): Router {
+    const router = Router();
+    const parseForm = urlencoded({ extended: false });
+
+    // ── Login ────────────────────────────────────────────────────────────
+
+    router.get('/auth/login', (req: Request, res: Response) => {
+      const returnTo = sanitizeReturnTo(typeof req.query.return_to === 'string' ? req.query.return_to : '/');
+      const registerLink = `/auth/register${returnTo !== '/' ? `?return_to=${encodeURIComponent(returnTo)}` : ''}`;
+      res.type('html').send(formPage({
+        title: 'Sign In',
+        action: '/auth/login',
+        returnTo,
+        submitLabel: 'Sign In',
+        fields: `
+          <label for="email">Email</label>
+          <input type="email" id="email" name="email" required autofocus>
+          <label for="password">Password</label>
+          <input type="password" id="password" name="password" required>`,
+        footerHtml: `Don't have an account? <a href="${escapeAttr(registerLink)}">Register</a>`,
+      }));
+    });
+
+    router.post('/auth/login', parseForm, async (req: Request, res: Response) => {
+      const email = typeof req.body?.email === 'string' ? req.body.email.trim() : '';
+      const password = typeof req.body?.password === 'string' ? req.body.password : '';
+      const returnTo = sanitizeReturnTo(typeof req.body?.return_to === 'string' ? req.body.return_to : '/');
+
+      if (!email || !password) {
+        res.status(400).type('html').send(formPage({
+          title: 'Sign In', action: '/auth/login', returnTo, submitLabel: 'Sign In',
+          error: 'Email and password are required.',
+          fields: `
+            <label for="email">Email</label>
+            <input type="email" id="email" name="email" value="${escapeAttr(email)}" required autofocus>
+            <label for="password">Password</label>
+            <input type="password" id="password" name="password" required>`,
+          footerHtml: `Don't have an account? <a href="/auth/register">Register</a>`,
+        }));
+        return;
+      }
+
+      const user = getLocalUserByEmail(email);
+      const valid = user ? await verifyPassword(password, user.password_hash) : false;
+
+      if (!user || !valid) {
+        res.status(401).type('html').send(formPage({
+          title: 'Sign In', action: '/auth/login', returnTo, submitLabel: 'Sign In',
+          error: 'Invalid email or password.',
+          fields: `
+            <label for="email">Email</label>
+            <input type="email" id="email" name="email" value="${escapeAttr(email)}" required autofocus>
+            <label for="password">Password</label>
+            <input type="password" id="password" name="password" required>`,
+          footerHtml: `Don't have an account? <a href="/auth/register">Register</a>`,
+        }));
+        return;
+      }
+
+      this.createSession(user.id, user.email, user.name, req, res);
+      res.redirect(returnTo);
+    });
+
+    // ── Register ─────────────────────────────────────────────────────────
+
+    router.get('/auth/register', (req: Request, res: Response) => {
+      const returnTo = sanitizeReturnTo(typeof req.query.return_to === 'string' ? req.query.return_to : '/');
+      const inviteRequired = getInviteCode() !== null;
+      const loginLink = `/auth/login${returnTo !== '/' ? `?return_to=${encodeURIComponent(returnTo)}` : ''}`;
+      res.type('html').send(formPage({
+        title: 'Register',
+        action: '/auth/register',
+        returnTo,
+        submitLabel: 'Create Account',
+        fields: `
+          <label for="name">Name</label>
+          <input type="text" id="name" name="name">
+          <label for="email">Email</label>
+          <input type="email" id="email" name="email" required autofocus>
+          <label for="password">Password</label>
+          <input type="password" id="password" name="password" required>
+          ${inviteRequired ? `<label for="invite_code">Invite Code</label>
+          <input type="text" id="invite_code" name="invite_code" required>` : ''}`,
+        footerHtml: `Already have an account? <a href="${escapeAttr(loginLink)}">Sign in</a>`,
+      }));
+    });
+
+    router.post('/auth/register', parseForm, async (req: Request, res: Response) => {
+      const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
+      const email = typeof req.body?.email === 'string' ? req.body.email.trim() : '';
+      const password = typeof req.body?.password === 'string' ? req.body.password : '';
+      const inviteInput = typeof req.body?.invite_code === 'string' ? req.body.invite_code.trim() : '';
+      const returnTo = sanitizeReturnTo(typeof req.body?.return_to === 'string' ? req.body.return_to : '/');
+      const inviteRequired = getInviteCode();
+      const inviteRequiredBool = inviteRequired !== null;
+
+      const renderError = (error: string) => {
+        res.status(400).type('html').send(formPage({
+          title: 'Register', action: '/auth/register', returnTo, submitLabel: 'Create Account',
+          error,
+          fields: `
+            <label for="name">Name</label>
+            <input type="text" id="name" name="name" value="${escapeAttr(name)}">
+            <label for="email">Email</label>
+            <input type="email" id="email" name="email" value="${escapeAttr(email)}" required>
+            <label for="password">Password</label>
+            <input type="password" id="password" name="password" required>
+            ${inviteRequiredBool ? `<label for="invite_code">Invite Code</label>
+            <input type="text" id="invite_code" name="invite_code" value="${escapeAttr(inviteInput)}" required>` : ''}`,
+          footerHtml: `Already have an account? <a href="/auth/login">Sign in</a>`,
+        }));
+      };
+
+      if (!email || !password) {
+        renderError('Email and password are required.');
+        return;
+      }
+
+      if (inviteRequired && !constantTimeCompare(inviteInput, inviteRequired)) {
+        renderError('Invalid invite code.');
+        return;
+      }
+
+      const existing = getLocalUserByEmail(email);
+      if (existing) {
+        renderError('An account with this email already exists.');
+        return;
+      }
+
+      const passwordHash = await hashPassword(password);
+      const user = createLocalUser({ email, passwordHash, name: name || null });
+
+      this.createSession(user.id, user.email, user.name, req, res);
+      res.redirect(returnTo);
+    });
+
+    // ── Logout ───────────────────────────────────────────────────────────
+
+    router.get('/auth/logout', (req: Request, res: Response) => {
+      this.logout(req, res);
+    });
+
+    return router;
+  }
+}
