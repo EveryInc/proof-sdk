@@ -115,24 +115,23 @@ export class WorkOSAuthStrategy implements AuthStrategy {
     return `/auth/login?return_to=${encodeURIComponent(returnTo)}`;
   }
 
-  async logout(req: Request, res: Response): Promise<void> {
+  logout(req: Request, res: Response): void {
     const sessionToken = getSessionCookie(req);
     let workosLogoutUrl: string | null = null;
 
     if (sessionToken) {
-      // Try to get WorkOS logout URL to clear the AuthKit session too
       const session = getShareAuthSession(sessionToken);
       if (session) {
         const data = parseSessionData(session.access_token);
-        if (data?.sealedSession) {
+        // Extract the session ID from the JWT access token's `sid` claim
+        if (data?.accessToken) {
           try {
-            const workosSession = this.workos.userManagement.loadSealedSession({
-              sessionData: data.sealedSession,
-              cookiePassword: getCookiePassword(),
-            });
-            workosLogoutUrl = await workosSession.getLogoutUrl();
+            const payload = JSON.parse(Buffer.from(data.accessToken.split('.')[1], 'base64').toString());
+            if (payload.sid) {
+              workosLogoutUrl = this.workos.userManagement.getLogoutUrl({ sessionId: payload.sid });
+            }
           } catch {
-            // Sealed session may be expired/invalid — fall through to local logout
+            console.warn('[auth:workos] failed to extract sid from access token');
           }
         }
       }
@@ -140,7 +139,7 @@ export class WorkOSAuthStrategy implements AuthStrategy {
     }
 
     clearSessionCookie(req, res);
-    res.redirect(workosLogoutUrl ?? '/auth/login');
+    res.redirect(workosLogoutUrl || '/auth/login');
   }
 
   // ── Routes ───────────────────────────────────────────────────────────────
@@ -333,8 +332,8 @@ export class WorkOSAuthStrategy implements AuthStrategy {
     /**
      * GET /auth/logout
      */
-    router.get('/auth/logout', async (req: Request, res: Response) => {
-      await this.logout(req, res);
+    router.get('/auth/logout', (req: Request, res: Response) => {
+      this.logout(req, res);
     });
 
     return router;
