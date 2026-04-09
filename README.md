@@ -43,7 +43,11 @@ Run the full stack in a single container (no separate Vite server needed — bui
 cp .env.example .env
 echo "PROOF_COLLAB_SIGNING_SECRET=$(openssl rand -hex 32)" >> .env
 
-# 2. Start
+# 2. Optional: enable auth
+echo "PROOF_AUTH_STRATEGY=local" >> .env
+echo "PROOF_LOCAL_INVITE_CODE=your-secret" >> .env
+
+# 3. Start
 docker compose up --build -d
 ```
 
@@ -60,7 +64,18 @@ fly volumes create proof_data --size 1 --region iad
 fly secrets set PROOF_COLLAB_SIGNING_SECRET=$(openssl rand -hex 32)
 fly secrets set PROOF_PUBLIC_BASE_URL=https://your-app.fly.dev
 
-# 3. Deploy
+# 3. Optional: enable auth
+fly secrets set PROOF_AUTH_STRATEGY=local
+fly secrets set PROOF_LOCAL_INVITE_CODE=your-secret
+
+# Or for WorkOS:
+# fly secrets set PROOF_AUTH_STRATEGY=workos
+# fly secrets set WORKOS_API_KEY=sk_...
+# fly secrets set WORKOS_CLIENT_ID=client_...
+# fly secrets set WORKOS_COOKIE_PASSWORD=$(openssl rand -hex 16)
+# fly secrets set PROOF_ALLOWED_ORG_IDS=org_...
+
+# 4. Deploy
 fly deploy
 ```
 
@@ -101,6 +116,46 @@ Bridge routes (for embedded editor integration):
 - `POST /documents/:slug/bridge/rewrite`
 - `POST /documents/:slug/bridge/presence`
 
+## Authentication
+
+Proof SDK supports pluggable authentication via `PROOF_AUTH_STRATEGY`:
+
+| Strategy | Description |
+|----------|-------------|
+| `none` | Default. No authentication — anyone can access the instance. |
+| `local` | Email/password accounts with optional invite-code gating. |
+| `workos` | WorkOS AuthKit SSO with organization-level access control. |
+
+### Local auth (email/password)
+
+```bash
+# Open registration
+PROOF_AUTH_STRATEGY=local npm run serve
+
+# Invite-code gated registration
+PROOF_AUTH_STRATEGY=local PROOF_LOCAL_INVITE_CODE=your-secret npm run serve
+```
+
+Users register at `/auth/register` and log in at `/auth/login`. Account settings (name, email, password) are at `/auth/account`.
+
+### WorkOS auth (SSO)
+
+```bash
+PROOF_AUTH_STRATEGY=workos \
+WORKOS_API_KEY=sk_... \
+WORKOS_CLIENT_ID=client_... \
+WORKOS_COOKIE_PASSWORD=$(openssl rand -hex 16) \
+PROOF_ALLOWED_ORG_IDS=org_... \
+npm run serve
+```
+
+Add your callback URL (`http://localhost:5555/api/auth/callback`) in the WorkOS dashboard. Set `PROOF_ALLOWED_ORG_IDS` to restrict access to specific organizations.
+
+### Adding a new strategy
+
+1. Create `server/auth/my-strategy.ts` implementing `AuthStrategy` from `server/auth/strategy.ts`.
+2. Add a `case` in `server/auth/index.ts`.
+
 ## Environment Variables
 
 | Variable | Required | Default | Description |
@@ -112,6 +167,12 @@ Bridge routes (for embedded editor integration):
 | `PROOF_CORS_ALLOW_ORIGINS` | No | localhost | Comma-separated allowed CORS origins |
 | `COLLAB_EMBEDDED_WS` | Docker | — | Set to `true` when WebSocket runs on the same port |
 | `PROOF_TRUST_PROXY_HEADERS` | Production | — | Set to `true` behind a reverse proxy |
+| `PROOF_AUTH_STRATEGY` | No | `none` | Auth strategy: `none`, `local`, or `workos` |
+| `PROOF_LOCAL_INVITE_CODE` | No | — | Invite code for local registration (when set, required to register) |
+| `WORKOS_API_KEY` | WorkOS | — | WorkOS API key |
+| `WORKOS_CLIENT_ID` | WorkOS | — | WorkOS client ID |
+| `WORKOS_COOKIE_PASSWORD` | WorkOS | — | Secret for sealing WorkOS sessions (min 32 chars) |
+| `PROOF_ALLOWED_ORG_IDS` | No | — | Comma-separated WorkOS org IDs allowed access |
 
 ## Build
 
