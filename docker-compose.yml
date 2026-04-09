@@ -16,6 +16,7 @@ services:
       PROOF_LOCAL_INVITE_CODE: "${PROOF_LOCAL_INVITE_CODE:-}"
       WORKOS_API_KEY: "${WORKOS_API_KEY:-}"
       WORKOS_CLIENT_ID: "${WORKOS_CLIENT_ID:-}"
+      WORKOS_COOKIE_PASSWORD: "${WORKOS_COOKIE_PASSWORD:-}"
       PROOF_ALLOWED_ORG_IDS: "${PROOF_ALLOWED_ORG_IDS:-}"
       NODE_ENV: production
     restart: unless-stopped
