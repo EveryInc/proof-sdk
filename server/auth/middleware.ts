@@ -12,8 +12,11 @@ const PUBLIC_PATHS = new Set([
 
 /** Path prefixes that never require authentication. */
 const PUBLIC_PREFIXES = [
+  '/api/',           // API routes use their own auth (bearer tokens, share tokens)
+  '/documents/',     // Bridge/agent routes use x-bridge-token / x-share-token
   '/og/',            // OG image generation
   '/.well-known/',   // agent discovery
+  '/agent-docs',     // agent documentation
 ];
 
 function isPublicPath(pathname: string): boolean {

@@ -281,7 +281,7 @@ export class WorkOSAuthStrategy implements AuthStrategy {
                 const isCurrent = m.organizationId === user.organizationId;
                 return `<a href="/auth/login?organization=${escapeAttr(m.organizationId)}&return_to=%2F" style="
                   display:flex;align-items:center;justify-content:space-between;
-                  padding:10px 14px;background:${isCurrent ? '#f5f3ec' : '#f5f3ec'};
+                  padding:10px 14px;background:${isCurrent ? '#edeae0' : '#f5f3ec'};
                   border:1px solid ${isCurrent ? '#266854' : 'rgba(38,37,30,0.08)'};
                   border-radius:4px;text-decoration:none;color:#26251e;font-size:15px;
                   transition:border-color 0.15s;

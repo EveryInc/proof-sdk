@@ -372,14 +372,14 @@ export class LocalAuthStrategy implements AuthStrategy {
 
     const sectionDivider = '<hr style="border:none;border-top:1px solid rgba(38,37,30,0.08);margin:24px 0;">';
 
-    const renderAccountPage = (user: AuthenticatedUser, opts?: { nameMsg?: string; emailMsg?: string; emailErr?: string; pwMsg?: string; pwErr?: string }) => {
+    const renderAccountPage = (user: AuthenticatedUser, opts?: { nameMsg?: string; nameErr?: string; emailMsg?: string; emailErr?: string; pwMsg?: string; pwErr?: string }) => {
       const o = opts ?? {};
       return formPage({
         title: 'Account',
         action: '/auth/account/name',
         returnTo: '/',
         fields: `
-          ${o.nameMsg ? successBanner(o.nameMsg) : ''}
+          ${o.nameMsg ? successBanner(o.nameMsg) : ''}${o.nameErr ? errorBanner(o.nameErr) : ''}
           <label for="name">Name</label>
           <input type="text" id="name" name="name" value="${escapeAttr(user.name || '')}">
           <button type="submit" class="btn" style="margin-bottom:0;">Update Name</button>
@@ -416,11 +416,14 @@ export class LocalAuthStrategy implements AuthStrategy {
       if (!user) return;
 
       const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
-      updateLocalUserName(Number(user.id), name || null);
-      touchShareAuthSessionVerification({ sessionToken: user.sessionToken, name: name || null });
+      if (!name) {
+        res.status(400).type('html').send(renderAccountPage(user, { nameErr: 'Name cannot be empty.' }));
+        return;
+      }
+      updateLocalUserName(Number(user.id), name);
+      touchShareAuthSessionVerification({ sessionToken: user.sessionToken, name });
 
-      // Reflect updated name in the rendered page
-      const updated = { ...user, name: name || null };
+      const updated = { ...user, name };
       res.type('html').send(renderAccountPage(updated, { nameMsg: 'Name updated.' }));
     });
 
