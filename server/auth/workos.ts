@@ -103,8 +103,8 @@ export class WorkOSAuthStrategy implements AuthStrategy {
       return renderForbiddenPage({
         email: user.email,
         organizationName: user.organizationName,
-        loginUrl: '/auth/logout', // Switch Account = clear both local + WorkOS session
-        switchOrgUrl: '/auth/logout', // Also full logout — WorkOS will show org picker on re-login if user has multiple orgs
+        loginUrl: '/auth/logout',
+        switchOrgUrl: '/auth/account', // Account page shows org list for switching
       });
     }
 
@@ -259,11 +259,40 @@ export class WorkOSAuthStrategy implements AuthStrategy {
     });
 
     /**
-     * GET /auth/account — read-only profile page (WorkOS manages the actual profile)
+     * GET /auth/account — profile page with org switcher
      */
-    router.get('/auth/account', (req: Request, res: Response) => {
+    router.get('/auth/account', async (req: Request, res: Response) => {
       const user = this.resolveUser(req) as AuthenticatedUser | null;
       if (!user) { res.redirect('/auth/login'); return; }
+
+      // Fetch the user's org memberships so they can switch
+      let orgButtons = '';
+      try {
+        const memberships = await this.workos.userManagement.listOrganizationMemberships({
+          userId: user.id,
+          statuses: ['active'],
+        });
+        const orgs = memberships.data || [];
+        if (orgs.length > 1) {
+          orgButtons = `
+            <label>Switch Organisation</label>
+            <div style="display:flex;flex-direction:column;gap:8px;margin-bottom:16px;">
+              ${orgs.map((m) => {
+                const isCurrent = m.organizationId === user.organizationId;
+                return `<a href="/auth/login?organization=${escapeAttr(m.organizationId)}&return_to=%2F" style="
+                  display:flex;align-items:center;justify-content:space-between;
+                  padding:10px 14px;background:${isCurrent ? '#f5f3ec' : '#f5f3ec'};
+                  border:1px solid ${isCurrent ? '#266854' : 'rgba(38,37,30,0.08)'};
+                  border-radius:4px;text-decoration:none;color:#26251e;font-size:15px;
+                  transition:border-color 0.15s;
+                " onmouseover="this.style.borderColor='#266854'" onmouseout="this.style.borderColor='${isCurrent ? '#266854' : 'rgba(38,37,30,0.08)'}'"
+                >${escapeHtml(m.organizationName)}${isCurrent ? '<span style="font-size:12px;color:#266854;font-weight:500;">Current</span>' : ''}</a>`;
+              }).join('')}
+            </div>`;
+        }
+      } catch (err) {
+        console.warn('[auth:workos] failed to list org memberships:', err);
+      }
 
       res.type('html').send(`<!doctype html>
 <html lang="en">
@@ -290,24 +319,11 @@ export class WorkOSAuthStrategy implements AuthStrategy {
     label { display: block; font-size: 14px; font-weight: 400; color: rgba(38,37,30,0.6); margin-bottom: 6px; }
     .value { font-size: 15px; color: #26251e; margin-bottom: 16px; padding: 10px 14px; background: #f5f3ec; border: 1px solid rgba(38,37,30,0.08); border-radius: 4px; }
     .hint { font-size: 13px; color: rgba(38,37,30,0.45); text-align: center; margin-bottom: 20px; }
-    .actions { display: flex; gap: 10px; margin-top: 24px; }
-    .btn {
-      flex: 1; display: inline-flex; align-items: center; justify-content: center;
-      padding: 12.48px 21.6px; border-radius: 33554400px;
-      font-family: inherit; font-size: 15px; font-weight: 400;
-      text-decoration: none; text-align: center;
-      transition: filter 0.2s ease, transform 0.1s ease, box-shadow 0.2s ease;
-    }
-    .btn-primary {
-      background: linear-gradient(-1.66deg, #266854 4.43%, #1f8a65 110.83%);
-      color: #f7f7f4; border: none;
-    }
-    .btn-primary:hover { filter: brightness(1.1); transform: translateY(-2px); box-shadow: 0 4px 12px rgba(38,104,84,0.3); }
-    .btn-secondary { background: transparent; color: #26251e; border: 1px solid rgba(38,37,30,0.12); }
-    .btn-secondary:hover { background: rgba(38,37,30,0.04); }
     .footer { text-align: center; margin-top: 20px; font-size: 14px; color: rgba(38,37,30,0.6); }
     .footer a { color: #14a378; font-weight: 600; text-decoration: none; }
     .footer a:hover { text-decoration: underline; }
+    .sign-out { display:block; text-align:center; margin-top:24px; color:rgba(38,37,30,0.4); font-size:13px; text-decoration:none; transition:color 0.15s; }
+    .sign-out:hover { color:#26251e; }
   </style>
 </head>
 <body>
@@ -317,12 +333,9 @@ export class WorkOSAuthStrategy implements AuthStrategy {
     <div class="value">${escapeHtml(user.name || '—')}</div>
     <label>Email</label>
     <div class="value">${escapeHtml(user.email)}</div>
-    ${user.organizationName ? `<label>Organisation</label><div class="value">${escapeHtml(user.organizationName)}</div>` : ''}
+    ${orgButtons}
     <p class="hint">Your account is managed by your organisation via WorkOS.</p>
-    <div class="actions">
-      <a href="/auth/logout" class="btn btn-secondary">Switch Organisation</a>
-      <a href="/auth/logout" class="btn btn-secondary">Sign out</a>
-    </div>
+    <a href="/auth/logout" class="sign-out">Sign out</a>
     <div class="footer"><a href="/">&larr; Back</a></div>
   </div>
 </body>
@@ -346,4 +359,8 @@ function escapeHtml(value: string): string {
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;');
+}
+
+function escapeAttr(value: string): string {
+  return escapeHtml(value).replace(/'/g, '&#39;');
 }
