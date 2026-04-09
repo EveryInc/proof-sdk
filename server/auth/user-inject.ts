@@ -25,41 +25,84 @@ function buildAuthSnippet(name: string, email: string): string {
 <script>
 (function(){
   try { localStorage.setItem('proof-share-viewer-name', ${escapeJs(name || email)}); } catch(e){}
+
+  var displayLabel = ${escapeJs(displayLabel)};
+  var initial = ${escapeJs(initial)};
+  var injected = false;
+
+  function createUserFragment() {
+    var sep = document.createElement('span');
+    sep.className = 'share-pill-sep';
+    sep.style.cssText = 'width:1px;height:16px;background:rgba(0,0,0,0.08);flex-shrink:0;';
+
+    var avatar = document.createElement('div');
+    avatar.style.cssText = 'width:24px;height:24px;border-radius:50%;background:linear-gradient(-1.66deg,#266854 4.43%,#1f8a65 110.83%);color:#f7f7f4;font-size:11px;font-weight:600;display:flex;align-items:center;justify-content:center;flex-shrink:0;';
+    avatar.textContent = initial;
+
+    var nameSpan = document.createElement('span');
+    nameSpan.style.cssText = 'max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px;color:#374151;';
+    nameSpan.textContent = displayLabel;
+
+    var link = document.createElement('a');
+    link.href = '/auth/account';
+    link.style.cssText = 'display:flex;align-items:center;gap:7px;text-decoration:none;transition:opacity 0.15s;';
+    link.onmouseover = function(){ link.style.opacity='0.7'; };
+    link.onmouseout = function(){ link.style.opacity='1'; };
+    link.appendChild(avatar);
+    link.appendChild(nameSpan);
+
+    var logout = document.createElement('a');
+    logout.href = '/auth/logout';
+    logout.textContent = 'Sign out';
+    logout.style.cssText = 'color:rgba(55,65,81,0.5);font-size:12px;text-decoration:none;white-space:nowrap;transition:color 0.15s;';
+    logout.onmouseover = function(){ logout.style.color='#374151'; };
+    logout.onmouseout = function(){ logout.style.color='rgba(55,65,81,0.5)'; };
+
+    var frag = document.createDocumentFragment();
+    frag.appendChild(sep);
+    frag.appendChild(link);
+    frag.appendChild(logout);
+    return frag;
+  }
+
+  function injectInto(banner) {
+    if (injected) return;
+    if (banner.querySelector('[data-proof-auth]')) return;
+    var wrapper = document.createElement('div');
+    wrapper.setAttribute('data-proof-auth', '1');
+    wrapper.style.cssText = 'display:flex;align-items:center;gap:10px;margin-left:auto;padding-left:4px;';
+    wrapper.appendChild(createUserFragment());
+    banner.appendChild(wrapper);
+    injected = true;
+  }
+
+  function tryInject() {
+    var banner = document.getElementById('share-banner');
+    if (banner) { injectInto(banner); return true; }
+    return false;
+  }
+
+  // Try immediately, then observe for the banner being created.
+  if (!tryInject()) {
+    var obs = new MutationObserver(function() {
+      if (tryInject()) obs.disconnect();
+    });
+    obs.observe(document.body || document.documentElement, { childList: true, subtree: true });
+    // Give up after 30s to avoid leaking the observer.
+    setTimeout(function(){ obs.disconnect(); }, 30000);
+  }
+
+  // Also re-inject if the banner is recreated (e.g. on navigation).
+  var reObs = new MutationObserver(function() {
+    var banner = document.getElementById('share-banner');
+    if (banner && !banner.querySelector('[data-proof-auth]')) {
+      injected = false;
+      injectInto(banner);
+    }
+  });
+  reObs.observe(document.body || document.documentElement, { childList: true, subtree: true });
 })();
-</script>
-<div id="proof-auth-user" style="
-  position: fixed; top: 0; right: 12px; z-index: 1000;
-  display: flex; align-items: center; gap: 6px;
-  background: rgba(255,255,255,0.94);
-  backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px);
-  border: 1px solid rgba(0,0,0,0.06); border-top: none;
-  border-radius: 0 0 28px 28px;
-  padding: 10px 14px 10px 10px;
-  box-shadow: 0 6px 24px rgba(0,0,0,0.06), 0 0 0 0.5px rgba(0,0,0,0.03);
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-  font-size: 13px; color: #374151;
-">
-  <a href="/auth/account" style="
-    display: flex; align-items: center; gap: 7px; text-decoration: none; color: #374151;
-    transition: opacity 0.15s;
-  " onmouseover="this.style.opacity='0.7'" onmouseout="this.style.opacity='1'">
-    <div style="
-      width: 24px; height: 24px; border-radius: 50%;
-      background: linear-gradient(-1.66deg, #266854 4.43%, #1f8a65 110.83%);
-      color: #f7f7f4; font-size: 11px; font-weight: 600;
-      display: flex; align-items: center; justify-content: center; flex-shrink: 0;
-    ">${escapeHtml(initial)}</div>
-    <span style="max-width: 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
-      ${escapeHtml(displayLabel)}
-    </span>
-  </a>
-  <span style="color: rgba(0,0,0,0.12); font-size: 16px; font-weight: 300;">|</span>
-  <a href="/auth/logout" style="
-    color: rgba(55,65,81,0.5); font-size: 12px; text-decoration: none;
-    transition: color 0.15s;
-  " onmouseover="this.style.color='#374151'" onmouseout="this.style.color='rgba(55,65,81,0.5)'"
-  >Sign out</a>
-</div>`;
+</script>`;
 }
 
 /**
