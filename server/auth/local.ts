@@ -74,7 +74,7 @@ function formPage(options: {
   title: string;
   error?: string | null;
   fields: string;
-  submitLabel: string;
+  submitLabel?: string;
   footerHtml?: string;
   action: string;
   returnTo: string;
@@ -140,7 +140,7 @@ function formPage(options: {
     <form method="POST" action="${escapeAttr(action)}">
       <input type="hidden" name="return_to" value="${escapeAttr(returnTo)}">
       ${fields}
-      <button type="submit" class="btn">${escapeHtml(submitLabel)}</button>
+      ${submitLabel ? `<button type="submit" class="btn">${escapeHtml(submitLabel)}</button>` : ''}
     </form>
     ${footerHtml ? `<div class="footer">${footerHtml}</div>` : ''}
   </div>
@@ -378,11 +378,11 @@ export class LocalAuthStrategy implements AuthStrategy {
         title: 'Account',
         action: '/auth/account/name',
         returnTo: '/',
-        submitLabel: 'Update Name',
         fields: `
           ${o.nameMsg ? successBanner(o.nameMsg) : ''}
           <label for="name">Name</label>
           <input type="text" id="name" name="name" value="${escapeAttr(user.name || '')}">
+          <button type="submit" class="btn" style="margin-bottom:0;">Update Name</button>
         </form>
         ${sectionDivider}
         <form method="POST" action="/auth/account/email">
