@@ -100,12 +100,11 @@ export class WorkOSAuthStrategy implements AuthStrategy {
     if (this.allowedOrgIds.size === 0) return null; // No org restriction
 
     if (!user.organizationId || !this.allowedOrgIds.has(user.organizationId)) {
-      const returnTo = encodeURIComponent(req.originalUrl);
       return renderForbiddenPage({
         email: user.email,
         organizationName: user.organizationName,
         loginUrl: '/auth/logout', // Switch Account = clear both local + WorkOS session
-        switchOrgUrl: `/auth/login?return_to=${returnTo}&prompt=select_organization`, // Force org picker
+        switchOrgUrl: '/auth/logout', // Also full logout — WorkOS will show org picker on re-login if user has multiple orgs
       });
     }
 
@@ -156,13 +155,11 @@ export class WorkOSAuthStrategy implements AuthStrategy {
      *   - return_to: URL to redirect to after login (default: /)
      *   - organization: pre-select an org in AuthKit (for "Switch Organisation")
      *   - screen_hint: 'sign-up' | 'sign-in'
-     *   - prompt: passed through to WorkOS (e.g. 'select_organization')
      */
     router.get('/auth/login', (req: Request, res: Response) => {
       const returnTo = sanitizeReturnTo(typeof req.query.return_to === 'string' ? req.query.return_to : '/');
       const organizationId = typeof req.query.organization === 'string' ? req.query.organization : undefined;
       const screenHint = typeof req.query.screen_hint === 'string' ? req.query.screen_hint : undefined;
-      const prompt = typeof req.query.prompt === 'string' ? req.query.prompt : undefined;
 
       const state = Buffer.from(JSON.stringify({ returnTo })).toString('base64url');
 
@@ -173,7 +170,6 @@ export class WorkOSAuthStrategy implements AuthStrategy {
         state,
         organizationId,
         screenHint: screenHint as 'sign-up' | 'sign-in' | undefined,
-        prompt,
       });
 
       res.redirect(authorizationUrl);
@@ -325,7 +321,7 @@ export class WorkOSAuthStrategy implements AuthStrategy {
     ${user.organizationName ? `<label>Organisation</label><div class="value">${escapeHtml(user.organizationName)}</div>` : ''}
     <p class="hint">Your account is managed by your organisation via WorkOS.</p>
     <div class="actions">
-      <a href="/auth/login?prompt=select_organization&return_to=%2F" class="btn btn-secondary">Switch Organisation</a>
+      <a href="/auth/logout" class="btn btn-secondary">Switch Organisation</a>
       <a href="/auth/logout" class="btn btn-secondary">Sign out</a>
     </div>
     <div class="footer"><a href="/">&larr; Back</a></div>
