@@ -355,6 +355,15 @@ export class LocalAuthStrategy implements AuthStrategy {
 
     // ── Account settings ──────────────────────────────────────────────────
 
+    // Account routes live on the strategy router (mounted before the auth
+    // middleware), so req.authenticatedUser is not set. Resolve the user
+    // directly from the session instead.
+    const requireUser = (req: Request, res: Response): AuthenticatedUser | null => {
+      const user = this.resolveUser(req) as AuthenticatedUser | null;
+      if (!user) res.redirect('/auth/login');
+      return user;
+    };
+
     const successBanner = (msg: string) =>
       `<div style="background:rgba(38,104,84,0.08);border:1px solid rgba(38,104,84,0.15);color:#266854;border-radius:4px;padding:10px 14px;font-size:14px;margin-bottom:20px;text-align:center;">${escapeHtml(msg)}</div>`;
 
@@ -397,14 +406,14 @@ export class LocalAuthStrategy implements AuthStrategy {
     };
 
     router.get('/auth/account', (req: Request, res: Response) => {
-      const user = req.authenticatedUser;
-      if (!user) { res.redirect('/auth/login'); return; }
+      const user = requireUser(req, res);
+      if (!user) return;
       res.type('html').send(renderAccountPage(user));
     });
 
     router.post('/auth/account/name', parseForm, (req: Request, res: Response) => {
-      const user = req.authenticatedUser;
-      if (!user) { res.redirect('/auth/login'); return; }
+      const user = requireUser(req, res);
+      if (!user) return;
 
       const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
       updateLocalUserName(Number(user.id), name || null);
@@ -416,8 +425,8 @@ export class LocalAuthStrategy implements AuthStrategy {
     });
 
     router.post('/auth/account/email', parseForm, async (req: Request, res: Response) => {
-      const user = req.authenticatedUser;
-      if (!user) { res.redirect('/auth/login'); return; }
+      const user = requireUser(req, res);
+      if (!user) return;
 
       const newEmail = typeof req.body?.email === 'string' ? req.body.email.trim() : '';
       const password = typeof req.body?.password === 'string' ? req.body.password : '';
@@ -449,8 +458,8 @@ export class LocalAuthStrategy implements AuthStrategy {
     });
 
     router.post('/auth/account/password', parseForm, async (req: Request, res: Response) => {
-      const user = req.authenticatedUser;
-      if (!user) { res.redirect('/auth/login'); return; }
+      const user = requireUser(req, res);
+      if (!user) return;
 
       const currentPassword = typeof req.body?.current_password === 'string' ? req.body.current_password : '';
       const newPassword = typeof req.body?.new_password === 'string' ? req.body.new_password : '';
