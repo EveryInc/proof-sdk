@@ -232,6 +232,58 @@ export class WorkOSAuthStrategy implements AuthStrategy {
     });
 
     /**
+     * GET /auth/account — read-only profile page (WorkOS manages the actual profile)
+     */
+    router.get('/auth/account', (req: Request, res: Response) => {
+      const user = this.resolveUser(req) as AuthenticatedUser | null;
+      if (!user) { res.redirect('/auth/login'); return; }
+
+      res.type('html').send(`<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Account | Proof</title>
+  <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png?v=20260309p">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://api.fontshare.com/v2/css?f[]=switzer@1,2&display=swap" rel="stylesheet">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: 'Switzer','Switzer Variable',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+      background: #f5f3ec; color: #26251e;
+      min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 24px;
+    }
+    .card {
+      width: min(420px, 100%); background: #edeae0;
+      border: 1px solid rgba(38,37,30,0.03); border-radius: 4px; padding: 40px 32px;
+    }
+    h1 { font-size: 26px; font-weight: 400; color: #26251e; margin-bottom: 24px; text-align: center; letter-spacing: -0.325px; }
+    label { display: block; font-size: 14px; font-weight: 400; color: rgba(38,37,30,0.6); margin-bottom: 6px; }
+    .value { font-size: 15px; color: #26251e; margin-bottom: 16px; padding: 10px 14px; background: #f5f3ec; border: 1px solid rgba(38,37,30,0.08); border-radius: 4px; }
+    .hint { font-size: 13px; color: rgba(38,37,30,0.45); text-align: center; margin-bottom: 20px; }
+    .footer { text-align: center; margin-top: 20px; font-size: 14px; color: rgba(38,37,30,0.6); }
+    .footer a { color: #14a378; font-weight: 600; text-decoration: none; }
+    .footer a:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Account</h1>
+    <label>Name</label>
+    <div class="value">${escapeHtml(user.name || '—')}</div>
+    <label>Email</label>
+    <div class="value">${escapeHtml(user.email)}</div>
+    ${user.organizationName ? `<label>Organisation</label><div class="value">${escapeHtml(user.organizationName)}</div>` : ''}
+    <p class="hint">Your account is managed by your organisation via WorkOS.</p>
+    <div class="footer"><a href="/">&larr; Back</a></div>
+  </div>
+</body>
+</html>`);
+    });
+
+    /**
      * GET /auth/logout
      */
     router.get('/auth/logout', (req: Request, res: Response) => {
