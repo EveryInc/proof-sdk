@@ -19,6 +19,8 @@ import { getBuildInfo } from './build-info.js';
 import { homeRoutes } from './home-routes.js';
 import { isShuttingDown, setShuttingDown } from './shutdown-state.js';
 import { flushAllDocumentsForShutdown } from './collab.js';
+import { getAuthStrategy } from './auth/index.js';
+import { createAuthMiddleware } from './auth/middleware.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -81,6 +83,12 @@ async function main(): Promise<void> {
     }
     next();
   });
+
+  // Auth: mount strategy routes (login/callback/logout) and middleware.
+  // Strategy is selected by PROOF_AUTH_STRATEGY env var ('none' or 'workos').
+  const authStrategy = getAuthStrategy();
+  app.use(authStrategy.router);
+  app.use(createAuthMiddleware(authStrategy));
 
   // Home routes before static middleware so / serves the landing page,
   // not the SPA index.html that the build copies into public/.
