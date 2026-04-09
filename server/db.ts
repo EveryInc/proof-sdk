@@ -461,6 +461,14 @@ export interface ShareAuthSessionRow {
   updated_at: string;
 }
 
+export interface LocalUserRow {
+  id: number;
+  email: string;
+  password_hash: string;
+  name: string | null;
+  created_at: string;
+}
+
 export interface ActiveCollabConnectionRow {
   connection_id: string;
   document_slug: string;
@@ -1335,6 +1343,17 @@ function initDatabase(): void {
     )
   `);
   d.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_library_documents_slug ON library_documents(document_slug)');
+
+  d.exec(`
+    CREATE TABLE IF NOT EXISTS local_users (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      email TEXT NOT NULL COLLATE NOCASE,
+      password_hash TEXT NOT NULL,
+      name TEXT,
+      created_at TEXT NOT NULL
+    )
+  `);
+  d.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_local_users_email ON local_users(email COLLATE NOCASE)');
 }
 
 export function createDocument(
@@ -3693,6 +3712,27 @@ export function revokeShareAuthSession(sessionToken: string): boolean {
     WHERE session_token_hash = ?
   `).run(now, now, hash);
   return result.changes > 0;
+}
+
+// ── Local Users ──────────────────────────────────────────────────────────────
+
+export function createLocalUser(input: {
+  email: string;
+  passwordHash: string;
+  name: string | null;
+}): LocalUserRow {
+  assertWritesAllowed('createLocalUser');
+  const now = new Date().toISOString();
+  const result = getDb().prepare(`
+    INSERT INTO local_users (email, password_hash, name, created_at)
+    VALUES (?, ?, ?, ?)
+  `).run(input.email, input.passwordHash, input.name, now);
+  return getDb().prepare('SELECT * FROM local_users WHERE id = ?').get(result.lastInsertRowid) as LocalUserRow;
+}
+
+export function getLocalUserByEmail(email: string): LocalUserRow | null {
+  const row = getDb().prepare('SELECT * FROM local_users WHERE email = ? COLLATE NOCASE').get(email) as LocalUserRow | undefined;
+  return row ?? null;
 }
 
 // ── User Document Visits (dashboard) ──────────────────────────────────────────
