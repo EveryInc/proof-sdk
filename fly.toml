@@ -14,6 +14,11 @@ primary_region = "iad"
   COLLAB_EMBEDDED_WS = "true"
   # Set PROOF_PUBLIC_BASE_URL via `fly secrets set` after first deploy
   # so share links, WebSocket URLs, and agent docs use the correct origin.
+  # Auth: set via `fly secrets set` when using WorkOS:
+  #   fly secrets set PROOF_AUTH_STRATEGY=workos
+  #   fly secrets set WORKOS_API_KEY=sk_...
+  #   fly secrets set WORKOS_CLIENT_ID=client_...
+  #   fly secrets set PROOF_ALLOWED_ORG_IDS=org_...
 
 [http_service]
   internal_port = 5555
