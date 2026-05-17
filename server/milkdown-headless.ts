@@ -116,6 +116,12 @@ function createSerializer(schema: Schema): (doc: ProseMirrorNode) => string {
     .use(remarkGfm)
     .use(remarkFrontmatter, ['yaml'])
     .use(remarkStringify, {
+      // Preserve canonical markdown style on round-trip. Without these, remark-stringify
+      // defaults to `*` for bullets and `***` for thematic breaks, producing cosmetic git
+      // diffs for any source that uses the `-` / `---` convention (which is the dominant
+      // style in CommonMark and GFM ecosystems).
+      bullet: '-',
+      rule: '-',
       handlers: {
         proofMark: proofMarkHandler,
       },

@@ -1227,6 +1227,10 @@ class ProofEditorImpl implements ProofEditor {
         // Note: remarkProofMarks is now registered via .use(remarkProofMarksPlugin)
         ctx.update(remarkStringifyOptionsCtx, (prev) => ({
           ...prev,
+          // Preserve canonical markdown style on round-trip. See server/milkdown-headless.ts
+          // for the same options applied on the headless serializer path.
+          bullet: '-',
+          rule: '-',
           handlers: {
             ...(prev.handlers ?? {}),
             proofMark: proofMarkHandler,
