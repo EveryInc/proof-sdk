@@ -44,10 +44,12 @@ npm run dev
 Start the local server:
 
 ```bash
-npm run serve
+COLLAB_EMBEDDED_WS=true npm run serve
 ```
 
 The default setup serves the editor on `http://localhost:3000` and the API/server on `http://localhost:4000`.
+
+> **Note:** `COLLAB_EMBEDDED_WS=true` is required for local self-hosting. Without it the server assumes the collab WebSocket runs on `PORT+1` (4001 by default) rather than the same port, and the editor will remain stuck in a "connecting" state. See `.env.example`.
 
 ## Core Routes
 
