@@ -35,7 +35,7 @@ import {
   summarizeParseError,
   type HeadlessMilkdownParser,
 } from './milkdown-headless.js';
-import { isHostedRewriteEnvironment } from './rewrite-policy.js';
+import { isHostedMultiReplicaRewriteEnvironment } from './rewrite-policy.js';
 import { getActiveCollabClientBreakdown } from './ws.js';
 import { canonicalizeStoredMarks, type StoredMark } from '../src/formats/marks.js';
 import { refreshSnapshotForSlug } from './snapshot.js';
@@ -126,12 +126,14 @@ const COLLAB_WRITE_STABILITY_SAMPLE_MS = parsePositiveInt(process.env.AGENT_EDIT
 
 function getStrictLiveClientCount(slug: string): number {
   const breakdown = getActiveCollabClientBreakdown(slug);
-  return isHostedRewriteEnvironment() ? breakdown.total : breakdown.exactEpochCount;
+  // Single-replica trusts its own connection view; only a genuine multi-replica
+  // fleet counts ghost leases (a live doc that might be held on a sibling node).
+  return isHostedMultiReplicaRewriteEnvironment() ? breakdown.total : breakdown.exactEpochCount;
 }
 
 async function getStrictLiveClientCountWithGrace(slug: string): Promise<number> {
   let breakdown = getActiveCollabClientBreakdown(slug);
-  if (!isHostedRewriteEnvironment()) return breakdown.exactEpochCount;
+  if (!isHostedMultiReplicaRewriteEnvironment()) return breakdown.exactEpochCount;
   if (breakdown.total === 0 || breakdown.exactEpochCount > 0) return breakdown.total;
 
   const timeoutMs = parsePositiveInt(process.env.HOSTED_LIVE_DOC_GRACE_MS, 1500);

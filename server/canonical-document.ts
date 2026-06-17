@@ -66,7 +66,7 @@ import {
   summarizeDocumentIntegrity,
 } from './document-integrity.js';
 import { recordProjectionRepair } from './metrics.js';
-import { isHostedRewriteEnvironment } from './rewrite-policy.js';
+import { isHostedRewriteEnvironment, isSingleReplicaDeployment } from './rewrite-policy.js';
 import { refreshSnapshotForSlug } from './snapshot.js';
 import { pauseDocumentAndPropagate } from './share-state.js';
 import { getActiveCollabClientBreakdown, getActiveCollabClientCount } from './ws.js';
@@ -800,17 +800,24 @@ export async function mutateCanonicalDocument(args: CanonicalMutationArgs): Prom
   const collabRuntimeEnabled = getCollabRuntime().enabled;
   let collabClientBreakdown = getActiveCollabClientBreakdown(args.slug);
   const hostedRuntime = isHostedRewriteEnvironment();
+  // Single-replica self-host: there is no sibling node that could hold the live
+  // doc, so a recent lease without a live connection here means "nobody is
+  // connected", not "another replica owns it". Trust this node's own view.
+  const singleReplica = isSingleReplicaDeployment();
   const strictLiveDocRequested = args.strictLiveDoc !== false;
   if (
     strictLiveDocRequested
     && collabRuntimeEnabled
     && hostedRuntime
+    && !singleReplica
     && collabClientBreakdown.total > 0
     && collabClientBreakdown.exactEpochCount === 0
   ) {
     collabClientBreakdown = await waitForHostedLiveLeaseMaterialization(args.slug);
   }
-  let activeCollabClients = collabClientBreakdown.total;
+  let activeCollabClients = singleReplica
+    ? collabClientBreakdown.exactEpochCount
+    : collabClientBreakdown.total;
   if (strictLiveDocRequested && activeCollabClients > 0 && !collabRuntimeEnabled) {
     return {
       ok: false,
@@ -822,6 +829,7 @@ export async function mutateCanonicalDocument(args: CanonicalMutationArgs): Prom
   }
   const hostedRemoteLiveLease = collabRuntimeEnabled
     && hostedRuntime
+    && !singleReplica
     && collabClientBreakdown.total > 0
     && collabClientBreakdown.exactEpochCount === 0;
   if (strictLiveDocRequested && hostedRemoteLiveLease) {

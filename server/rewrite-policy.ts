@@ -76,6 +76,26 @@ export function isHostedRewriteEnvironment(runtimeEnvironment: string = getRewri
   return runtimeEnvironment === 'production' || runtimeEnvironment === 'staging' || isRailwayHostedRuntime();
 }
 
+// Single-replica self-hosting. The live-doc gate assumes a multi-replica fleet:
+// a recent collab-session lease with no live connection *on this node* is read
+// as "another replica holds the doc live", returning LIVE_DOC_UNAVAILABLE. On a
+// single replica there are no siblings, so that inference is a false positive
+// that blocks all programmatic edits for the lease window after a viewer leaves.
+// When set, callers trust this node's own connection view (exactEpochCount)
+// instead of ghost leases. Auto-on when RAILWAY_REPLICA_ID is absent would be
+// too aggressive (cold starts), so this stays explicit/opt-in.
+export function isSingleReplicaDeployment(): boolean {
+  const raw = (process.env.PROOF_SINGLE_REPLICA || '').trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on';
+}
+
+// Multi-replica hosted runtime: hosted AND not explicitly single-replica. Use
+// this for the "another replica may hold the live doc" gating; keep
+// isHostedRewriteEnvironment for genuinely environment-wide policy.
+export function isHostedMultiReplicaRewriteEnvironment(): boolean {
+  return isHostedRewriteEnvironment() && !isSingleReplicaDeployment();
+}
+
 export function evaluateRewriteLiveClientGate(slug: string, body: unknown): RewriteLiveClientGate {
   return evaluateRewriteLiveClientGateWithOptions(slug, body, {});
 }
