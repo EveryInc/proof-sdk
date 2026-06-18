@@ -429,7 +429,16 @@ export function expandRangeToIncludeFullyWrappedAuthoredSpan(
   let nextEnd = end;
 
   for (const span of listAuthoredProofSpanBounds(markdown)) {
-    if (nextStart === span.contentStart && nextEnd === span.contentEnd) {
+    // Expand when the resolved range covers the span's entire inner content and
+    // sits within the span's outer tag bounds. Anchor resolution that strips
+    // authored spans can return a range that reaches the opening tag on one
+    // side but stops at the content edge on the other (e.g. [openStart,
+    // contentEnd]); requiring exact content-bound equality left the unmatched
+    // tag behind as an orphaned </span>. A partial-content edit does not cover
+    // the full content, so it is left untouched and keeps its wrapper.
+    const coversFullContent = nextStart <= span.contentStart && nextEnd >= span.contentEnd;
+    const withinSpanBounds = nextStart >= span.openStart && nextEnd <= span.closeEnd;
+    if (coversFullContent && withinSpanBounds) {
       nextStart = span.openStart;
       nextEnd = span.closeEnd;
       break;
