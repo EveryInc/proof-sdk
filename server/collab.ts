@@ -7300,11 +7300,16 @@ export async function loadCanonicalYDoc(
         degradedReason: null,
       };
     }
-    const { doc, cleanup } = await getOrLoadHocuspocusDoc(slug, {
+    const { doc, cleanup, timedOut } = await getOrLoadHocuspocusDoc(slug, {
       allowDirectConnection: options.liveRequired === true,
     });
     let registeredLiveDoc = getLiveHocuspocusDoc(slug);
-    if (!registeredLiveDoc && options.liveRequired) {
+    // Only wait out the registration grace when the direct connection itself did
+    // not time out. A stalled/timed-out direct connection establishes nothing for
+    // the live-doc map to register, so the bounded direct-connection timeout would
+    // otherwise be followed by the full (much longer) registration grace, defeating
+    // its purpose. If the doc is already registered, the check above returns it.
+    if (!registeredLiveDoc && options.liveRequired && !timedOut) {
       registeredLiveDoc = await waitForLiveHocuspocusDocRegistration(slug);
     }
     if (registeredLiveDoc) {
@@ -9560,7 +9565,7 @@ type DirectConnectionLike = {
 async function getOrLoadHocuspocusDoc(
   slug: string,
   options: { allowDirectConnection?: boolean } = {},
-): Promise<{ doc: Y.Doc | null; cleanup?: () => Promise<void> }> {
+): Promise<{ doc: Y.Doc | null; cleanup?: () => Promise<void>; timedOut?: boolean }> {
   const existing = getLiveHocuspocusDoc(slug);
   if (existing) return { doc: existing };
   if (!options.allowDirectConnection) return { doc: null };
@@ -9621,9 +9626,9 @@ async function getOrLoadHocuspocusDoc(
     }
   };
 
-  if (doc && typeof (doc as any).getText === 'function') return { doc, cleanup };
-  if (direct) return { doc: null, cleanup };
-  return { doc: null };
+  if (doc && typeof (doc as any).getText === 'function') return { doc, cleanup, timedOut: directTimedOut };
+  if (direct) return { doc: null, cleanup, timedOut: directTimedOut };
+  return { doc: null, timedOut: directTimedOut };
 }
 
 async function waitForLiveHocuspocusDocRegistration(slug: string): Promise<Y.Doc | null> {
