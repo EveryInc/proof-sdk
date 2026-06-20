@@ -867,7 +867,17 @@ export async function applyAgentEditV2(
   const usingAuthoritativeFallback = authoritativeBase.base.source === 'live_yjs'
     || authoritativeMarkdown !== stripEphemeralCollabSpans(doc.markdown ?? '');
   if (usingAuthoritativeFallback) {
-    const persistedBase = parseMarkdownWithHtmlFallback(parser, stripEphemeralCollabSpans(doc.markdown ?? ''));
+    // The b1..bN refs the agent sent were assigned against the base it declared. For a
+    // baseRevision-only edit that base is the persisted document row at that revision.
+    // doc.markdown here is the live-fallback canonical read, so using it would compare the
+    // live authoritative fragment against itself and never detect that a concurrent edit
+    // shifted block topology under the agent's refs. Use the persisted row as the drift
+    // baseline. When a baseToken is supplied the agent opted into the live base directly
+    // (validated above), so that base is already the correct comparison frame.
+    const driftBaselineMarkdown = baseToken
+      ? stripEphemeralCollabSpans(doc.markdown ?? '')
+      : stripEphemeralCollabSpans(getDocumentBySlug(slug)?.markdown ?? doc.markdown ?? '');
+    const persistedBase = parseMarkdownWithHtmlFallback(parser, driftBaselineMarkdown);
     if (!persistedBase.doc) {
       return {
         status: 500,
