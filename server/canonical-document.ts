@@ -26,6 +26,7 @@ import {
 import {
   maybeFastQuarantineProjectionPathology,
   cloneAuthoritativeDocState,
+  deriveCanonicalMarkdownFromProseMirrorDoc,
   detectPathologicalProjectionRepeat,
   evaluateProjectionSafety,
   getCanonicalReadableDocument,
@@ -980,9 +981,20 @@ export async function mutateCanonicalDocument(args: CanonicalMutationArgs): Prom
   const nextMarksBase = hasExplicitNextMarks ? nextMarks : authoritativeMarks;
   const authoredMarks = extractAuthoredMarksFromDoc(parsedNext.doc as ProseMirrorNode, parser.schema as Schema);
   const effectiveNextMarks = synchronizeAuthoredMarks(nextMarksBase, authoredMarks);
+  // Store canonical markdown in the collab fragment's serialization (the same
+  // fixed point POST /documents uses) so the projection stays fresh after an
+  // edit. A plain parse->serialize (serializedNextMarkdown) is NOT that fixed
+  // point — it reformats GFM tables differently from the fragment round trip, so
+  // storing it re-wedges the doc (readSource=yjs_fallback) on the next read.
+  // The rich-snapshot branch keeps its raw HTML-preserving form (it intentionally
+  // holds content the fragment cannot represent). Fall back to the parse->serialize
+  // form if the fragment derivation fails.
+  const fragmentCanonicalMarkdown = shouldPreserveRichMarkdownSnapshot(sanitizedMarkdown)
+    ? null
+    : await deriveCanonicalMarkdownFromProseMirrorDoc(parsedNext.doc as ProseMirrorNode);
   const authoritativeNextMarkdown = shouldPreserveRichMarkdownSnapshot(sanitizedMarkdown)
     ? normalizeStoredMarkdownSnapshot(sanitizedMarkdown)
-    : serializedNextMarkdown;
+    : (fragmentCanonicalMarkdown ?? serializedNextMarkdown);
 
   try {
     if (liveRequired && currentMutationBase.source !== 'live_yjs') {

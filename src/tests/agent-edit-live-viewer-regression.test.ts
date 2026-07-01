@@ -179,6 +179,19 @@ async function run(): Promise<void> {
     });
     const created = await mustJson<CreateResponse>(createRes, 'create');
 
+    // Capture the canonical markdown the server actually stored. Creation
+    // normalizes markdown into the collab fragment's serialization, so the stored
+    // canonical may differ cosmetically from the raw POST body (e.g. a canonical
+    // blank line before a heading). The blocked-edit assertion below checks this
+    // stored canonical is left unchanged, not that it equals the raw input.
+    const canonicalAfterCreateRes = await fetch(`${httpBase}/api/documents/${created.slug}`, {
+      headers: {
+        ...CLIENT_HEADERS,
+        'x-share-token': created.ownerSecret,
+      },
+    });
+    const canonicalAfterCreate = (await mustJson<ReadDocResponse>(canonicalAfterCreateRes, 'read-after-create')).markdown;
+
     const collabSessionRes = await fetch(`${httpBase}/api/documents/${created.slug}/collab-session`, {
       headers: {
         ...CLIENT_HEADERS,
@@ -271,7 +284,7 @@ async function run(): Promise<void> {
       `Expected /edit/v2 guidance, got ${String(edit.recommendedEndpoint)}`,
     );
 
-    const expectedFinal = `${DOC_PREFIX}${currentSection}${DOC_SUFFIX}`;
+    const expectedFinal = canonicalAfterCreate;
     const readRes = await fetch(`${httpBase}/api/documents/${created.slug}`, {
       headers: {
         ...CLIENT_HEADERS,

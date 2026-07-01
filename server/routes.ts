@@ -6,6 +6,7 @@ import {
   applyAgentPresenceToLoadedCollab,
   applyCanonicalDocumentToCollab,
   buildCollabSession,
+  deriveCanonicalMarkdownForStorage,
   getCanonicalReadableDocumentSync,
   getCollabRuntime,
   invalidateCollabDocument,
@@ -784,7 +785,7 @@ function deriveShareCapabilities(role: ShareRole, shareState: string): {
 }
 
 // Create a shared document
-apiRoutes.post('/documents', (req: Request, res: Response) => {
+apiRoutes.post('/documents', async (req: Request, res: Response) => {
   const legacyCreateMode = resolveLegacyCreateMode(getPublicBaseUrl(req));
   if (legacyCreateMode === 'disabled') {
     recordLegacyCreateRouteTelemetry(req, legacyCreateMode, 'blocked_disabled');
@@ -826,7 +827,12 @@ apiRoutes.post('/documents', (req: Request, res: Response) => {
   const slug = generateSlug();
   const ownerSecret = randomUUID();
   const normalizedMarks = canonicalizeStoredMarks(marks ?? {});
-  const doc = createDocument(slug, sanitizedMarkdown, normalizedMarks, title, ownerId, ownerSecret);
+  // Store canonical markdown in the collab fragment's serialization so the
+  // projection derived on first load matches byte-for-byte. Without this, docs
+  // containing GFM tables wedge on `readSource=yjs_fallback` / `mutationReady=false`
+  // because the fragment re-serializes tables (column padding + `:---` markers).
+  const canonicalMarkdown = await deriveCanonicalMarkdownForStorage(sanitizedMarkdown);
+  const doc = createDocument(slug, canonicalMarkdown, normalizedMarks, title, ownerId, ownerSecret);
   const defaultAccess = createDocumentAccessToken(slug, 'editor');
   const links = buildShareLink(req, doc.slug);
   const shareUrlWithToken = withShareToken(links.shareUrl, defaultAccess.secret);
@@ -1078,7 +1084,11 @@ export async function handleShareMarkdown(req: Request, res: Response): Promise<
 
   const slug = generateSlug();
   const ownerSecret = randomUUID();
-  const doc = createDocument(slug, sanitizedMarkdown, marks, title, ownerId, ownerSecret);
+  // Normalize to the collab fragment's serialization so structural markdown
+  // (GFM tables, list-then-heading) doesn't wedge the projection. Same rationale
+  // as POST /documents.
+  const canonicalMarkdown = await deriveCanonicalMarkdownForStorage(sanitizedMarkdown);
+  const doc = createDocument(slug, canonicalMarkdown, marks, title, ownerId, ownerSecret);
   const access = createDocumentAccessToken(slug, requestedRole);
   const links = buildShareLink(req, doc.slug);
   const shareUrlWithToken = withShareToken(links.shareUrl, access.secret);
