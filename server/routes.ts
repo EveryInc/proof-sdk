@@ -1728,20 +1728,18 @@ apiRoutes.post('/documents/:slug/ops', opsRateLimiter, async (req: Request, res:
 
   if (result.status >= 200 && result.status < 300) {
     // Collab mutations for rewrite.apply are committed through the canonical Yjs path.
-    // Other ops still need explicit projection sync into the live room.
+    // Other (engine-backed) ops only refresh presence/cursor coupling below; they do not
+    // push a DB snapshot into the live room.
     if (op !== 'rewrite.apply') {
       try {
         const collabRuntime = getCollabRuntime();
         if (collabRuntime.enabled) {
           const updatedDoc = getDocumentBySlug(slug);
           if (updatedDoc) {
-            const applyOptions = {
-              markdown: typeof updatedDoc.markdown === 'string' ? updatedDoc.markdown : undefined,
-              marks: parseJson(updatedDoc.marks),
-              source: 'rest-ops',
-            };
-            await applyCanonicalDocumentToCollab(slug, applyOptions);
-
+            // Route-level reapplication from the DB can replay stale markdown over concurrent
+            // live edits that are not yet persisted, so engine-backed (non-rewrite.apply) ops
+            // no longer push a broad DB snapshot into the live room. Only the narrow,
+            // non-content presence/cursor coupling below is synced.
             if (participation) {
               try {
                 applyAgentPresenceToLoadedCollab(slug, participation.presenceEntry, {
