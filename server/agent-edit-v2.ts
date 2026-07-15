@@ -874,9 +874,14 @@ export async function applyAgentEditV2(
     // shifted block topology under the agent's refs. Use the persisted row as the drift
     // baseline. When a baseToken is supplied the agent opted into the live base directly
     // (validated above), so that base is already the correct comparison frame.
+    const persistedDriftBaseline = baseToken ? null : getDocumentBySlug(slug);
     const driftBaselineMarkdown = baseToken
       ? stripEphemeralCollabSpans(doc.markdown ?? '')
-      : stripEphemeralCollabSpans(getDocumentBySlug(slug)?.markdown ?? doc.markdown ?? '');
+      : stripEphemeralCollabSpans(
+        persistedDriftBaseline?.revision === baseRevision
+          ? persistedDriftBaseline.markdown
+          : doc.markdown ?? '',
+      );
     const persistedBase = parseMarkdownWithHtmlFallback(parser, driftBaselineMarkdown);
     if (!persistedBase.doc) {
       return {
