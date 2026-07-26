@@ -3110,8 +3110,13 @@ function createDecorations(
     switch (mark.kind) {
       case 'authored':
       case 'approved':
-      case 'flagged':
         continue;
+
+      case 'flagged': {
+        style = STYLES.flagged;
+        cssClass = `mark-flagged ${isActive ? 'mark-active' : ''}`;
+        break;
+      }
 
       case 'comment': {
         const data = mark.data as CommentData;
@@ -3220,6 +3225,15 @@ function injectGlowStyles(): void {
     }
     @keyframes proof-delete-glow {
       0% { box-shadow: 0 0 8px rgba(239, 68, 68, 0.6); }
+      100% { box-shadow: none; }
+    }
+
+    /* Flag glow (dusty rose, box-shadow only so the flag background persists) */
+    .mark-flagged.proof-mark-new {
+      animation-name: proof-flag-glow;
+    }
+    @keyframes proof-flag-glow {
+      0% { box-shadow: 0 0 8px rgba(252, 165, 165, 0.8); }
       100% { box-shadow: none; }
     }
 

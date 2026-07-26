@@ -1215,6 +1215,10 @@ class MarkPopoverController {
   }
 
   private renderSuggestion(mark: Mark): void {
+    if (mark.kind === 'flagged') {
+      this.renderFlag(mark);
+      return;
+    }
     this.popover.innerHTML = '';
 
     const header = document.createElement('div');
@@ -1271,6 +1275,45 @@ class MarkPopoverController {
     if (canEdit) {
       actions.appendChild(applyButton);
       actions.appendChild(rejectButton);
+    }
+
+    const closeButton = document.createElement('button');
+    closeButton.type = 'button';
+    closeButton.textContent = 'Close';
+    installTouchSafeButton(closeButton, () => {
+      this.close();
+    });
+    actions.appendChild(closeButton);
+
+    this.popover.appendChild(header);
+    this.popover.appendChild(body);
+    this.popover.appendChild(actions);
+  }
+
+  private renderFlag(mark: Mark): void {
+    this.popover.innerHTML = '';
+
+    const header = document.createElement('div');
+    header.className = 'mark-popover-header';
+    header.textContent = `Flagged by ${getActorName(mark.by)}`;
+
+    const body = document.createElement('div');
+    body.className = 'mark-popover-body';
+    const note = (mark.data as { note?: string } | undefined)?.note;
+    body.textContent = note || mark.quote || '';
+
+    const actions = document.createElement('div');
+    actions.className = 'mark-popover-actions';
+
+    if (canCommentInRuntime()) {
+      const removeButton = document.createElement('button');
+      removeButton.type = 'button';
+      removeButton.textContent = 'Remove flag';
+      installTouchSafeButton(removeButton, () => {
+        deleteMark(this.view, mark.id);
+        this.close();
+      });
+      actions.appendChild(removeButton);
     }
 
     const closeButton = document.createElement('button');
