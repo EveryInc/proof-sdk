@@ -146,6 +146,11 @@ import { initThemePicker, getThemePicker } from '../ui/theme-picker';
 import { fileClient } from '../bridge/file-client';
 import { shareClient, type CollabSessionInfo, type SharePendingEvent } from '../bridge/share-client';
 import { collabClient, type CollabSyncStatus } from '../bridge/collab-client';
+import {
+  shouldPreserveLocalStateOnReconnect,
+  shouldRenewCollabSession,
+  shouldUseRestMarksFallback,
+} from '../bridge/collab-session-renewal';
 import { shouldDeferShareMarksRefresh } from './share-marks-refresh';
 import { collabCursorBuilder, collabSelectionBuilder } from './plugins/collab-cursors';
 import { isAgentScopedId } from '../shared/agent-identity';
@@ -1117,6 +1122,7 @@ class ProofEditorImpl implements ProofEditor {
   private readonly collabRecoveryDelayMs: number = 4_000;
   private readonly collabRecoveryBackoffMs: number = 5_000;
   private readonly collabTypingRecoveryGraceMs: number = 3_000;
+  private lastCollabRenewalAttemptMs: number | null = null;
   private readonly shareEventPollMs: number = 1500;
   private readonly shareDocumentUpdatedDebounceMs: number = 600;
   private readonly commentPopoverDraftRestoreDelayMs: number = 120;
@@ -1511,8 +1517,22 @@ class ProofEditorImpl implements ProofEditor {
           this.collabUnsyncedChanges = status.unsyncedChanges;
           this.collabPendingLocalUpdates = status.pendingLocalUpdates;
           this.updateShareEditGate();
-          if (status.connectionStatus === 'disconnected' && collabClient.terminalCloseReason === 'permission-denied') {
-            void this.refreshCollabSessionAndReconnect(false);
+          // Any authentication failure gets exactly one immediate refresh,
+          // preserving unsaved local marks. The reason string cannot be trusted
+          // to separate "expired" from "revoked" — the server reports an
+          // expired token as permission-denied through the Hocuspocus hook — so
+          // the refresh response is what decides. A real revocation comes back
+          // 401/403/404/410 and refreshCollabSessionAndReconnect() tears down
+          // into the read-only banner from there.
+          //
+          // This replaces a check on terminalCloseReason, which nothing in src/
+          // ever assigned, so the hook could never fire.
+          if (status.connectionStatus === 'disconnected' && collabClient.authRecoveryPending) {
+            collabClient.authRecoveryPending = false;
+            void this.refreshCollabSessionAndReconnect(shouldPreserveLocalStateOnReconnect({
+              collabCanEdit: this.collabCanEdit,
+              hasPendingLocalState: this.shouldPreservePendingLocalCollabState(),
+            }));
           }
           if (status.connectionStatus === 'connected' && status.isSynced) {
             if (this.pendingCollabRebindOnSync) {
@@ -2250,13 +2270,21 @@ class ProofEditorImpl implements ProofEditor {
       if (!this.collabEnabled || !this.activeCollabSession) return;
       await this.maybeRecoverStalledCollab();
       const expiresAt = this.activeCollabSession.expiresAt;
-      if (!expiresAt) return;
-      const expiresAtMs = Date.parse(expiresAt);
-      if (!Number.isFinite(expiresAtMs)) return;
+      const expiresAtMs = expiresAt ? Date.parse(expiresAt) : null;
       const now = Date.now();
-      if ((expiresAtMs - now) > 60_000) return;
-      if (this.collabConnectionStatus === 'connected' && this.collabIsSynced) return;
-      if (this.shouldDeferExpiringCollabRefresh(now)) return;
+      if (!shouldRenewCollabSession({
+        expiresAtMs: expiresAtMs !== null && Number.isFinite(expiresAtMs) ? expiresAtMs : null,
+        now,
+        connectionStatus: this.collabConnectionStatus,
+        refreshInFlight: this.collabSessionRefreshInFlight,
+        lastRenewalAttemptMs: this.lastCollabRenewalAttemptMs,
+        hasPendingLocalState: this.shouldPreservePendingLocalCollabState(),
+        lastLocalTypingAt: this.lastLocalTypingAt,
+        typingGraceMs: this.collabTypingRecoveryGraceMs,
+      })) {
+        return;
+      }
+      this.lastCollabRenewalAttemptMs = now;
       await this.refreshCollabSessionAndReconnect(this.shouldPreservePendingLocalCollabState());
     }, 2_000);
   }
@@ -2266,13 +2294,10 @@ class ProofEditorImpl implements ProofEditor {
       && (this.collabUnsyncedChanges > 0 || this.collabPendingLocalUpdates > 0);
   }
 
-  private shouldDeferExpiringCollabRefresh(now: number): boolean {
-    if (!this.collabCanEdit) return false;
-    if (this.shouldPreservePendingLocalCollabState()) return true;
-    if (this.pendingProjectionPublish) return true;
-    if (this.contentSyncTimeout !== null) return true;
-    return (now - this.lastLocalTypingAt) < this.collabTypingRecoveryGraceMs;
-  }
+  // shouldDeferExpiringCollabRefresh() lived here. Its deferral rules moved into
+  // shouldRenewCollabSession(), which applies them only while the connection is
+  // still usable and never past the hard deadline. Deferring on a disconnected
+  // session was what let an expired token sit unrenewed for minutes.
 
   private updateCollabHealthWindow(status: CollabSyncStatus): void {
     const healthy = status.connectionStatus === 'connected'
@@ -2302,7 +2327,13 @@ class ProofEditorImpl implements ProofEditor {
     if ((now - this.collabLastRecoveryAttemptMs) < this.collabRecoveryBackoffMs) return;
     this.collabLastRecoveryAttemptMs = now;
     this.collabUnhealthySinceMs = now;
-    await this.refreshCollabSessionAndReconnect(false);
+    // Previously hardcoded false, which reset the Y.Doc on reconnect and threw
+    // away any comment the user had just added — the loss this recovery path
+    // was supposed to prevent.
+    await this.refreshCollabSessionAndReconnect(shouldPreserveLocalStateOnReconnect({
+      collabCanEdit: this.collabCanEdit,
+      hasPendingLocalState: this.shouldPreservePendingLocalCollabState(),
+    }));
   }
 
   private teardownCollabRuntimeAfterTerminalRefreshFailure(): void {
@@ -4821,7 +4852,21 @@ class ProofEditorImpl implements ProofEditor {
         if (!shouldPersistMarks) {
           return;
         }
-        if (!this.collabEnabled || !this.collabCanEdit || LEGACY_REST_FALLBACK) {
+        // Liveness, not just capability. collabEnabled/collabCanEdit stay true
+        // on a provider that has been closed out from under the tab, so gating
+        // the durable REST write on them alone meant a comment submitted after
+        // a 4401 close was written to the local Y.Doc and nowhere else.
+        //
+        // REST runs only when the provider is not connected, so it never writes
+        // alongside a live Yjs writer. Marks are keyed by mark id and merged by
+        // key, so a mark that later replays on reconnect converges rather than
+        // duplicating.
+        if (shouldUseRestMarksFallback({
+          collabEnabled: this.collabEnabled,
+          collabCanEdit: this.collabCanEdit,
+          legacyRestFallback: LEGACY_REST_FALLBACK,
+          connectionStatus: this.collabConnectionStatus,
+        })) {
           void shareClient.pushMarks(metadata, getCurrentActor(), { keepalive: Boolean(_options?.keepalive) });
         }
       } catch (error) {
