@@ -3,6 +3,7 @@ import { HocuspocusProvider } from '@hocuspocus/provider';
 import type { Awareness } from 'y-protocols/awareness';
 import { shareClient, type CollabSessionInfo, type ShareRole } from './share-client';
 import { shouldPreserveMissingLocalMark } from './marks-preservation';
+import { classifyCollabAuthFailure, type CollabAuthFailureClass } from './collab-session-renewal';
 import { recordClientIncidentEvent } from '../agent/client-incident-buffer';
 
 type PresenceHandler = (count: number) => void;
@@ -200,6 +201,9 @@ export class CollabClient {
   private sessionRole: ShareRole | null = null;
   terminalCloseReason: CollabTerminalCloseReason = null;
   lastAuthenticationFailureReason: string | null = null;
+  lastAuthFailureClass: CollabAuthFailureClass | null = null;
+  /** Set on an auth failure, consumed once by the editor to drive one refresh. */
+  authRecoveryPending = false;
 
   constructor() {
     this.durableClientId = getOrCreateDurableClientId();
@@ -560,6 +564,8 @@ export class CollabClient {
     this.unsyncedChanges = 0;
     this.hasSynced = false;
     this.terminalCloseReason = null;
+    this.authRecoveryPending = false;
+    this.lastAuthFailureClass = null;
     this.lastAuthenticationFailureReason = null;
     this.emitSyncStatus();
     this.durableUpdatesEnabled = this.canPersistDurableUpdates(session.role);
@@ -622,6 +628,8 @@ export class CollabClient {
       }
       if (event.status === 'connected') {
         this.terminalCloseReason = null;
+        this.authRecoveryPending = false;
+        this.lastAuthFailureClass = null;
         this.lastAuthenticationFailureReason = null;
         if (this.lastDisconnectAt !== null) {
           const durationMs = Date.now() - this.lastDisconnectAt;
@@ -658,9 +666,22 @@ export class CollabClient {
     provider.on('authenticationFailed', (event: { reason?: string }) => {
       const reason = typeof event?.reason === 'string' ? event.reason : 'permission-denied';
       this.lastAuthenticationFailureReason = reason;
+      this.lastAuthFailureClass = classifyCollabAuthFailure(reason);
       this.connectionStatus = 'disconnected';
       this.hasSynced = false;
       this.lastDisconnectAt = Date.now();
+      // An expired token is recoverable, so it must not be recorded as a
+      // terminal close — that would put the tab into the read-only banner path
+      // instead of refreshing. Only an explicit denial is terminal, and even
+      // then the refresh response is what confirms it.
+      if (this.lastAuthFailureClass === 'permission-denied') {
+        this.terminalCloseReason = 'permission-denied';
+      }
+      // Consumed once by the editor's sync-status handler. Without this the
+      // 4401 close left the session expired indefinitely: nothing in src/ ever
+      // assigned terminalCloseReason, so the immediate-refresh hook that read
+      // it was unreachable.
+      this.authRecoveryPending = true;
       recordClientIncidentEvent({
         type: 'collab.authentication_failed',
         level: 'error',
@@ -669,6 +690,7 @@ export class CollabClient {
           slug: session.slug,
           role: session.role,
           reason,
+          failureClass: this.lastAuthFailureClass,
         },
       });
       this.emitSyncStatus();
@@ -720,6 +742,8 @@ export class CollabClient {
     this.activeSession = { ...session };
     this.sessionRole = session.role;
     this.terminalCloseReason = null;
+    this.authRecoveryPending = false;
+    this.lastAuthFailureClass = null;
     this.lastAuthenticationFailureReason = null;
     this.connectionStatus = 'connecting';
     this.hasSynced = false;
@@ -877,6 +901,8 @@ export class CollabClient {
     this.hasSynced = false;
     this.applyingLocalMarks = false;
     this.terminalCloseReason = null;
+    this.authRecoveryPending = false;
+    this.lastAuthFailureClass = null;
     this.lastAuthenticationFailureReason = null;
     this.sessionRole = null;
     this.emitSyncStatus();
