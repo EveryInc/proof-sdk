@@ -76,8 +76,9 @@ export const authoredTrackerPlugin = $prose(() => {
 
         const { from } = view.state.selection;
         let tr = view.state.tr.replaceSelection(slice);
-        const insertFrom = tr.mapping.map(from, -1);
-        const insertTo = insertFrom + slice.size;
+        const docSize = tr.doc.content.size;
+        const insertFrom = Math.max(0, Math.min(tr.mapping.map(from, -1), docSize));
+        const insertTo = Math.max(insertFrom, Math.min(insertFrom + slice.size, docSize));
 
         if (insertTo > insertFrom) {
           tr = tr.removeMark(insertFrom, insertTo, markType);
