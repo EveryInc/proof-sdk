@@ -606,7 +606,11 @@ export class CollabClient {
       if (!this.marksHandler) return;
       if (transaction.origin === 'local-marks-sync') return;
       if (this.applyingLocalMarks) return;
-      this.marksHandler(this.readMarks());
+      // Let the shared text reach ProseMirror before a mark callback dispatches.
+      queueMicrotask(() => {
+        if (this.ydoc !== ydoc) return;
+        this.marksHandler?.(this.readMarks());
+      });
     });
 
     provider.on('awarenessChange', (event: { states: Array<unknown> }) => {

@@ -8471,133 +8471,74 @@ class ProofEditorImpl implements ProofEditor {
     return success;
   }
 
+  private finalizeSharedSuggestion(markId: string, action: 'accept' | 'reject'): boolean {
+    if (!this.editor) return false;
+    if (!this.getSuggestions().some(mark => mark.id === markId)) return false;
+
+    this.clearErrorBanner();
+    const actor = getCurrentActor();
+    const failureMessage = action === 'accept'
+      ? 'Proof could not apply this suggestion. Try again.'
+      : 'Proof could not reject this suggestion. Try again.';
+    const request = action === 'accept'
+      ? shareClient.acceptSuggestion(markId, actor)
+      : shareClient.rejectSuggestion(markId, actor);
+    void request.then(result => {
+      if (!result || 'error' in result || result.success !== true) {
+        this.showErrorBanner(failureMessage);
+        return;
+      }
+      const serverMarks = (result.marks && typeof result.marks === 'object' && !Array.isArray(result.marks))
+        ? result.marks as Record<string, StoredMark>
+        : null;
+      if (serverMarks) {
+        this.lastReceivedServerMarks = { ...serverMarks };
+        this.initialMarksSynced = true;
+        this.applyLatestCollabMarksToEditor();
+      }
+      captureEvent(action === 'accept' ? 'suggestion_accepted' : 'suggestion_rejected', { count: 1 });
+    }).catch(error => {
+      console.error('[finalizeSharedSuggestion] The suggestion request failed:', error);
+      this.showErrorBanner(failureMessage);
+    });
+    return true;
+  }
+
   /**
-   * Accept a suggestion and apply the change
+   * Accept a suggestion and apply the change.
    */
   markAccept(markId: string): boolean {
     if (!this.editor) {
-      console.warn('[markAccept] Editor not initialized');
+      console.warn('[markAccept] The editor is not ready.');
       return false;
     }
-
-    if (this.isShareMode) {
-      let canAccept = false;
-      this.editor.action((ctx) => {
-        const view = ctx.get(editorViewCtx);
-        canAccept = getPendingSuggestions(getMarks(view.state)).some((mark) => mark.id === markId);
-      });
-      if (!canAccept) {
-        console.warn('[markAccept] Suggestion not pending in share mode:', markId);
-        return false;
-      }
-
-      const actor = getCurrentActor();
-      void shareClient.acceptSuggestion(markId, actor).then((result) => {
-        if (!result || 'error' in result || result.success !== true) return;
-        const serverMarks = (result.marks && typeof result.marks === 'object' && !Array.isArray(result.marks))
-          ? result.marks as Record<string, StoredMark>
-          : null;
-        if (!serverMarks) return;
-        this.lastReceivedServerMarks = { ...serverMarks };
-        this.initialMarksSynced = true;
-        if (this.editor) {
-          this.editor.action((innerCtx) => {
-            const innerView = innerCtx.get(editorViewCtx);
-            applyRemoteMarks(innerView, serverMarks, { hydrateAnchors: this.collabCanEdit });
-            const stats = getAuthorshipStats(innerView);
-            this.bridge.authorshipStatsUpdated(stats);
-          });
-        }
-        captureEvent('suggestion_accepted', { count: 1 });
-      }).catch((error) => {
-        console.error('[markAccept] Failed to persist suggestion acceptance via share mutation:', error);
-      });
-      return true;
-    }
+    if (this.isShareMode) return this.finalizeSharedSuggestion(markId, 'accept');
 
     let success = false;
     this.editor.action((ctx) => {
       const view = ctx.get(editorViewCtx);
       const parser = ctx.get(parserCtx);
       success = acceptMark(view, markId, parser);
-      console.log('[markAccept] Accepted:', success);
-      if (success && this.isShareMode) {
-        const metadata = getMarkMetadataWithQuotes(view.state);
-        this.lastReceivedServerMarks = { ...metadata };
-        this.initialMarksSynced = true;
-
-        const actor = getCurrentActor();
-        void shareClient.acceptSuggestion(markId, actor).then((result) => {
-          if (!result || 'error' in result || result.success !== true) return;
-          const serverMarks = (result.marks && typeof result.marks === 'object' && !Array.isArray(result.marks))
-            ? result.marks as Record<string, StoredMark>
-            : null;
-          if (!serverMarks) return;
-          this.lastReceivedServerMarks = { ...serverMarks };
-          this.initialMarksSynced = true;
-          if (this.editor) {
-            this.editor.action((innerCtx) => {
-              const innerView = innerCtx.get(editorViewCtx);
-              const mergedMetadata = mergePendingServerMarks(getMarkMetadataWithQuotes(innerView.state), serverMarks);
-              setMarkMetadata(innerView, mergedMetadata);
-            });
-          }
-        }).catch((error) => {
-          console.error('[markAccept] Failed to persist suggestion acceptance via share mutation:', error);
-        });
-      }
-      if (success) {
-        captureEvent('suggestion_accepted', { count: 1 });
-        const stats = getAuthorshipStats(view);
-        this.bridge.authorshipStatsUpdated(stats);
-      }
+      if (success) captureEvent('suggestion_accepted', { count: 1 });
     });
-
     return success;
   }
 
   /**
-   * Reject a suggestion without changing the document
+   * Reject a suggestion and preserve the document text.
    */
   markReject(markId: string): boolean {
     if (!this.editor) {
-      console.warn('[markReject] Editor not initialized');
+      console.warn('[markReject] The editor is not ready.');
       return false;
     }
+    if (this.isShareMode) return this.finalizeSharedSuggestion(markId, 'reject');
 
     let success = false;
     this.editor.action((ctx) => {
       const view = ctx.get(editorViewCtx);
       success = rejectMark(view, markId);
-      console.log('[markReject] Rejected:', success);
-      if (success && this.isShareMode) {
-        const metadata = getMarkMetadataWithQuotes(view.state);
-        this.lastReceivedServerMarks = { ...metadata };
-        this.initialMarksSynced = true;
-
-        const actor = getCurrentActor();
-        void shareClient.rejectSuggestion(markId, actor).then((result) => {
-          if (!result || 'error' in result || result.success !== true) return;
-          const serverMarks = (result.marks && typeof result.marks === 'object' && !Array.isArray(result.marks))
-            ? result.marks as Record<string, StoredMark>
-            : null;
-          if (!serverMarks) return;
-          this.lastReceivedServerMarks = { ...serverMarks };
-          this.initialMarksSynced = true;
-          if (this.editor) {
-            this.editor.action((innerCtx) => {
-              const innerView = innerCtx.get(editorViewCtx);
-              const mergedMetadata = mergePendingServerMarks(getMarkMetadataWithQuotes(innerView.state), serverMarks);
-              setMarkMetadata(innerView, mergedMetadata);
-            });
-          }
-        }).catch((error) => {
-          console.error('[markReject] Failed to persist suggestion rejection via share mutation:', error);
-        });
-      }
-      if (success) {
-        captureEvent('suggestion_rejected', { count: 1 });
-      }
+      if (success) captureEvent('suggestion_rejected', { count: 1 });
     });
     return success;
   }
@@ -8640,8 +8581,6 @@ class ProofEditorImpl implements ProofEditor {
           this.editor.action((innerCtx) => {
             const innerView = innerCtx.get(editorViewCtx);
             applyRemoteMarks(innerView, latestServerMarks!, { hydrateAnchors: this.collabCanEdit });
-            const stats = getAuthorshipStats(innerView);
-            this.bridge.authorshipStatsUpdated(stats);
           });
         }
         if (acceptedCount > 0) {
@@ -8693,8 +8632,6 @@ class ProofEditorImpl implements ProofEditor {
       }
       if (count > 0) {
         captureEvent('suggestion_accepted', { count });
-        const stats = getAuthorshipStats(view);
-        this.bridge.authorshipStatsUpdated(stats);
       }
     });
 
@@ -8750,8 +8687,6 @@ class ProofEditorImpl implements ProofEditor {
       }
       if (count > 0) {
         captureEvent('suggestion_rejected', { count });
-        const stats = getAuthorshipStats(view);
-        this.bridge.authorshipStatsUpdated(stats);
       }
     });
     return count;

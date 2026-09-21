@@ -15,7 +15,8 @@
     "test": "npm run test:proof-sdk && npm run test:server-routes-share",
     "test:proof-sdk": "tsx src/tests/proof-sdk-agent-bridge-client.test.ts",
     "test:server-routes-share": "tsx src/tests/server-routes-and-share.test.ts",
-    "demo:agent": "npm --workspace proof-example run demo:agent"
+    "demo:agent": "npm --workspace proof-example run demo:agent",
+    "test:suggestion-browser": "npm run build && tsx src/tests/suggestion-actions-browser.test.ts"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.879.0",
@@ -60,6 +61,7 @@
     "@types/ws": "^8.18.1",
     "tsx": "^4.21.0",
     "typescript": "^5.3.0",
-    "vite": "^5.0.0"
+    "vite": "^5.0.0",
+    "playwright-core": "^1.58.2"
   }
 }
