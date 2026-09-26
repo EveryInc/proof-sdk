@@ -3029,21 +3029,6 @@ export function resolveMarks(doc: ProseMirrorNode, marks: Mark[]): ResolvedMark[
 // Decorations
 // ============================================================================
 
-const STYLES = {
-  authored_human: 'background-color: rgba(110, 231, 183, 0.08);',
-  authored_ai: 'background-color: rgba(165, 180, 252, 0.12);',
-
-  flagged: 'border-left: 3px solid #FCA5A5; padding-left: 4px; background-color: rgba(252, 165, 165, 0.1);',
-
-  comment: 'background-color: rgba(252, 211, 77, 0.3); border-bottom: 2px solid #FCD34D;',
-  comment_active: 'background-color: rgba(252, 211, 77, 0.5); border-bottom: 2px solid #FBBF24;',
-  comment_resolved: 'background-color: rgba(156, 163, 175, 0.15); border-bottom: 1px dashed #9CA3AF;',
-  compose_anchor: 'background-color: rgba(252, 211, 77, 0.22); border-bottom: 2px dashed #F59E0B;',
-
-  insert: 'background-color: rgba(34, 197, 94, 0.25); border-bottom: 2px solid #22C55E;',
-  delete: 'background-color: rgba(239, 68, 68, 0.2); text-decoration: line-through; color: #666;',
-};
-
 function normalizeComposeAnchorRange(range: MarkRange | null, doc: ProseMirrorNode): MarkRange | null {
   if (!range) return null;
   const minPos = 0;
@@ -3070,7 +3055,6 @@ function createDecorations(
     decorations.push(
       Decoration.inline(safeComposeRange.from, safeComposeRange.to, {
         class: 'mark-compose-anchor',
-        style: STYLES.compose_anchor,
       })
     );
   }
@@ -3102,7 +3086,6 @@ function createDecorations(
     if (ranges.length === 0) continue;
     const isActive = mark.id === activeMarkId;
 
-    let style = '';
     let cssClass = '';
 
     let replacementContent: string | null = null;
@@ -3116,7 +3099,6 @@ function createDecorations(
       case 'comment': {
         const data = mark.data as CommentData;
         if (data?.resolved) continue;
-        style = isActive ? STYLES.comment_active : STYLES.comment;
         cssClass = `mark-comment ${isActive ? 'mark-active' : ''}`;
         break;
       }
@@ -3124,7 +3106,6 @@ function createDecorations(
       case 'insert': {
         const data = mark.data as InsertData;
         if (data?.status === 'pending') {
-          style = STYLES.insert;
           cssClass = 'mark-insert';
         }
         break;
@@ -3133,7 +3114,6 @@ function createDecorations(
       case 'delete': {
         const data = mark.data as DeleteData;
         if (data?.status === 'pending') {
-          style = STYLES.delete;
           cssClass = 'mark-delete';
         }
         break;
@@ -3145,7 +3125,6 @@ function createDecorations(
           if (!primaryReplaceMarkIds.has(mark.id)) {
             continue;
           }
-          style = STYLES.delete;
           cssClass = 'mark-replace mark-delete';
           replacementContent = data.content ?? '';
         }
@@ -3153,7 +3132,7 @@ function createDecorations(
       }
     }
 
-    if (style) {
+    if (cssClass) {
       // Add glow class for newly-created marks (within last 2 seconds)
       const GLOW_DURATION_MS = 2000;
       const markAge = Date.now() - new Date(mark.at).getTime();
@@ -3163,7 +3142,6 @@ function createDecorations(
         decorations.push(
           Decoration.inline(from, to, {
             class: [cssClass, glowClass].filter(Boolean).join(' '),
-            style,
             'data-mark-id': mark.id,
             'data-mark-kind': mark.kind,
           })
@@ -3178,7 +3156,6 @@ function createDecorations(
             () => {
               const span = document.createElement('span');
               span.className = ['mark-replace-insert', 'mark-insert', glowClass].filter(Boolean).join(' ');
-              span.style.cssText = STYLES.insert;
               span.setAttribute('data-mark-id', mark.id);
               span.setAttribute('data-mark-kind', 'replace');
               span.textContent = replacementContent ?? '';
@@ -3199,14 +3176,23 @@ function createDecorations(
 // ============================================================================
 
 // Inject glow animation and refresh transition CSS
-let glowStylesInjected = false;
-function injectGlowStyles(): void {
-  if (glowStylesInjected) return;
-  glowStylesInjected = true;
 
+function injectGlowStyles(): void {
+  if (document.getElementById('proof-mark-glow-styles')) return;
   const style = document.createElement('style');
   style.id = 'proof-mark-glow-styles';
   style.textContent = `
+    /* Decoration paint. These rules live here rather than on the decorations themselves: an
+       inline style attribute on a ProseMirror-managed span is rewritten by extensions such as
+       Dark Reader, and prosemirror-view redraws the decoration in response, which reapplies the
+       attribute — an endless redraw loop. Each rule stays at single-class specificity so a host
+       page's own mark rules still win. */
+    .mark-compose-anchor { background-color: rgba(252, 211, 77, 0.22); border-bottom: 2px dashed #F59E0B; }
+    .mark-insert { background-color: rgba(34, 197, 94, 0.25); border-bottom: 2px solid #22C55E; }
+    .mark-delete { background-color: rgba(239, 68, 68, 0.2); text-decoration: line-through; color: #666; }
+    .mark-comment { background-color: rgba(252, 211, 77, 0.3); border-bottom: 2px solid #FCD34D; }
+    .mark-active { background-color: rgba(252, 211, 77, 0.5); border-bottom: 2px solid #FBBF24; }
+
     /* Glow animation for newly-created suggestion marks */
     @keyframes proof-change-glow {
       0% { box-shadow: 0 0 8px rgba(34, 197, 94, 0.6); background-color: rgba(34, 197, 94, 0.4); }

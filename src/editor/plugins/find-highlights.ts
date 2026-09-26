@@ -51,9 +51,6 @@ function buildDecorations(
     decorations.push(
       Decoration.inline(match.from, match.to, {
         class: isCurrent ? 'proof-find-match proof-find-match--active' : 'proof-find-match',
-        style: isCurrent
-          ? 'background-color: rgba(34, 211, 238, 0.55) !important; border-radius: 2px; box-shadow: 0 0 0 2px rgba(8, 145, 178, 0.95) !important; text-decoration: underline 2px rgba(8, 145, 178, 0.95); text-underline-offset: 1px;'
-          : 'background-color: rgba(250, 204, 21, 0.5) !important; border-radius: 2px; box-shadow: inset 0 -2px 0 rgba(217, 119, 6, 0.9);',
       })
     );
   }
@@ -97,6 +94,17 @@ function mapRanges(
   return mapped;
 }
 
+function injectFindHighlightStyles(): void {
+  if (document.getElementById('proof-find-highlight-styles')) return;
+  const style = document.createElement('style');
+  style.id = 'proof-find-highlight-styles';
+  style.textContent = `
+    .proof-find-match { background-color: rgba(250, 204, 21, 0.5) !important; border-radius: 2px; box-shadow: inset 0 -2px 0 rgba(217, 119, 6, 0.9); }
+    .proof-find-match--active { background-color: rgba(34, 211, 238, 0.55) !important; border-radius: 2px; box-shadow: 0 0 0 2px rgba(8, 145, 178, 0.95) !important; text-decoration: underline 2px rgba(8, 145, 178, 0.95); text-underline-offset: 1px; }
+  `;
+  document.head.appendChild(style);
+}
+
 export function setFindHighlights(
   view: EditorView,
   matches: FindHighlightRange[],
@@ -116,6 +124,7 @@ export function clearFindHighlights(view: EditorView): void {
 }
 
 export const findHighlightsPlugin = $prose(() => {
+  injectFindHighlightStyles();
   return new Plugin<FindHighlightsState>({
     key: findHighlightsKey,
     state: {

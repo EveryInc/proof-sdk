@@ -18,7 +18,6 @@ import type { EditorView } from '@milkdown/kit/prose/view';
 import {
   createAgentFaceElement,
   type AgentFamily,
-  getAgentFacePalette,
   resolveAgentFamily,
 } from '../../ui/agent-identity-icon';
 
@@ -78,39 +77,14 @@ function createCursorDecoration(pos: number, label: string | null, kind: AgentCu
   cursorWidget.className = 'agent-cursor';
   cursorWidget.setAttribute('data-agent-cursor', 'true');
 
-  // Apply inline styles for the cursor
-  cursorWidget.style.cssText = `
-    position: relative;
-    width: 0;
-    display: inline-block;
-    pointer-events: none;
-  `;
-
   // Create the cursor bar
   const cursorBar = document.createElement('span');
   cursorBar.className = 'agent-cursor-bar';
-  cursorBar.style.cssText = `
-    position: absolute;
-    left: 0;
-    top: 0;
-    width: 2px;
-    height: 1.15em;
-    background-color: #2563eb;
-    border-radius: 2px;
-    animation: agentCursorBlink 1.6s ease-in-out infinite;
-    z-index: 100;
-  `;
   cursorWidget.appendChild(cursorBar);
 
   if (label) {
     const badge = document.createElement('span');
     badge.className = `agent-cursor-badge${kind ? ` agent-cursor-badge--${kind}` : ''}`;
-    badge.style.display = 'inline-flex';
-    badge.style.alignItems = 'center';
-    badge.style.gap = '6px';
-    if (kind) {
-      badge.style.borderLeftColor = getAgentFacePalette(kind).accent;
-    }
 
     const icon = createAgentFaceElement({
       family: kind ?? 'purple',
@@ -139,11 +113,6 @@ function createSelectionDecorations(from: number, to: number): Decoration[] {
   return [
     Decoration.inline(from, to, {
       class: 'agent-selection',
-      style: `
-        background-color: rgba(37, 99, 235, 0.14);
-        border-radius: 3px;
-        box-shadow: inset 0 0 0 1px rgba(37, 99, 235, 0.18);
-      `,
     }),
   ];
 }
@@ -187,6 +156,10 @@ function injectStyles(): void {
       50% { opacity: 0.3; }
     }
 
+    .agent-cursor { position: relative; width: 0; display: inline-block; pointer-events: none; }
+    .agent-cursor-bar { position: absolute; left: 0; top: 0; width: 2px; height: 1.15em; background-color: #2563eb; border-radius: 2px; animation: agentCursorBlink 1.6s ease-in-out infinite; z-index: 100; }
+    .agent-selection { background-color: rgba(37, 99, 235, 0.14); border-radius: 3px; box-shadow: inset 0 0 0 1px rgba(37, 99, 235, 0.18); transition: background-color 0.15s ease-out; }
+
     @keyframes agentCursorPulse {
       0% { transform: scaleY(1); box-shadow: 0 0 4px rgba(59, 130, 246, 0.5); }
       50% { transform: scaleY(1.1); box-shadow: 0 0 8px rgba(59, 130, 246, 0.8); }
@@ -195,10 +168,6 @@ function injectStyles(): void {
 
     .agent-cursor-bar.animating {
       animation: agentCursorPulse 0.3s ease-out !important;
-    }
-
-    .agent-selection {
-      transition: background-color 0.15s ease-out;
     }
 
     .agent-cursor-badge {
@@ -219,7 +188,19 @@ function injectStyles(): void {
       box-shadow: 0 10px 24px rgba(0, 0, 0, 0.18);
       pointer-events: none;
       z-index: 101;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
     }
+
+    .agent-cursor-badge--blue { border-left-color: #2F80FF; }
+    .agent-cursor-badge--lime { border-left-color: #A3C600; }
+    .agent-cursor-badge--mint { border-left-color: #3DC79A; }
+    .agent-cursor-badge--orange { border-left-color: #FF8A3D; }
+    .agent-cursor-badge--pink { border-left-color: #F45CAB; }
+    .agent-cursor-badge--purple { border-left-color: #8B6BFF; }
+    .agent-cursor-badge--red { border-left-color: #F15B5B; }
+    .agent-cursor-badge--yellow { border-left-color: #E4B90A; }
 
     .agent-cursor-badge__icon {
       filter: drop-shadow(0 1px 1px rgba(0, 0, 0, 0.12));

@@ -335,8 +335,16 @@ export function setActiveComment(view: EditorView, commentId: string | null): vo
 // Decorations
 // ============================================================================
 
-const COMMENT_HIGHLIGHT_STYLE = 'background-color: rgba(255, 220, 100, 0.3); border-bottom: 2px solid rgb(255, 180, 0);';
-const ACTIVE_COMMENT_HIGHLIGHT_STYLE = 'background-color: rgba(255, 180, 0, 0.5); border-bottom: 2px solid rgb(255, 140, 0);';
+function injectCommentHighlightStyles(): void {
+  if (document.getElementById('proof-comment-highlight-styles')) return;
+  const style = document.createElement('style');
+  style.id = 'proof-comment-highlight-styles';
+  style.textContent = `
+    .comment-highlight { background-color: rgba(255, 220, 100, 0.3); border-bottom: 2px solid rgb(255, 180, 0); }
+    .comment-active { background-color: rgba(255, 180, 0, 0.5); border-bottom: 2px solid rgb(255, 140, 0); }
+  `;
+  document.head.appendChild(style);
+}
 
 /**
  * Create decorations for comments
@@ -355,12 +363,10 @@ function createCommentDecorations(
     if (!range) continue;
 
     const isActive = comment.id === activeCommentId;
-    const style = isActive ? ACTIVE_COMMENT_HIGHLIGHT_STYLE : COMMENT_HIGHLIGHT_STYLE;
 
     decorations.push(
       Decoration.inline(range.from, range.to, {
         class: `comment-highlight ${isActive ? 'comment-active' : ''}`,
-        style,
         'data-comment-id': comment.id
       })
     );
@@ -374,6 +380,7 @@ function createCommentDecorations(
 // ============================================================================
 
 export const commentsPlugin = $prose(() => {
+  injectCommentHighlightStyles();
   return new Plugin<CommentState>({
     key: commentsPluginKey,
 

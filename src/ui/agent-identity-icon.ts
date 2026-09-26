@@ -240,25 +240,35 @@ export function createAgentFaceSvgMarkup(options: AgentFaceMarkupOptions = {}): 
   `.trim();
 }
 
+function injectAgentFaceStyles(): void {
+  if (document.getElementById('proof-agent-face-styles')) return;
+  const style = document.createElement('style');
+  style.id = 'proof-agent-face-styles';
+  style.textContent = `
+    .proof-agent-face { display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; border-radius: 999px; }
+    .proof-agent-face img { display: block; border-radius: 999px; }
+    .proof-agent-face[data-agent-family="blue"] img { box-shadow: 0 0 0 1px rgba(47,128,255,0.18); }
+    .proof-agent-face[data-agent-family="lime"] img { box-shadow: 0 0 0 1px rgba(163,198,0,0.18); }
+    .proof-agent-face[data-agent-family="mint"] img { box-shadow: 0 0 0 1px rgba(61,199,154,0.18); }
+    .proof-agent-face[data-agent-family="orange"] img { box-shadow: 0 0 0 1px rgba(255,138,61,0.18); }
+    .proof-agent-face[data-agent-family="pink"] img { box-shadow: 0 0 0 1px rgba(244,92,171,0.18); }
+    .proof-agent-face[data-agent-family="purple"] img { box-shadow: 0 0 0 1px rgba(139,107,255,0.18); }
+    .proof-agent-face[data-agent-family="red"] img { box-shadow: 0 0 0 1px rgba(241,91,91,0.18); }
+    .proof-agent-face[data-agent-family="yellow"] img { box-shadow: 0 0 0 1px rgba(228,185,10,0.18); }
+  `;
+  document.head.appendChild(style);
+}
+
 export function createAgentFaceElement(options: AgentFaceElementOptions = {}): HTMLSpanElement {
+  injectAgentFaceStyles();
   const family = options.family ?? resolveAgentFamily(options.input ?? {});
   const variant = getAgentFaceVariant(family);
-  const palette = getAgentFacePalette(family);
   const size = options.size ?? 20;
   const wrapper = document.createElement('span');
   const wrapperClassName = options.wrapperClassName?.trim();
   wrapper.className = ['proof-agent-face', wrapperClassName].filter(Boolean).join(' ');
   wrapper.dataset.agentFamily = variant;
   wrapper.dataset.agentVariant = variant;
-  wrapper.style.cssText = [
-    'display:inline-flex',
-    'align-items:center',
-    'justify-content:center',
-    'flex-shrink:0',
-    'border-radius:999px',
-    `width:${size}px`,
-    `height:${size}px`,
-  ].join(';');
 
   const img = document.createElement('img');
   img.src = getAgentFaceAssetUrl(family);
@@ -270,13 +280,6 @@ export function createAgentFaceElement(options: AgentFaceElementOptions = {}): H
   img.className = options.className?.trim() ?? '';
   img.dataset.agentFamily = variant;
   img.dataset.agentVariant = variant;
-  img.style.cssText = [
-    `width:${size}px`,
-    `height:${size}px`,
-    'display:block',
-    'border-radius:999px',
-    `box-shadow:0 0 0 1px ${palette.ring}`,
-  ].join(';');
   if (!options.title?.trim()) {
     img.setAttribute('aria-hidden', 'true');
   }
