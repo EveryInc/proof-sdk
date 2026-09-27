@@ -3184,7 +3184,7 @@ function createDecorations(
               span.textContent = replacementContent ?? '';
               return span;
             },
-            { side: 1, key: `replace-insert-${mark.id}` }
+            { side: 1, key: `replace-insert-${mark.id}-${replacementContent}` }
           )
         );
       }
