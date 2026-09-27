@@ -1256,19 +1256,30 @@ function collectAnchorRanges(doc: ProseMirrorNode, mark: Mark): MarkRange[] {
   return ranges;
 }
 
+function hasTextBetween(doc: ProseMirrorNode, from: number, to: number): boolean {
+  let found = false;
+  doc.nodesBetween(from, to, (node) => {
+    if (node.isText) found = true;
+    return !found;
+  });
+  return found;
+}
+
+// A mark's runs are one range where they meet across a block boundary or a non-text inline
+// node, so an insert typed across Enter is rejected as one and its blocks join again. Text
+// between two runs lacks the mark (collectAnchorRanges would have taken it otherwise), so it is
+// not the mark's to act on: it ends a range, and each action leaves it as it is.
 function resolveActionRanges(doc: ProseMirrorNode, mark: Mark): MarkRange[] {
-  const ranges = collectAnchorRanges(doc, mark);
-  if (ranges.length === 0 && mark.range) return [mark.range];
-  if (ranges.length <= 1) return ranges;
+  const runs = collectAnchorRanges(doc, mark);
+  if (runs.length === 0 && mark.range) return [mark.range];
 
-  const sorted = [...ranges].sort((a, b) => a.from - b.from);
-  const composite: MarkRange = { from: sorted[0].from, to: sorted[sorted.length - 1].to };
-  const compositeQuote = normalizeQuote(doc.textBetween(composite.from, composite.to, '\n', '\n'));
-  if (compositeQuote && compositeQuote === mark.quote) {
-    return [composite];
+  const ranges: MarkRange[] = [];
+  for (const run of runs) {
+    const last = ranges[ranges.length - 1];
+    if (last && !hasTextBetween(doc, last.to, run.from)) last.to = run.to;
+    else ranges.push({ ...run });
   }
-
-  return sorted;
+  return ranges;
 }
 
 function resolveActionRangesDescending(doc: ProseMirrorNode, mark: Mark): MarkRange[] {
@@ -2717,10 +2728,13 @@ export function accept(view: EditorView, markId: string, parser?: MarkdownParser
     case 'insert': {
       const markType = getMarkTypeForKind(view.state, 'insert');
       if (!markType) return false;
+      const data = mark.data as InsertData | undefined;
       for (const range of ranges) {
         tr = tr.removeMark(range.from, range.to, markType);
-        const data = mark.data as InsertData | undefined;
-        const content = data?.content ?? getTextForRange(view.state.doc, range);
+        // The stored content is the whole insert's; a run of a split insert holds only its part.
+        const content = ranges.length === 1
+          ? data?.content ?? getTextForRange(view.state.doc, range)
+          : getTextForRange(view.state.doc, range);
         const result = applyMarkdownInsert(view, tr, range, content, mark.by, effectiveParser);
         if (!result.ok) return false;
         tr = result.tr;
