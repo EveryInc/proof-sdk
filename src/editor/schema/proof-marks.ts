@@ -6,7 +6,8 @@
  */
 
 import { $markSchema, $markAttr } from '@milkdown/kit/utils';
-import type { Attrs } from '@milkdown/kit/prose/model';
+import type { Attrs, MarkType } from '@milkdown/kit/prose/model';
+import type { ParserState } from '@milkdown/kit/transformer';
 
 type ProofSuggestionKind = 'insert' | 'delete' | 'replace';
 
@@ -52,6 +53,34 @@ function serializeProofMark(
   state.withMark(mark, 'proofMark', undefined, { proof, attrs });
 }
 
+/**
+ * The comment and suggestion spans the markdown parser has open, outermost first, per parser
+ * state and mark type. Two people's comments (or suggestions) may cover the same text, so their
+ * spans nest, but `ParserState.closeMark` drops every open mark of the type: closing an inner
+ * comment would end the comment around it too. The runner closes its own span, then re-opens the
+ * outer ones.
+ */
+const openProofSpans = new WeakMap<ParserState, Map<MarkType, Attrs[]>>();
+
+function runNestableProofMark(state: ParserState, node: ProofNode, markType: MarkType, attrs: Attrs): void {
+  let byType = openProofSpans.get(state);
+  if (!byType) {
+    byType = new Map();
+    openProofSpans.set(state, byType);
+  }
+  const outer = byType.get(markType) ?? [];
+  byType.set(markType, outer);
+  state.openMark(markType, attrs);
+  outer.push(attrs);
+  try {
+    state.next((node.children || []) as Parameters<ParserState['next']>[0]);
+  } finally {
+    outer.pop();
+    state.closeMark(markType);
+    for (const outerAttrs of outer) state.openMark(markType, outerAttrs);
+  }
+}
+
 // Suggestion mark
 export const proofSuggestionAttr = $markAttr('proofSuggestion', () => ({
   id: {},
@@ -78,6 +107,9 @@ export const proofSuggestionSchema = $markSchema('proofSuggestion', (ctx) => ({
     debugAutoFixedQuotesReason: { default: null },
   },
   inclusive: false,
+  // Two people's suggestions may cover the same text: by default a mark excludes its own type,
+  // and adding one would cut the other out of the overlap.
+  excludes: '',
   spanning: true,
   parseDOM: [
     {
@@ -143,7 +175,7 @@ export const proofSuggestionSchema = $markSchema('proofSuggestion', (ctx) => ({
       const attrs = proofNode.attrs || {};
       const provisional = parseBooleanAttr(attrs.provisional ?? null);
       const orchestrator = parseBooleanAttr(attrs.orchestrator ?? null);
-      state.openMark(markType, {
+      runNestableProofMark(state, proofNode, markType, {
         id: attrs.id ?? null,
         kind: normalizeSuggestionKind(attrs.kind),
         by: attrs.by ?? 'unknown',
@@ -158,8 +190,6 @@ export const proofSuggestionSchema = $markSchema('proofSuggestion', (ctx) => ({
         provisional: provisional ?? null,
         orchestrator: orchestrator ?? null,
       });
-      state.next(proofNode.children || []);
-      state.closeMark(markType);
     },
   },
   toMarkdown: {
@@ -186,6 +216,9 @@ export const proofCommentSchema = $markSchema('proofComment', (ctx) => ({
     by: { default: 'unknown' },
   },
   inclusive: false,
+  // Two people's comments may cover the same text: by default a mark excludes its own type, and
+  // adding one would cut the other out of the overlap.
+  excludes: '',
   spanning: true,
   parseDOM: [
     {
@@ -207,12 +240,10 @@ export const proofCommentSchema = $markSchema('proofComment', (ctx) => ({
     runner: (state, node, markType) => {
       const proofNode = node as ProofNode;
       const attrs = proofNode.attrs || {};
-      state.openMark(markType, {
+      runNestableProofMark(state, proofNode, markType, {
         id: attrs.id ?? null,
         by: attrs.by ?? 'unknown',
       });
-      state.next(proofNode.children || []);
-      state.closeMark(markType);
     },
   },
   toMarkdown: {

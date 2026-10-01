@@ -1275,6 +1275,26 @@ function resolveActionRangesDescending(doc: ProseMirrorNode, mark: Mark): MarkRa
   return resolveActionRanges(doc, mark).sort((a, b) => b.from - a.from);
 }
 
+/**
+ * Removes, over `range` in `tr.doc`, the marks of `markType` whose id is `markId`. A comment or
+ * suggestion type does not exclude itself, so its text may also carry another person's mark of
+ * the type, which a removal by type would take too. A type that excludes itself holds one mark per
+ * character (an authored mark's id is not on the node), so it is still removed by type.
+ */
+function removeMarkInstances(tr: Transaction, range: MarkRange, markType: MarkType, markId: string): Transaction {
+  if (markType.excludes(markType)) return tr.removeMark(range.from, range.to, markType);
+  tr.doc.nodesBetween(range.from, range.to, (node, pos) => {
+    if (!node.isText) return true;
+    for (const nodeMark of node.marks) {
+      if (nodeMark.type === markType && nodeMark.attrs.id === markId) {
+        tr = tr.removeMark(Math.max(pos, range.from), Math.min(pos + node.nodeSize, range.to), nodeMark);
+      }
+    }
+    return true;
+  });
+  return tr;
+}
+
 function getProofAnchorIds(doc: ProseMirrorNode): Map<string, { kind: MarkKind; by: string }> {
   const ids = new Map<string, { kind: MarkKind; by: string }>();
 
@@ -2718,7 +2738,7 @@ export function accept(view: EditorView, markId: string, parser?: MarkdownParser
       const markType = getMarkTypeForKind(view.state, 'insert');
       if (!markType) return false;
       for (const range of ranges) {
-        tr = tr.removeMark(range.from, range.to, markType);
+        tr = removeMarkInstances(tr, range, markType, mark.id);
         const data = mark.data as InsertData | undefined;
         const content = data?.content ?? getTextForRange(view.state.doc, range);
         const result = applyMarkdownInsert(view, tr, range, content, mark.by, effectiveParser);
@@ -2818,7 +2838,7 @@ export function reject(view: EditorView, markId: string): boolean {
       const markType = getMarkTypeForKind(view.state, 'delete');
       if (!markType) return false;
       for (const range of ranges) {
-        tr = tr.removeMark(range.from, range.to, markType);
+        tr = removeMarkInstances(tr, range, markType, mark.id);
       }
       break;
     }
@@ -2826,7 +2846,7 @@ export function reject(view: EditorView, markId: string): boolean {
       const markType = getMarkTypeForKind(view.state, 'replace');
       if (!markType) return false;
       for (const range of ranges) {
-        tr = tr.removeMark(range.from, range.to, markType);
+        tr = removeMarkInstances(tr, range, markType, mark.id);
       }
       break;
     }
@@ -2909,7 +2929,7 @@ export function rejectAll(view: EditorView): number {
           const from = tr.mapping.map(range.from);
           const to = tr.mapping.map(range.to);
           if (markType) {
-            tr = tr.removeMark(from, to, markType);
+            tr = removeMarkInstances(tr, { from, to }, markType, mark.id);
           }
         }
         break;
@@ -2920,7 +2940,7 @@ export function rejectAll(view: EditorView): number {
           const from = tr.mapping.map(range.from);
           const to = tr.mapping.map(range.to);
           if (markType) {
-            tr = tr.removeMark(from, to, markType);
+            tr = removeMarkInstances(tr, { from, to }, markType, mark.id);
           }
         }
         break;
@@ -2952,7 +2972,7 @@ export function deleteMark(view: EditorView, markId: string): boolean {
 
   let tr = view.state.tr;
   for (const range of ranges) {
-    tr = tr.removeMark(range.from, range.to, markType);
+    tr = removeMarkInstances(tr, range, markType, mark.id);
   }
   const metadata = removeMetadataEntries(getMarkMetadata(view.state), [markId]);
   finalizeMarkTransaction(view, tr, metadata);
