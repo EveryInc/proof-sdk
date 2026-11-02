@@ -39,6 +39,7 @@ function parseAllowedCorsOrigins(): Set<string> {
 
 async function main(): Promise<void> {
   const app = express();
+  app.use('/api/innotm', express.json({ limit: '256kb' }), innotmRouter());
   const server = createServer(app);
   const wss = new WebSocketServer({ server, path: '/ws' });
   wss.on('error', (error) => {
