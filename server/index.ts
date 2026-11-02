@@ -140,3 +140,4 @@ main().catch((error) => {
   console.error('[proof-sdk] failed to start server', error);
   process.exit(1);
 });
+import { innotmRouter } from './innotm-afspraken.js';
