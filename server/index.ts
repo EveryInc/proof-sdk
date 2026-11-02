@@ -1,6 +1,7 @@
 import express from 'express';
 import { createServer } from 'http';
 import { WebSocketServer } from 'ws';
+import { innotmRouter } from './innotm-afspraken.js';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { apiRoutes } from './routes.js';
@@ -140,4 +141,3 @@ main().catch((error) => {
   console.error('[proof-sdk] failed to start server', error);
   process.exit(1);
 });
-import { innotmRouter } from './innotm-afspraken.js';
